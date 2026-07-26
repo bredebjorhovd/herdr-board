@@ -252,12 +252,14 @@ pub struct Defaults {
     /// tab does not become a row of narrow columns. `right` or `down` force it.
     #[serde(default)]
     pub split_direction: Option<String>,
-    /// How many *agent* panes a tab may hold before the next one gets a tab of
-    /// its own. The board is not counted: it keeps its own column.
+    /// How many panes besides the board a tab may hold before the next agent
+    /// gets a tab of its own. The board is not counted: it keeps its column.
     ///
-    /// Two agents stacked beside the board is about the limit of what stays
-    /// readable. Past that a new tab is the better trade — it costs a keystroke
-    /// to reach, but what is on screen is still legible.
+    /// This trades two things against each other. Too high and the column
+    /// becomes unreadable slivers; too low and agents land in tabs, which are
+    /// easy to miss — a tab has no presence on screen the way a pane does, so
+    /// an agent in one is out of sight until you go looking. Three is the
+    /// compromise: your own pane plus two agents beside the board.
     #[serde(default = "default_max_panes_per_tab")]
     pub max_panes_per_tab: usize,
 }
@@ -267,7 +269,7 @@ fn default_max_concurrent() -> usize {
 }
 
 fn default_max_panes_per_tab() -> usize {
-    2
+    3
 }
 
 /// Impl spec §5. The design fixtures show `lin-145-altinn-retry`, but the design

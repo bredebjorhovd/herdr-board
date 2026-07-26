@@ -743,9 +743,8 @@ mod tests {
     }
 
     #[test]
-    fn two_agents_and_the_board_fill_a_tab() {
-        // The default: two agents stacked beside the board is the limit of what
-        // stays readable, so the third gets a tab.
+    fn a_tab_fills_before_anything_opens_a_new_one() {
+        // The board never counts, so the limit is about the working column.
         let mut panes = vec![board("w1:b", "w1", "w1:t1")];
         assert!(matches!(
             agent_placement_for(&panes, "w1", 2),
@@ -760,8 +759,14 @@ mod tests {
         assert_eq!(
             agent_placement_for(&panes, "w1", 2),
             Some(Placement::NewTab),
-            "a third agent belongs in its own tab"
+            "past the limit, a tab"
         );
+        // ...and the limit is the operator's to set: a tab is easy to miss, so
+        // some will prefer a tighter column to an agent out of sight.
+        assert!(matches!(
+            agent_placement_for(&panes, "w1", 3),
+            Some(Placement::Split { .. })
+        ));
     }
 
     #[test]

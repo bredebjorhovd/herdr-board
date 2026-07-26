@@ -38,10 +38,10 @@ branch_template = "board/{identifier_lower}"
 # "auto" (default): right into a tab with one pane, down once it holds two or
 # more, so a busy tab does not become a row of narrow columns.
 # split_direction = "auto"
-# Agent panes a tab may hold before the next one gets a tab of its own. The
-# board is not counted — it keeps its own column — so the default of 2 means two
-# agents stacked beside the board, and a third opens a tab.
-# max_panes_per_tab = 2
+# Panes besides the board a tab may hold before the next agent opens a tab. Too
+# high and the column is unreadable slivers; too low and agents land in tabs,
+# which are easy to miss. The default of 3 is your own pane plus two agents.
+# max_panes_per_tab = 3
 
 # GitHub is entirely optional. With no repos listed it is never polled, the
 # header omits it, and GITHUB_TOKEN is not needed at all.

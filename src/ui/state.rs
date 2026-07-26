@@ -229,12 +229,20 @@ impl App {
     }
 
     /// Sections in fixed order, empty ones omitted entirely.
+    ///
+    /// `done` is bounded to today. The header says "DONE today" and it means
+    /// it: every issue ever closed in a tracked repo derives to `done`, and
+    /// ninety-odd of them is a wall of history, not a board.
     pub fn sections(&self) -> Vec<(BoardState, Vec<&TaskView>)> {
         BoardState::SECTION_ORDER
             .iter()
             .filter_map(|&state| {
-                let rows: Vec<&TaskView> =
-                    self.views.iter().filter(|v| v.state() == state).collect();
+                let rows: Vec<&TaskView> = self
+                    .views
+                    .iter()
+                    .filter(|v| v.state() == state)
+                    .filter(|v| state != BoardState::Done || finished_today(v))
+                    .collect();
                 if rows.is_empty() {
                     None
                 } else {
@@ -352,6 +360,20 @@ pub fn setup_hints(cfg: &RoutingConfig, paths: &crate::config::Paths) -> Vec<Str
     out
 }
 
+/// Was this task closed today, in the operator's own timezone?
+///
+/// Local midnight, not a rolling 24 hours: "today" is a thing a person means,
+/// and a row dropping off at 14:37 because that is when it closed yesterday
+/// would be baffling.
+pub fn finished_today(v: &TaskView) -> bool {
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&v.task.updated_at) else {
+        // An unparseable timestamp is not evidence of recency.
+        return false;
+    };
+    let local = updated.with_timezone(&chrono::Local);
+    local.date_naive() == chrono::Local::now().date_naive()
+}
+
 /// `12s` / `9m04s` / `1h20m`. Minute resolution was rejected: a counter that
 /// never visibly moves is not worth the redraw.
 pub fn format_elapsed(secs: i64) -> String {
@@ -401,7 +423,8 @@ mod tests {
                 pr_url: None,
                 pr_number: None,
                 pr_open: false,
-                updated_at: String::new(),
+                // Today, so a `done` fixture row is inside the section's bound.
+                updated_at: crate::db::rfc3339(chrono::Utc::now()),
                 synced_at: String::new(),
                 attempts: vec![],
             },
@@ -456,6 +479,36 @@ mod tests {
         );
         // review and failed had no rows and are absent entirely.
         assert!(!order.contains(&BoardState::Review));
+    }
+
+    #[test]
+    fn done_is_bounded_to_today() {
+        // Every issue ever closed in a tracked repo derives to `done`; the
+        // section says "today" and has to mean it.
+        let mut old = view("old", BoardState::Done);
+        old.task.updated_at = "2020-01-01T00:00:00Z".into();
+        let mut today = view("today", BoardState::Done);
+        today.task.updated_at = crate::db::rfc3339(chrono::Utc::now());
+
+        let a = App::new(vec![old, today], sync(), "/cfg".into());
+        let done: Vec<&str> = a
+            .sections()
+            .into_iter()
+            .find(|(s, _)| *s == BoardState::Done)
+            .map(|(_, rows)| rows.into_iter().map(|v| v.id()).collect())
+            .unwrap_or_default();
+        assert_eq!(done, vec!["today"]);
+    }
+
+    #[test]
+    fn a_done_section_with_nothing_from_today_is_omitted() {
+        let mut old = view("old", BoardState::Done);
+        old.task.updated_at = "2020-01-01T00:00:00Z".into();
+        let a = App::new(vec![old, view("r", BoardState::Ready)], sync(), "/cfg".into());
+        assert!(
+            !a.sections().iter().any(|(s, _)| *s == BoardState::Done),
+            "an all-history done section must not render at all"
+        );
     }
 
     #[test]

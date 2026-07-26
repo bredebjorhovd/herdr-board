@@ -283,9 +283,18 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
             (None, None) => "waiting on you".into(),
         },
         BoardState::Ready => {
-            // Which repo, when there is one: `gh#507` alone does not say, and
-            // with several repos configured that is the first thing you ask.
-            let repo = v.repo.as_deref().unwrap_or_default();
+            // Where it would go, not where it came from.
+            //
+            // The repo answers this for a GitHub row, but a Linear row has no
+            // repo and was left running to the edge while its neighbours
+            // stopped short. The routed workspace is the same fact for both —
+            // and it is the routing outcome, which is otherwise invisible until
+            // the picker opens.
+            let repo = v
+                .workspace
+                .as_deref()
+                .or(v.repo.as_deref())
+                .unwrap_or_default();
             if !v.has_route {
                 // A property of the issue, not an affordance for the cursor —
                 // so it shows on every such row, selected or not.
@@ -1386,18 +1395,26 @@ mod tests {
     }
 
     #[test]
-    fn a_github_row_names_its_repo() {
-        // `gh#507` says nothing about which of several configured repos it is.
+    fn a_ready_row_says_where_it_would_go() {
+        // `gh#507` does not say which repo, and a Linear row has no repo at
+        // all — the routed workspace answers both.
         let mut v = fixtures::app(fixtures::POPULATED)
             .views
             .iter()
             .find(|v| v.state() == BoardState::Ready && v.has_route)
             .cloned()
             .unwrap();
+        v.workspace = Some("tally".into());
+        v.repo = None;
+        assert_eq!(metadata(&v, false, 80), "tally");
+        assert_eq!(metadata(&v, true, 80), "tally · [enter to dispatch]");
+
+        // A GitHub row falls back to its repo if it somehow has no route.
+        v.workspace = None;
         v.repo = Some("Tally".into());
         assert_eq!(metadata(&v, false, 80), "Tally");
-        assert_eq!(metadata(&v, true, 80), "Tally · [enter to dispatch]");
-        // Linear rows have no repo and are unchanged.
+
+        // Nothing to say, nothing said.
         v.repo = None;
         assert_eq!(metadata(&v, false, 80), "");
     }
@@ -1420,8 +1437,14 @@ mod tests {
             .find(|v| v.state() == BoardState::Ready && v.has_route)
             .cloned()
             .unwrap();
-        assert_eq!(metadata(&ready, false, 80), "");
-        assert_eq!(metadata(&ready, true, 80), "[enter to dispatch]");
+        // The workspace is on every ready row now; the dispatch hint is still
+        // only on the selected one.
+        let ws = ready.workspace.clone().unwrap();
+        assert_eq!(metadata(&ready, false, 80), ws);
+        assert_eq!(
+            metadata(&ready, true, 80),
+            format!("{ws} · [enter to dispatch]")
+        );
         app.screen = Screen::List;
     }
 

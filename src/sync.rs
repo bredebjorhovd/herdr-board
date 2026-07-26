@@ -2,7 +2,7 @@
 //! writebacks (impl spec §4, §6, §7).
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
-use crate::db::{Db, NewWriteback};
+use crate::db::{Db, NewWriteback, Reaped};
 use crate::herdr::{Herdr, PaneInfo};
 use crate::log::Logger;
 use crate::model::*;
@@ -42,6 +42,15 @@ pub enum SourceHealth {
     Absent,
     Ok,
     Down { error: String, retry_in: u64 },
+}
+
+/// How a writeback left the queue — see [`SyncEngine::drain_writebacks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sent {
+    /// Reached the source.
+    Upstream,
+    /// Never sent, and never will be: there is nothing upstream to send it to.
+    Dropped(String),
 }
 
 pub struct SyncEngine {
@@ -128,13 +137,16 @@ impl SyncEngine {
             .unwrap_or(true)
     }
 
-    /// Forget tasks the source no longer returns.
+    /// Retire tasks the source no longer returns.
     ///
-    /// A task with a live attempt is left alone: an agent is working on it, and
-    /// the row vanishing underneath a running pane would be worse than a stale
-    /// row. Reconciliation will orphan it if the pane dies.
+    /// A task with a live attempt is left alone entirely: an agent is working on
+    /// it, and the row vanishing underneath a running pane would be worse than a
+    /// stale row. Reconciliation will orphan it if the pane dies.
+    ///
+    /// Closed attempts are kept too, as a `gone` row rather than a deletion —
+    /// see [`Db::reap_task`]. Only a task nobody ever dispatched is forgotten.
     fn reap_missing(&self, source: Source, seen: &std::collections::HashSet<String>) {
-        let Ok(known) = self.db.task_ids_for_source(source) else {
+        let Ok(known) = self.db.reapable_task_ids(source) else {
             return;
         };
         let live: std::collections::HashSet<String> = self
@@ -155,11 +167,15 @@ impl SyncEngine {
                 ));
                 continue;
             }
-            match self.db.delete_task(&id) {
-                Ok(()) => self
-                    .log
-                    .info(format!("{id} no longer exists upstream — removed")),
-                Err(e) => self.log.error(format!("removing {id}: {e}")),
+            match self.db.reap_task(&id) {
+                Ok(Reaped::Forgotten) => self.log.info(format!(
+                    "{id} no longer exists upstream and was never dispatched — removed"
+                )),
+                Ok(Reaped::Kept { attempts }) => self.log.info(format!(
+                    "{id} no longer exists upstream — marked gone, keeping {attempts} \
+                     attempt(s) so `gc` can still collect their worktrees"
+                )),
+                Err(e) => self.log.error(format!("reaping {id}: {e}")),
             }
         }
     }
@@ -646,10 +662,12 @@ impl SyncEngine {
                     .info(format!("{}: {} → {}", task.identifier, task.state, state));
             }
             // A GitHub row that has reached `done` while its issue is still open
-            // upstream needs closing, or the next poll undoes it.
+            // upstream needs closing, or the next poll undoes it. `is_final`
+            // rather than `!= Terminal`: an issue that is *gone* cannot be
+            // closed, and asking would retry against a 404 forever.
             if state == BoardState::Done
                 && task.source == Source::Github
-                && task.upstream != UpstreamState::Terminal
+                && !task.upstream.is_final()
                 && self.cfg.github.writeback
             {
                 self.db.enqueue_writeback(&NewWriteback {
@@ -723,6 +741,10 @@ impl SyncEngine {
 
     /// Drain the queue. Failures back off exponentially, capped at 5 minutes,
     /// and drain on their own once the source returns.
+    ///
+    /// A writeback leaves the queue two ways: delivered to the source, or
+    /// dropped because there is no longer anything upstream to deliver it to
+    /// (AGE-6). Both are final — the difference is only what the log says.
     pub fn drain_writebacks(&self) {
         let pending = match self.db.pending_writebacks(20) {
             Ok(p) => p,
@@ -733,13 +755,23 @@ impl SyncEngine {
         };
         for w in pending {
             match self.deliver(&w) {
-                Ok(()) => {
+                Ok(sent) => {
                     let _ = self.db.mark_writeback_done(w.id);
                     let _ = self
                         .db
                         .meta_set(&meta::writeback_at(&w.task_id), &crate::db::now());
-                    self.log
-                        .info(format!("writeback {} delivered ({})", w.idem_key, w.kind));
+                    // Both leave the queue; only one of them reached a source,
+                    // and a log that called the other "delivered" would be a
+                    // lie an operator has no way to check.
+                    match sent {
+                        Sent::Upstream => self
+                            .log
+                            .info(format!("writeback {} delivered ({})", w.idem_key, w.kind)),
+                        Sent::Dropped(why) => self.log.info(format!(
+                            "writeback {} ({}) dropped: {why}",
+                            w.idem_key, w.kind
+                        )),
+                    }
                 }
                 Err(e) => {
                     self.log
@@ -750,11 +782,22 @@ impl SyncEngine {
         }
     }
 
-    fn deliver(&self, w: &crate::db::Writeback) -> Result<()> {
+    fn deliver(&self, w: &crate::db::Writeback) -> Result<Sent> {
         let Some(task) = self.db.get_task(&w.task_id)? else {
-            // The task is gone; nothing to say upstream.
-            return Ok(());
+            // Reaping a never-dispatched task drops its queued writebacks in the
+            // same transaction, so this is only reachable if the row went some
+            // other way. Either way there is nothing left to say it to.
+            return Ok(Sent::Dropped(format!("{} is no longer on the board", w.task_id)));
         };
+        if task.upstream == UpstreamState::Gone {
+            // The row is kept for its history, but the issue it points at is not
+            // there any more. Retrying would only back off forever, so this
+            // leaves the queue — as dropped, not as delivered.
+            return Ok(Sent::Dropped(format!(
+                "{} no longer exists upstream",
+                task.identifier
+            )));
+        }
         let payload: Value = serde_json::from_str(&w.payload).unwrap_or(Value::Null);
 
         match task.source {
@@ -826,16 +869,15 @@ impl SyncEngine {
                     anyhow::bail!("no GitHub client; writeback stays queued");
                 };
                 if !self.cfg.github.writeback {
-                    self.log.info(format!(
-                        "github writeback disabled in routing.toml: {} {}",
-                        w.kind, task.identifier
-                    ));
-                    return Ok(());
+                    return Ok(Sent::Dropped(format!(
+                        "github writeback disabled in routing.toml ({})",
+                        task.identifier
+                    )));
                 }
                 let Some((repo, number)) = split_gh_task_id(&task.id) else {
                     self.log
                         .warn(format!("cannot parse a repo out of {}", task.id));
-                    return Ok(());
+                    return Ok(Sent::Dropped(format!("no repo in {}", task.id)));
                 };
                 match w.kind.as_str() {
                     "dispatch" => {
@@ -877,7 +919,7 @@ impl SyncEngine {
                 }
             }
         }
-        Ok(())
+        Ok(Sent::Upstream)
     }
 
     /// Merge the pull request on a task, if it has one.
@@ -1400,6 +1442,80 @@ mod tests {
         );
     }
 
+    /// AGE-6, and the reason it is more than record-keeping: deleting the task
+    /// deleted the only row that knew where the attempt's checkout was, and `gc`
+    /// then refused to collect a directory it could not attribute. The row stays.
+    #[test]
+    fn a_sweep_keeps_the_attempts_of_a_task_that_was_worked_on() {
+        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
+        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
+            empty.clone(),
+            empty,
+        ])) as Box<dyn GraphQl>)));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "w1:p9");
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET worktree = '/wt/lin-142-1' WHERE id = ?1",
+                rusqlite::params![a],
+            )
+            .unwrap();
+        // Closed, so the task is reapable at all — a live attempt is protected
+        // by a rule of its own.
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+
+        e.poll_linear();
+
+        let t = e.db.get_task("linear:LIN-142").unwrap().expect("row kept");
+        assert_eq!(t.upstream, UpstreamState::Gone);
+        assert_eq!(t.attempts.len(), 1, "the history is the point");
+        assert_eq!(t.attempts[0].worktree.as_deref(), Some("/wt/lin-142-1"));
+        // And it derives out of the queue, into `done`.
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Done
+        );
+    }
+
+    #[test]
+    fn a_sweep_still_forgets_a_task_nobody_ever_dispatched() {
+        // The noise case the old behaviour was right about: created, mislabelled
+        // or deleted again, never worked on. Nothing to keep.
+        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
+        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
+            empty.clone(),
+            empty,
+        ])) as Box<dyn GraphQl>)));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+
+        e.poll_linear();
+        assert!(e.db.load_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reaped_row_is_not_reported_again_on_the_next_sweep() {
+        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
+        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
+            empty.clone(),
+            empty.clone(),
+            empty.clone(),
+            empty,
+        ])) as Box<dyn GraphQl>)));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "w1:p9");
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+
+        e.poll_linear();
+        e.db.meta_set(meta::LAST_FULL_SWEEP, "2026-01-01T00:00:00Z")
+            .unwrap();
+        e.poll_linear();
+        assert!(
+            e.db.reapable_task_ids(Source::Linear).unwrap().is_empty(),
+            "a gone row has nothing left to reap"
+        );
+    }
+
     #[test]
     fn an_incremental_poll_does_not_reap() {
         // An incremental response is not the whole set, so absence proves
@@ -1489,6 +1605,40 @@ mod tests {
             e.github
                 .as_ref()
                 .is_some_and(|_| e.db.meta_get(&meta::writeback_at("gh:o/r#87")).unwrap().is_some())
+        );
+    }
+
+    /// AGE-6. Reaping drops the queued writebacks it can see, but one enqueued
+    /// between that sweep and the next drain would otherwise sit there failing
+    /// against a deleted issue and backing off forever. It leaves the queue —
+    /// and the log calls it dropped rather than delivered, because nothing was.
+    #[test]
+    fn a_writeback_against_a_gone_task_is_dropped_rather_than_retried_forever() {
+        let e = engine_with(None, Some(gh_client()));
+        seed_gh(&e);
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        e.enqueue_outcome(&task, Outcome::Done, None).unwrap();
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET upstream = 'gone' WHERE id = 'gh:o/r#87'",
+                [],
+            )
+            .unwrap();
+
+        let w = e.db.pending_writebacks(1).unwrap().remove(0);
+        assert!(matches!(e.deliver(&w).unwrap(), Sent::Dropped(_)));
+
+        e.drain_writebacks();
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "it must leave the queue, not back off against a 404"
+        );
+        assert!(
+            e.db.meta_get(&meta::writeback_at("gh:o/r#87"))
+                .unwrap()
+                .is_some(),
+            "and it is recorded as handled, so nothing re-queues it"
         );
     }
 

@@ -240,28 +240,72 @@ impl Db {
         Ok(())
     }
 
-    /// Forget a task that no longer exists upstream, with its history.
+    /// Retire a task the source no longer returns.
     ///
-    /// Only ever called for tasks with no live attempt: a row whose agent is
-    /// still running must not vanish underneath it.
-    pub fn delete_task(&self, task_id: &str) -> Result<()> {
+    /// Two outcomes, decided by whether anyone ever worked on it (AGE-6):
+    ///
+    /// - **Nothing was ever dispatched** — the row is noise, an issue created and
+    ///   deleted again, and it is forgotten outright.
+    /// - **It has attempts** — the row stays, marked `gone` upstream. Deleting it
+    ///   threw away the record of which agent ran, on what branch, and how it
+    ///   ended; worse, it orphaned the attempt's checkout, leaving `gc` with a
+    ///   directory it could not attribute to a repo and so refused to touch. The
+    ///   kept row is what `gc` still collects by: `gone` is terminal, so the
+    ///   checkout ages out normally instead of leaking.
+    ///
+    /// Queued writebacks go either way: there is no issue left to comment on, and
+    /// a comment aimed at a deleted issue would fail and back off forever.
+    /// Delivered ones stay, so their idempotency keys still hold if the task
+    /// reappears.
+    pub fn reap_task(&self, task_id: &str) -> Result<Reaped> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM attempts WHERE task_id = ?1", params![task_id])?;
+        let attempts: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        if attempts == 0 {
+            tx.execute(
+                "DELETE FROM writeback_queue WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            tx.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+            tx.commit()?;
+            return Ok(Reaped::Forgotten);
+        }
         tx.execute(
-            "DELETE FROM writeback_queue WHERE task_id = ?1",
+            "DELETE FROM writeback_queue WHERE task_id = ?1 AND done = 0",
             params![task_id],
         )?;
-        tx.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+        // `state` is derived on every read, but it is also a stored column other
+        // readers use — so it is set here rather than left claiming `ready` until
+        // the next derivation pass.
+        tx.execute(
+            "UPDATE tasks SET upstream = ?2, state = ?3 WHERE id = ?1",
+            params![
+                task_id,
+                UpstreamState::Gone.as_str(),
+                BoardState::Done.as_str()
+            ],
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(Reaped::Kept {
+            attempts: attempts as usize,
+        })
     }
 
-    /// Task ids from one source, for reaping.
-    pub fn task_ids_for_source(&self, source: Source) -> Result<Vec<String>> {
+    /// Task ids from one source that reaping still has something to do to.
+    ///
+    /// Tasks already marked `gone` are left out: they have been reaped once, and
+    /// re-reaping them every sweep would say so in the log every two minutes.
+    pub fn reapable_task_ids(&self, source: Source) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM tasks WHERE source = ?1")?;
-        let rows = stmt.query_map(params![source.as_str()], |r| r.get::<_, String>(0))?;
+            .prepare("SELECT id FROM tasks WHERE source = ?1 AND upstream <> ?2")?;
+        let rows = stmt.query_map(
+            params![source.as_str(), UpstreamState::Gone.as_str()],
+            |r| r.get::<_, String>(0),
+        )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -571,6 +615,15 @@ pub fn backoff_secs(attempt: i64) -> u64 {
     base.min(300)
 }
 
+/// What reaping did to one task — see [`Db::reap_task`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reaped {
+    /// Never dispatched, so there was nothing to keep. Row and all.
+    Forgotten,
+    /// Kept, marked `gone` upstream, with this many attempts still on it.
+    Kept { attempts: usize },
+}
+
 pub struct UpsertTask {
     pub id: String,
     pub source: Source,
@@ -825,11 +878,11 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_task_takes_its_history_with_it() {
+    fn reaping_a_task_nobody_worked_on_forgets_it_entirely() {
+        // An issue created and deleted again five minutes later was noise; there
+        // is no history to protect.
         let db = db();
         seed(&db, "linear:LIN-142");
-        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
-        db.close_attempt(a, Outcome::Cancelled).unwrap();
         db.enqueue_writeback(&NewWriteback {
             task_id: "linear:LIN-142".into(),
             kind: "comment".into(),
@@ -838,12 +891,78 @@ mod tests {
         })
         .unwrap();
 
-        db.delete_task("linear:LIN-142").unwrap();
+        assert_eq!(db.reap_task("linear:LIN-142").unwrap(), Reaped::Forgotten);
         assert!(db.load_tasks().unwrap().is_empty());
-        assert!(db.attempts_for("linear:LIN-142").unwrap().is_empty());
-        // A queued comment about a task that no longer exists is not worth
-        // delivering.
         assert_eq!(db.pending_writeback_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn reaping_a_task_that_was_worked_on_keeps_its_attempts() {
+        // AGE-6: the record of which agent ran, on what branch and how it ended
+        // is the whole point — and without the attempt row, `gc` can no longer
+        // attribute the checkout it left behind.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.conn
+            .execute(
+                "UPDATE attempts SET worktree = '/wt/lin-142-1' WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+        db.close_attempt(a, Outcome::Done).unwrap();
+
+        assert_eq!(
+            db.reap_task("linear:LIN-142").unwrap(),
+            Reaped::Kept { attempts: 1 }
+        );
+        let t = db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(t.upstream, UpstreamState::Gone);
+        assert_eq!(t.state, BoardState::Done, "stored state is set, not stale");
+        assert_eq!(t.attempts.len(), 1);
+        assert_eq!(t.attempts[0].worktree.as_deref(), Some("/wt/lin-142-1"));
+        assert_eq!(t.attempts[0].branch.as_deref(), Some("board/lin-142"));
+    }
+
+    #[test]
+    fn reaping_drops_queued_writebacks_but_keeps_delivered_ones() {
+        // Nothing upstream to comment on any more, so a queued comment would
+        // fail and back off forever. The delivered rows are the idempotency
+        // ledger and cost nothing to keep.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.close_attempt(a, Outcome::Done).unwrap();
+        for key in ["delivered", "queued"] {
+            db.enqueue_writeback(&NewWriteback {
+                task_id: "linear:LIN-142".into(),
+                kind: "comment".into(),
+                payload: "{}".into(),
+                idem_key: key.into(),
+            })
+            .unwrap();
+        }
+        let delivered = db.pending_writebacks(10).unwrap()[0].id;
+        db.mark_writeback_done(delivered).unwrap();
+
+        db.reap_task("linear:LIN-142").unwrap();
+        assert_eq!(db.pending_writeback_count().unwrap(), 0);
+        let total: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM writeback_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "the delivered row survives");
+    }
+
+    #[test]
+    fn an_already_reaped_task_is_not_reaped_again() {
+        // Otherwise every sweep re-reaps it and says so in the log, forever.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.close_attempt(a, Outcome::Done).unwrap();
+        db.reap_task("linear:LIN-142").unwrap();
+        assert!(db.reapable_task_ids(Source::Linear).unwrap().is_empty());
     }
 
     #[test]
@@ -851,10 +970,10 @@ mod tests {
         let db = db();
         seed(&db, "linear:LIN-142");
         assert_eq!(
-            db.task_ids_for_source(Source::Linear).unwrap(),
+            db.reapable_task_ids(Source::Linear).unwrap(),
             vec!["linear:LIN-142"]
         );
-        assert!(db.task_ids_for_source(Source::Github).unwrap().is_empty());
+        assert!(db.reapable_task_ids(Source::Github).unwrap().is_empty());
     }
 
     #[test]

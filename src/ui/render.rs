@@ -9,7 +9,7 @@
 
 use super::state::*;
 use super::theme;
-use crate::model::BoardState;
+use crate::model::{BoardState, UpstreamState};
 use crate::sync::SourceHealth;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -258,6 +258,13 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
             }
         }
         BoardState::Done => {
+            // A row whose issue was deleted sits in `done` next to rows that
+            // were properly closed, and the two are worth telling apart: this
+            // one is here because the issue went away, not because the work
+            // landed. The attempts are still on it, which is the point.
+            if v.task.upstream == UpstreamState::Gone {
+                return format!("{}{}", fixed(v.runtime.as_deref().unwrap_or(""), 12), "gone upstream");
+            }
             format!("{}{}", fixed(v.runtime.as_deref().unwrap_or(""), 12), fixed(&ws(v), 11))
         }
     }
@@ -726,6 +733,20 @@ pub fn render_detail(buf: &mut Buffer, area: Rect, app: &mut App) {
             COL_ID,
             y,
             "pane exited without completing",
+            theme::fg_default(),
+        );
+        y += 2;
+    }
+
+    // The one thing detail must say about a reaped row: the attempts below are
+    // all that is left of it, and `source` above no longer resolves.
+    if v.task.upstream == UpstreamState::Gone {
+        put(
+            buf,
+            area,
+            COL_ID,
+            y,
+            "deleted upstream · kept for the attempts below",
             theme::fg_default(),
         );
         y += 2;
@@ -1306,6 +1327,29 @@ mod tests {
         assert_eq!(metadata(&ready, false, 80), "");
         assert_eq!(metadata(&ready, true, 80), "[enter to dispatch]");
         app.screen = Screen::List;
+    }
+
+    /// AGE-6: a reaped row sits in `done` beside rows that were properly closed,
+    /// and the two are there for different reasons — this one because the issue
+    /// went away, not because the work landed.
+    #[test]
+    fn a_row_whose_issue_was_deleted_says_so_where_a_done_row_shows_its_workspace() {
+        let done = fixtures::app(fixtures::POPULATED)
+            .views
+            .iter()
+            .find(|v| v.state() == BoardState::Done)
+            .cloned()
+            .expect("fixture needs a done row");
+        assert!(
+            !metadata(&done, false, 80).contains("gone upstream"),
+            "an ordinary done row must not claim to be gone"
+        );
+
+        let mut gone = done;
+        gone.task.upstream = UpstreamState::Gone;
+        assert!(metadata(&gone, false, 80).contains("gone upstream"));
+        // Selection changes nothing: there is no dispatch to hint at.
+        assert!(metadata(&gone, true, 80).contains("gone upstream"));
     }
 
     #[test]

@@ -326,9 +326,12 @@ fn main_repo_for(worktree: &Path) -> Result<PathBuf> {
 
 /// Directories under `$STATE/wt/` that no attempt in the database claims.
 ///
-/// They are reported, never removed: a task reaped from the board takes its
-/// attempts with it, which leaves a checkout nothing here can attribute to a
-/// repo or a state — so the operator decides.
+/// They are reported, never removed: nothing here can attribute them to a repo
+/// or a state, so the operator decides. Reaping used to be the main way they
+/// appeared — a deleted issue took its attempts with it and stranded the
+/// checkout (AGE-6) — and no longer is: a reaped task keeps its attempts, so its
+/// checkout stays claimed and collectable. What is left are directories that
+/// were never ours: hand-made, or from a database that was thrown away.
 fn untracked_worktrees(root: &Path, entries: &[Entry]) -> Vec<PathBuf> {
     let known: HashSet<&Path> = entries.iter().map(|e| e.worktree.as_path()).collect();
     let Ok(dir) = std::fs::read_dir(root) else {

@@ -441,9 +441,12 @@ pub struct TaskRow {
     pub source: String,
     pub url: String,
     pub labels: Vec<String>,
-    /// False when no route matches: the task is on the board but cannot be
-    /// dispatched, and `dispatch` will refuse it.
+    /// False when no route matches, or when the issue is gone upstream: the
+    /// task is on the board but cannot be dispatched, and `dispatch` refuses it.
     pub dispatchable: bool,
+    /// The issue behind this row no longer exists upstream. The row is kept for
+    /// the attempts on it; there is nothing left to work on.
+    pub gone: bool,
     pub route: Option<String>,
     pub workspace: Option<String>,
     pub runtime: Option<String>,
@@ -507,6 +510,7 @@ pub fn list_tasks(
         let route = cfg.resolve(&crate::sync::route_context(&task));
         let live = task.live_attempt();
         let last = task.attempts.last();
+        let gone = task.upstream == crate::model::UpstreamState::Gone;
         rows.push(TaskRow {
             id: task.id.clone(),
             identifier: task.identifier.clone(),
@@ -515,7 +519,8 @@ pub fn list_tasks(
             source: task.source.as_str().to_string(),
             url: task.url.clone(),
             labels: task.labels.clone(),
-            dispatchable: route.is_some(),
+            dispatchable: route.is_some() && !gone,
+            gone,
             route: route.map(|r| r.display_name().to_string()),
             workspace: live
                 .or(last)
@@ -555,6 +560,9 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
     }
     for r in rows {
         let extra = match (&r.pr_url, r.dispatchable) {
+            // Two different reasons a row cannot be dispatched, and calling the
+            // second one "no route" would send you to routing.toml for nothing.
+            _ if r.gone => "  (gone upstream)".to_string(),
             (Some(pr), _) => format!("  {pr}"),
             (None, false) => "  (no route)".to_string(),
             _ => String::new(),

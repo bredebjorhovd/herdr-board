@@ -472,7 +472,9 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   stacked pane, and both the board and an agent read fine at reduced height.
   Only the target tab is counted, not the whole workspace. This governs the
   board's own pane and dispatched agent panes alike; force it with
-  `[defaults] split_direction = "right" | "down"`.
+  `[defaults] split_direction = "right" | "down"`. Two agents stacked beside the
+  board is the default limit (`[defaults] max_panes_per_tab`); the board is not
+  counted, and a third agent opens a tab.
 - **A dispatched agent lands as a split, not a new tab.** A new tab is invisible
   until you switch to it, so an agent that goes `blocked` waiting for approval
   would sit unseen. Splitting the routed workspace's active tab puts it beside

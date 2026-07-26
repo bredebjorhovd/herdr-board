@@ -743,16 +743,25 @@ mod tests {
     }
 
     #[test]
-    fn a_full_tab_overflows_to_a_new_tab() {
-        // Agents stack, but only so far; past the limit the next one gets a tab
-        // rather than shaving another sliver off the stack.
-        let mut panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
+    fn two_agents_and_the_board_fill_a_tab() {
+        // The default: two agents stacked beside the board is the limit of what
+        // stays readable, so the third gets a tab.
+        let mut panes = vec![board("w1:b", "w1", "w1:t1")];
+        assert!(matches!(
+            agent_placement_for(&panes, "w1", 2),
+            Some(Placement::Split { .. })
+        ));
+        panes.push(pane("w1:p1", "w1", "w1:t1", true));
         assert!(matches!(
             agent_placement_for(&panes, "w1", 2),
             Some(Placement::Split { .. })
         ));
         panes.push(pane("w1:p2", "w1", "w1:t1", false));
-        assert_eq!(agent_placement_for(&panes, "w1", 2), Some(Placement::NewTab));
+        assert_eq!(
+            agent_placement_for(&panes, "w1", 2),
+            Some(Placement::NewTab),
+            "a third agent belongs in its own tab"
+        );
     }
 
     #[test]

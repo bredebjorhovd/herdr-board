@@ -369,10 +369,12 @@ impl Board {
         };
         match dispatch::cancel(&self.engine, &self.herdr, &self.log, &task) {
             Ok(()) => {
-                self.app
-                    .flash(format!("cancelled {} — the issue is still open", task.identifier));
+                self.app.flash(format!(
+                    "✓ cancelled {} — the issue is still open",
+                    task.identifier
+                ));
             }
-            Err(e) => self.app.flash(format!("cancel failed: {e}")),
+            Err(e) => self.app.flash(format!("✕ cancel failed: {e}")),
         }
         self.engine.rederive_all()?;
         self.reload()
@@ -387,11 +389,13 @@ impl Board {
         // the screen freezes, and nothing says whether it worked. The merge
         // updates the database itself; the daemon reconciles upstream later.
         match self.engine.merge_pull_request(&task) {
+            // The glyph matters: `y` on a confirmation that then does its work
+            // silently is indistinguishable from `y` on one that did nothing.
             Ok(what) => {
-                self.app.flash(format!("merged {what}"));
+                self.app.flash(format!("✓ merged {what}"));
                 self.reload()?;
             }
-            Err(e) => self.app.flash(format!("merge failed: {e}")),
+            Err(e) => self.app.flash(format!("✕ merge failed: {e}")),
         }
         Ok(())
     }
@@ -422,7 +426,7 @@ impl Board {
         self.engine.rederive_all()?;
         self.reload()?;
         self.app
-            .flash(format!("{} marked done on the board", v.task.identifier));
+            .flash(format!("✓ {} marked done on the board", v.task.identifier));
         Ok(())
     }
 }

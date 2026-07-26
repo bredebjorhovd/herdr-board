@@ -36,6 +36,9 @@ pub struct TaskView {
     /// The **resolved** prompt — interpolated with this task's title and body,
     /// which is what the prompt view must show, not the template.
     pub resolved_prompt: Option<String>,
+    /// Short repo name for a GitHub task. `gh#507` says nothing about which of
+    /// several configured repos it came from.
+    pub repo: Option<String>,
     /// Identifier of the parent task that released this one, when an agent did.
     /// `None` means the operator did.
     ///
@@ -105,7 +108,17 @@ pub fn build_views(
                     &wt,
                 )
             });
+            // `gh:Florin-AS/Tally#507` → `Tally`. The owner is noise when you
+            // only work with a handful of repos; the name is the part you read.
+            let repo = task
+                .id
+                .strip_prefix("gh:")
+                .and_then(|r| r.split(['#', '!']).next())
+                .and_then(|r| r.rsplit('/').next())
+                .map(str::to_string);
+
             TaskView {
+                repo,
                 has_route: route.is_some(),
                 route_name: route.map(|r| r.display_name().to_string()),
                 runtime: live
@@ -477,6 +490,7 @@ mod tests {
             pane_id: None,
             branch: Some("board/lin-142".into()),
             resolved_prompt: Some("do the thing".into()),
+            repo: None,
             dispatched_by: None,
         }
     }

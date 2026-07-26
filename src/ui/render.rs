@@ -264,29 +264,46 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
             (Some(n), _) if v.task.pr_merged => format!("PR #{n} merged · close the issue"),
             // With several branches in flight, whether it can still merge is
             // the most useful thing to say about a PR waiting on you.
-            (Some(n), _) => match v.task.pr_mergeable.as_deref() {
-                Some("behind") => format!("PR #{n} · behind master"),
-                Some("dirty") => format!("PR #{n} · conflicts"),
-                Some("blocked") => format!("PR #{n} · blocked on a check"),
-                Some("unstable") => format!("PR #{n} · a check is failing"),
-                _ => format!("PR #{n} open · waiting on you"),
-            },
+            (Some(n), _) => {
+                let repo = match v.repo.as_deref() {
+                    Some(r) => format!("{r} "),
+                    None => String::new(),
+                };
+                match v.task.pr_mergeable.as_deref() {
+                    Some("behind") => format!("{repo}PR #{n} · behind master"),
+                    Some("dirty") => format!("{repo}PR #{n} · conflicts"),
+                    Some("blocked") => format!("{repo}PR #{n} · blocked"),
+                    Some("unstable") => format!("{repo}PR #{n} · check failing"),
+                    _ => format!("{repo}PR #{n} · waiting on you"),
+                }
+            }
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
             (None, Some(b)) => format!("{b} · no PR"),
             (None, None) => "waiting on you".into(),
         },
         BoardState::Ready => {
+            // Which repo, when there is one: `gh#507` alone does not say, and
+            // with several repos configured that is the first thing you ask.
+            let repo = v.repo.as_deref().unwrap_or_default();
             if !v.has_route {
                 // A property of the issue, not an affordance for the cursor —
                 // so it shows on every such row, selected or not.
-                "no route".into()
+                if repo.is_empty() {
+                    "no route".into()
+                } else {
+                    format!("{repo} · no route")
+                }
             } else if selected {
                 // Repeating this on every ready row is four copies of one
                 // sentence.
-                "[enter to dispatch]".into()
+                if repo.is_empty() {
+                    "[enter to dispatch]".into()
+                } else {
+                    format!("{repo} · [enter to dispatch]")
+                }
             } else {
-                String::new()
+                repo.to_string()
             }
         }
         BoardState::Done => {
@@ -1369,6 +1386,23 @@ mod tests {
     }
 
     #[test]
+    fn a_github_row_names_its_repo() {
+        // `gh#507` says nothing about which of several configured repos it is.
+        let mut v = fixtures::app(fixtures::POPULATED)
+            .views
+            .iter()
+            .find(|v| v.state() == BoardState::Ready && v.has_route)
+            .cloned()
+            .unwrap();
+        v.repo = Some("Tally".into());
+        assert_eq!(metadata(&v, false, 80), "Tally");
+        assert_eq!(metadata(&v, true, 80), "Tally · [enter to dispatch]");
+        // Linear rows have no repo and are unchanged.
+        v.repo = None;
+        assert_eq!(metadata(&v, false, 80), "");
+    }
+
+    #[test]
     fn no_route_shows_on_every_such_row_but_the_dispatch_hint_only_on_selection() {
         let mut app = fixtures::app(fixtures::POPULATED);
         let unrouted = app
@@ -1729,13 +1763,17 @@ mod tests {
             .unwrap();
         let n = v.task.pr_number.unwrap();
 
+        v.repo = None;
         v.task.pr_mergeable = Some("behind".into());
         assert_eq!(metadata(&v, false, 80), format!("PR #{n} · behind master"));
         v.task.pr_mergeable = Some("dirty".into());
         assert_eq!(metadata(&v, false, 80), format!("PR #{n} · conflicts"));
-        // Clean says nothing extra — the row is already telling you to look.
         v.task.pr_mergeable = Some("clean".into());
-        assert_eq!(metadata(&v, false, 80), format!("PR #{n} open · waiting on you"));
+        assert_eq!(metadata(&v, false, 80), format!("PR #{n} · waiting on you"));
+
+        // ...and the repo leads when there is one to name.
+        v.repo = Some("Tally".into());
+        assert_eq!(metadata(&v, false, 80), format!("Tally PR #{n} · waiting on you"));
     }
 
     #[test]

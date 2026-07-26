@@ -94,6 +94,7 @@ fn view(task: Task, elapsed: Option<i64>) -> TaskView {
         idle: false,
         pane_id: Some("w3:p2".into()),
         branch: Some(format!("board/{}", task.identifier.to_lowercase())),
+        repo: None,
         dispatched_by: task
             .attempts
             .last()

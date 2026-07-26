@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Cargo.lock is committed, so builds here match a developer's.
+      - uses: Swatinem/rust-cache@v2
+
+      # The definition of done in the spec: clippy clean at -D warnings, and
+      # every test passing. Both are cheap, so both gate every push.
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets
+
+      # The board renders into a terminal; the render tests cover the grid, but
+      # a release build is what the plugin manifest actually runs.
+      - name: release build
+        run: cargo build --release

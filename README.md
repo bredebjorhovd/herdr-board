@@ -285,7 +285,7 @@ Files, all under the herdr-managed plugin directories:
 | `$STATE/board.db` | tasks, attempts, writeback queue |
 | `$STATE/syncd.pid` | daemon pidfile (pid + start time) |
 | `$STATE/syncd.log` | every state transition and every herdr argv, rotated at 5 MB |
-| `$STATE/wt/` | git worktrees, one per attempt; cleared by `gc`, never automatically |
+| `$STATE/wt/` | worktrees cut by older versions; herdr owns new ones. Cleared by `gc`, never automatically |
 
 Nothing is ever written to `HERDR_PLUGIN_ROOT`.
 
@@ -448,10 +448,6 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   its shell prompt, so dispatch does `tab create` first and starts the agent in
   the returned `root_pane`. Each attempt gets its own tab, created with
   `--no-focus` so dispatching does not yank you out of the board.
-- **Worktrees are cut with plain `git worktree add`**, not `herdr worktree
-  create`. herdr's version opens each worktree as its *own workspace*, which
-  would break `max_concurrent_per_workspace` and the picker's `1 of 2 working`
-  line — both of which count attempts within one workspace.
 - **`pane focus` is directional** (`--direction left|right|…`) and cannot target
   a pane id. `g` uses `agent focus <pane_id>`, falling back to `tab focus`.
 - **The picker popup is not a herdr pane.** It has no pane id and is outside
@@ -596,7 +592,8 @@ migration from an older database, the full key map, and cell-exact rendering at
 80×24, 120×40, 160×38 and 60×20. `tests/sync_once.rs` drives whole
 sync cycles against recorded Linear responses in `tests/fixtures/`, and
 `tests/gc_worktree.rs` runs `gc` against a real repository — the checkout goes,
-the branch survives, and a checkout with uncommitted work is refused.
+the branch survives, a checkout with uncommitted work is refused, and both
+removal paths are exercised by faking what herdr reports.
 
 ### Tasks that vanish upstream
 
@@ -641,8 +638,8 @@ down with it.
 ### Clearing out old worktrees
 
 Nothing removes a worktree on its own, and that is deliberate — see "one branch,
-one worktree" above. `$STATE/wt/` therefore grows by one checkout per attempt and
-never shrinks, so there is a sweep you run when you want the space back:
+one worktree" above. Checkouts therefore accumulate one per attempt and never
+shrink, so there is a sweep you run when you want the space back:
 
 ```bash
 herdr-board gc --dry-run           # what would go, and why the rest stays
@@ -663,13 +660,38 @@ alone deletes work someone is coming back for:
 
 **The branch is never touched.** Removing the checkout is what frees the branch
 for a fresh worktree; deleting it would throw the work away. A checkout with
-uncommitted changes is refused by git and reported rather than forced, and gc
-exits non-zero when that happens. Directories under `$STATE/wt/` that no attempt
-claims are listed, never removed: nothing left in the database says which repo
-they came from. Reaping used to be how they appeared and no longer is — a reaped
-task keeps its attempts, so its checkout stays claimed and collectable. What is
-left is a directory that was never ours: hand-made, or from a database that was
-thrown away.
+uncommitted changes is refused and reported rather than forced, and gc exits
+non-zero when that happens.
+
+**gc asks herdr where the checkouts are.** Dispatch hands the checkout to
+`herdr worktree create`, so herdr is what knows where it went — under its
+`[worktrees] directory`, which is the operator's to configure, and grouped by
+repo. There is no directory of ours left to walk, so gc runs
+`herdr worktree list` against each repository the routes name. That also covers
+the `$STATE/wt/` an older version used, so a board running across the change
+collects from both.
+
+Which leaves two ways a checkout comes back, and gc does both:
+
+- **herdr still holds it open as a workspace** — `herdr worktree remove` runs
+  `git worktree remove` *and* closes the workspace. git alone would leave herdr
+  showing a space with no directory behind it.
+- **Nothing holds it** — the common case, because a workspace whose last pane
+  closes is dropped: cancelling an attempt takes the workspace with it and
+  leaves the checkout still holding its branch. There is no workspace left to
+  name, so git removes it. A checkout deleted by hand leaves git's
+  administrative entry behind, still holding the branch against a retry, and
+  `git worktree prune` clears that.
+
+A checkout on a branch the board cuts — `branch_template`'s literal head,
+`board/` by default — that no attempt claims is **listed, never removed**:
+nothing on the board can say whether it is still wanted, so you decide. The
+branch filter is what keeps that list short. A repo the board works in is one
+you work in too, and herdr lists every checkout of it; without the filter your
+own worktrees, and the ones other agents cut under `.claude/worktrees/`, bury
+the one line that matters. Reaping used to be how strays appeared and no longer
+is — a reaped task keeps its attempts, so its checkout stays claimed and
+collectable.
 
 ### Not in v0
 

@@ -71,6 +71,28 @@ pub struct CreatedTab {
     pub root_pane_id: String,
 }
 
+/// One checkout of a repository, as herdr sees it.
+///
+/// herdr reports the *real* path, which is what makes this the right source for
+/// `gc`: the checkouts are herdr's now, it puts them under its configurable
+/// `[worktrees] directory`, and the checkouts an older board left under
+/// `$STATE/wt/` show up here too.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    /// False for the repository's own working tree, which is not a checkout to
+    /// collect.
+    pub is_linked_worktree: bool,
+    /// git still has an administrative entry, but the directory is gone.
+    pub is_prunable: bool,
+    /// Set while herdr holds this checkout open as a workspace. It is absent
+    /// far more often than you would expect: a workspace whose last pane closes
+    /// is dropped, so cancelling an attempt leaves the checkout with no
+    /// workspace behind it.
+    pub open_workspace_id: Option<String>,
+}
+
 /// A git worktree that herdr has opened as its own workspace, grouped under the
 /// parent repo in the spaces sidebar.
 #[derive(Debug, Clone)]
@@ -266,6 +288,32 @@ impl Herdr {
             "--no-focus",
         ])?;
         parse_worktree(&r)
+    }
+
+    /// Every checkout herdr knows of for the repository containing `cwd`.
+    ///
+    /// `--cwd` is not optional in practice: without it herdr answers for
+    /// whichever workspace happens to be focused, which for a background `gc`
+    /// is somebody else's repository entirely.
+    pub fn worktree_list(&self, cwd: &Path) -> Result<Vec<WorktreeInfo>> {
+        let cwd = cwd.to_string_lossy().into_owned();
+        let r = self.run_quiet(&["worktree", "list", "--cwd", &cwd])?;
+        let arr = r
+            .get("worktrees")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("worktree list: no `worktrees` array"))?;
+        Ok(arr.iter().filter_map(parse_worktree_info).collect())
+    }
+
+    /// Remove a checkout through herdr: it runs `git worktree remove` *and*
+    /// closes the workspace. Removing it with git alone would leave herdr
+    /// showing a workspace whose directory is gone.
+    pub fn worktree_remove(&self, workspace_id: &str) -> Result<()> {
+        // Quiet: `workspace_not_found` is an expected answer — the workspace
+        // may have been dropped between listing and removing — and the caller
+        // falls back to git rather than treating it as a fault.
+        self.run_quiet(&["worktree", "remove", "--workspace", workspace_id])?;
+        Ok(())
     }
 
     pub fn tab_create(
@@ -689,6 +737,25 @@ fn parse_worktree(r: &Value) -> Result<CreatedWorktree> {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("worktree: no cwd"))?,
+    })
+}
+
+fn parse_worktree_info(w: &Value) -> Option<WorktreeInfo> {
+    Some(WorktreeInfo {
+        path: PathBuf::from(w.get("path")?.as_str()?),
+        branch: w.get("branch").and_then(Value::as_str).map(str::to_string),
+        is_linked_worktree: w
+            .get("is_linked_worktree")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_prunable: w
+            .get("is_prunable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        open_workspace_id: w
+            .get("open_workspace_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

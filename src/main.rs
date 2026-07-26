@@ -253,10 +253,14 @@ fn main() -> Result<()> {
             // File only: gc's stdout *is* the report, and argv logging on
             // stderr interleaves straight through the middle of it.
             let log = Arc::new(Logger::new(paths.logfile(), false));
-            let report = gc::run(&paths, log, &older_than, dry_run)?;
+            // herdr owns the checkouts, so it is the one that knows where they
+            // are; the routes say which repositories to ask about.
+            let cfg = config::RoutingConfig::load_or_default(&paths.routing());
+            let h = herdr::Herdr::discover(log.clone());
+            let report = gc::run(&paths, &cfg, &h, log, &older_than, dry_run)?;
             gc::print_report(&report);
-            // A checkout git refused to remove is a result the operator has to
-            // act on, not a detail in the middle of a summary.
+            // A checkout that could not be removed is a result the operator has
+            // to act on, not a detail in the middle of a summary.
             if !report.skipped.is_empty() {
                 std::process::exit(1);
             }

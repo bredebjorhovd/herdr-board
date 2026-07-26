@@ -192,6 +192,9 @@ pub struct App {
     pub setup_hints: Vec<String>,
     /// Height of the last render, so a click can tell the footer row apart.
     pub last_height: u16,
+    /// First body line on screen. Rows below the fold are otherwise
+    /// unreachable, which on a short pane is most of the board.
+    pub scroll: usize,
 }
 
 pub const MESSAGE_TTL: std::time::Duration = std::time::Duration::from_millis(2600);
@@ -212,6 +215,7 @@ impl App {
             config_path,
             setup_hints: Vec::new(),
             last_height: 0,
+            scroll: 0,
         };
         app.selected_id = app.visible_task_ids().first().cloned();
         app

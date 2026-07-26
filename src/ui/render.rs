@@ -286,6 +286,7 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
     let last = area.height.saturating_sub(1);
     let body_top = 2u16;
     let body_bottom = last.saturating_sub(2); // rule sits at last-1
+    let mut more_marker: Option<String> = None;
 
     if app.is_empty() {
         render_empty(buf, area, body_top, app);
@@ -296,33 +297,59 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
             .into_iter()
             .map(|(s, rows)| (s, rows.into_iter().cloned().collect()))
             .collect();
-        let mut y = body_top;
+
+        // Flatten to the full list of lines the body would draw, then take a
+        // window of it. Without this the body is simply clipped: a selection
+        // below the fold is invisible and unreachable, which on a short pane is
+        // most of the board.
+        let mut lines: Vec<Row> = Vec::new();
         for (state, rows) in sections {
-            if y > body_bottom {
-                break;
-            }
             if state == BoardState::Done && !app.done_expanded {
-                render_done_collapsed(buf, area, y);
-                app.rows.push((y, Row::DoneCollapsed));
-                y += 1;
+                lines.push(Row::DoneCollapsed);
                 continue;
             }
-            render_section_header(buf, area, y, state);
-            app.rows.push((y, Row::Section(state)));
-            y += 1;
-            for v in &rows {
-                if y > body_bottom {
-                    break;
+            lines.push(Row::Section(state));
+            lines.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
+        }
+
+        let height = (body_bottom + 1).saturating_sub(body_top) as usize;
+        app.scroll = clamp_scroll(&lines, app.selected_id.as_deref(), app.scroll, height);
+
+        let mut y = body_top;
+        for row in lines.iter().skip(app.scroll).take(height) {
+            match row {
+                Row::DoneCollapsed => render_done_collapsed(buf, area, y),
+                Row::Section(state) => render_section_header(buf, area, y, *state),
+                Row::Task(id) => {
+                    let Some(v) = app.views.iter().find(|v| v.id() == id) else {
+                        continue;
+                    };
+                    let selected = app.selected_id.as_deref() == Some(id.as_str());
+                    render_task_row(buf, area, y, v, selected);
                 }
-                let selected = app.selected_id.as_deref() == Some(v.id());
-                render_task_row(buf, area, y, v, selected);
-                app.rows.push((y, Row::Task(v.id().to_string())));
-                y += 1;
             }
+            app.rows.push((y, row.clone()));
+            y += 1;
+        }
+
+        // A scrollable list has to say so, or a short pane looks like the whole
+        // board. Drawn after the rule below, which would otherwise paint over it.
+        if lines.len() > height {
+            let more = lines.len() - app.scroll - height.min(lines.len() - app.scroll);
+            more_marker = Some(if app.scroll > 0 && more > 0 {
+                format!(" ↑{} ↓{more} ", app.scroll)
+            } else if app.scroll > 0 {
+                format!(" ↑{} ", app.scroll)
+            } else {
+                format!(" ↓{more} ")
+            });
         }
     }
 
     rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
+    if let Some(marker) = &more_marker {
+        put_right(buf, area, area.width.saturating_sub(2), last - 1, marker, theme::dim());
+    }
     render_footer(buf, area, last, app);
 }
 
@@ -898,6 +925,39 @@ pub fn render_help(buf: &mut Buffer, area: Rect, app: &mut App) {
     render_footer(buf, area, last, app);
 }
 
+/// Keep the selected row inside the window, scrolling as little as possible.
+pub fn clamp_scroll(
+    lines: &[Row],
+    selected: Option<&str>,
+    scroll: usize,
+    height: usize,
+) -> usize {
+    if height == 0 || lines.len() <= height {
+        return 0;
+    }
+    let max = lines.len() - height;
+    let Some(id) = selected else {
+        return scroll.min(max);
+    };
+    let Some(ix) = lines
+        .iter()
+        .position(|r| matches!(r, Row::Task(t) if t == id))
+    else {
+        return scroll.min(max);
+    };
+    // Keep the section header above the selection visible where it is cheap to
+    // do so — a row with no header above it loses the state it is in.
+    let want_top = ix.saturating_sub(1);
+    let scroll = if want_top < scroll {
+        want_top
+    } else if ix >= scroll + height {
+        ix + 1 - height
+    } else {
+        scroll
+    };
+    scroll.min(max)
+}
+
 /// Word-wrap to `width`, preserving existing hard breaks.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -1008,6 +1068,54 @@ mod tests {
         assert_eq!(l.chars().nth(2).unwrap(), ' ');
         assert_ne!(l.chars().nth(3).unwrap(), ' ', "id starts at col 3");
         assert_ne!(l.chars().nth(13).unwrap(), ' ', "title starts at col 13");
+    }
+
+    #[test]
+    fn the_selection_is_always_on_screen() {
+        // Without a viewport the body is just clipped, and every row below the
+        // fold is invisible and unreachable.
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.done_expanded = true;
+        let ids = app.visible_task_ids();
+        // A pane short enough that most of the board is below the fold.
+        for id in &ids {
+            app.selected_id = Some(id.clone());
+            let buf = draw(&mut app, 80, 12);
+            let on_screen = app
+                .rows
+                .iter()
+                .any(|(_, r)| matches!(r, Row::Task(t) if t == id));
+            assert!(on_screen, "{id} was selected but never drawn");
+            let _ = buf;
+        }
+    }
+
+    #[test]
+    fn scrolling_stops_at_both_ends() {
+        let lines: Vec<Row> = (0..10)
+            .map(|i| Row::Task(format!("t{i}")))
+            .collect();
+        // Never scrolls past the end.
+        assert_eq!(clamp_scroll(&lines, Some("t9"), 0, 4), 6);
+        // Never scrolls above the top.
+        assert_eq!(clamp_scroll(&lines, Some("t0"), 6, 4), 0);
+        // A list that fits never scrolls at all.
+        assert_eq!(clamp_scroll(&lines, Some("t9"), 3, 20), 0);
+    }
+
+    #[test]
+    fn a_selection_already_on_screen_does_not_move_the_view() {
+        let lines: Vec<Row> = (0..10).map(|i| Row::Task(format!("t{i}"))).collect();
+        // t5 is visible in the window [4..8), so the view stays put.
+        assert_eq!(clamp_scroll(&lines, Some("t5"), 4, 4), 4);
+    }
+
+    #[test]
+    fn a_short_pane_says_there_is_more_below() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        let buf = draw(&mut app, 80, 10);
+        let rule = line(&buf, 8);
+        assert!(rule.contains('↓'), "no more-below marker: {rule:?}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::sources::linear::{GraphQl, Linear};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Arc;
 
 impl GraphQl for Box<dyn GraphQl> {
@@ -388,6 +389,53 @@ impl SyncEngine {
 
     // ---- reconciliation -------------------------------------------------
 
+    /// Has this attempt produced commits on its branch?
+    ///
+    /// A pull request is not the only evidence of finished work: an agent that
+    /// commits locally and stops is done, and waiting for a PR that is never
+    /// coming leaves the row `working` forever. Counting commits against the
+    /// repo's default branch is the local equivalent of "explicit done
+    /// detection".
+    fn attempt_has_commits(&self, worktree: Option<&str>) -> bool {
+        let Some(worktree) = worktree else {
+            return false;
+        };
+        if !std::path::Path::new(worktree).exists() {
+            return false;
+        }
+        // `@{-1}` and friends are unreliable here; ask git for the branch the
+        // worktree was cut from via its merge base with the default branch.
+        let base = Command::new("git")
+            .args(["-C", worktree, "rev-parse", "--abbrev-ref", "origin/HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "HEAD@{upstream}".to_string());
+
+        let count = |range: &str| -> Option<u32> {
+            let out = Command::new("git")
+                .args(["-C", worktree, "rev-list", "--count", range])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+                .flatten()
+        };
+
+        // Try the remote default branch, then the local one git reports for the
+        // main checkout. Either way: commits on this branch that are not on the
+        // base mean the agent produced something.
+        for range in [format!("{base}..HEAD"), "master..HEAD".into(), "main..HEAD".into()] {
+            if let Some(n) = count(&range) {
+                return n > 0;
+            }
+        }
+        false
+    }
+
     /// Map live attempts onto herdr's current pane reality (impl spec §6).
     pub fn reconcile(&self, panes: &[PaneInfo]) -> Result<()> {
         let by_id: HashMap<&str, &PaneInfo> =
@@ -447,17 +495,31 @@ impl SyncEngine {
                         status,
                         AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown
                     );
-                    if settled && task.pr_open {
-                        self.log.info(format!(
-                            "{} agent {} with PR — attempt done",
-                            task.identifier, status.as_str()
-                        ));
-                        self.db.close_attempt(attempt.id, Outcome::Done)?;
-                        self.enqueue_outcome(
-                            &task,
-                            Outcome::Done,
-                            task.pr_url.as_deref(),
-                        )?;
+                    if settled {
+                        // A PR is the clearest evidence of finished work, but
+                        // commits on the attempt branch are evidence too — and
+                        // an agent that commits locally and stops would
+                        // otherwise sit `working` forever.
+                        let why = if task.pr_open {
+                            Some("PR")
+                        } else if self.attempt_has_commits(attempt.worktree.as_deref()) {
+                            Some("commits")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = why {
+                            self.log.info(format!(
+                                "{} agent {} with {why} — attempt done",
+                                task.identifier,
+                                status.as_str()
+                            ));
+                            self.db.close_attempt(attempt.id, Outcome::Done)?;
+                            self.enqueue_outcome(
+                                &task,
+                                Outcome::Done,
+                                task.pr_url.as_deref(),
+                            )?;
+                        }
                     }
                 }
             }

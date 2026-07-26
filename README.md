@@ -671,6 +671,45 @@ task keeps its attempts, so its checkout stays claimed and collectable. What is
 left is a directory that was never ours: hand-made, or from a database that was
 thrown away.
 
+### Workspace concurrency is not on the board
+
+Nothing in the list says how full a workspace is. A `ws:offhand` with room and
+one at three of three read identically, and the design nominates the `WORKING`
+section header as the place to fix that. It is deliberately not built, and this
+is the record of why — not a note to build it later.
+
+The premise is narrower than it sounds. The picker states capacity on **every**
+dispatch, not only on a refusal: `ws:offhand  2 of 3 working`, dim, on the row
+above the footer, before `enter` is pressed. At cap the same line goes loud and
+`enter` leaves the footer entirely. So the number is one keypress from the row
+you are asking about, and it is never absent at the moment it decides anything.
+
+Three things real use has to settle before a header can be written:
+
+- **Which workspace.** Routes each name their own, so `WORKING` routinely holds
+  rows from several at once and the header is one line. `ws:offhand 1/3
+  ws:fintech 3/3` at 80 columns is a legend, not a status. The alternative —
+  following the selected row's workspace — is a header that changes as you
+  arrow down the list, which is worse than one that says nothing.
+- **Whether it carries information.** Below cap it is a fact already on screen:
+  every working row prints its own `ws:` at 60 columns and up, so the count is
+  there to be counted. It says something new only at cap, which is precisely
+  where the picker already says it.
+- **Whether the cap is the interesting number.** What would actually sting is
+  opening a dispatch *expecting* room and being told no. Designing against that
+  surprise and hanging a permanent counter on the board are different features,
+  and at most one of them is warranted.
+
+Building it later is cheap, which is the other half of why deferring costs
+nothing here. The live per-workspace count is already in the view model —
+`TaskView::workspace` is on every row — and the cap is not: `App` holds no
+`RoutingConfig`, so `max_concurrent_per_workspace` has to be threaded in beside
+the views. That is the whole cost.
+
+**The trigger to revisit:** the first dispatch opened expecting room and
+refused. Until that has happened, a header is a guess at a problem, and a
+section header is one line the board only gets to spend once.
+
 ### Not in v0
 
 Multi-operator anything, Linear webhooks and agent sessions (polling is enough

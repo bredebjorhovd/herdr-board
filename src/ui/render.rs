@@ -149,6 +149,27 @@ pub fn header_status(sync: &SyncStatus) -> String {
     parts.join("   ")
 }
 
+/// How loudly to say it.
+///
+/// Healthy is dim, like every other piece of chrome. A down source or a dead
+/// daemon is not chrome — it is the one thing on the board that says the board
+/// is lying to you, and dim is the quietest style there is. Seen on a light
+/// terminal, where dim collapses towards the background, `linear ✗ retrying 30s`
+/// read exactly as quietly as `gh ✓`.
+///
+/// Red carries it on a colour terminal and bold carries it without one, so the
+/// distinction survives being stripped either way.
+pub fn header_style(sync: &SyncStatus) -> Style {
+    let degraded = sync.syncd_dead()
+        || matches!(sync.linear, SourceHealth::Down { .. })
+        || matches!(sync.github, SourceHealth::Down { .. });
+    if degraded {
+        theme::state_style(BoardState::Blocked).add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    }
+}
+
 /// Below this much room, the sync status is dropped rather than shortened into
 /// something unreadable.
 const MIN_STATUS: u16 = 10;
@@ -167,7 +188,7 @@ fn render_header(buf: &mut Buffer, area: Rect, left: &str, sync: Option<&SyncSta
             .saturating_sub(2);
         if room >= MIN_STATUS {
             let status = truncate(&header_status(s), room as usize);
-            put_right(buf, area, area.width.saturating_sub(2), 0, &status, theme::dim());
+            put_right(buf, area, area.width.saturating_sub(2), 0, &status, header_style(s));
         }
     }
     rule(
@@ -632,8 +653,8 @@ fn render_footer(buf: &mut Buffer, area: Rect, y: u16, app: &mut App) {
     // A transient message and the cancel confirmation both replace the footer
     // inline rather than opening a second modal.
     if let Some(id) = &app.confirm {
-        let merging = id.starts_with("merge:");
-        let bare = id.trim_start_matches("merge:");
+        let merging = id.starts_with(super::app::MERGE_PREFIX);
+        let bare = id.trim_start_matches(super::app::MERGE_PREFIX);
         let v = app.views.iter().find(|v| v.id() == bare);
         let ident = v.map(|v| v.task.identifier.clone()).unwrap_or_default();
         let question = if merging {
@@ -928,6 +949,9 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("r", "re-dispatch a failed task"),
             ("d", "mark a failed task done"),
             ("x", "cancel — kills the pane"),
+            // The footer offers `m merge` on a review row and the key map has
+            // always bound it; only this list had never caught up.
+            ("m", "merge the pull request"),
         ],
     ),
     (
@@ -1275,6 +1299,41 @@ mod tests {
         };
         assert_eq!(header_status(&dead), "syncd not running   sync stale 4m");
         assert!(!header_status(&dead).contains("linear ✗"));
+    }
+
+    #[test]
+    fn a_broken_header_is_not_drawn_as_chrome() {
+        let healthy = SyncStatus {
+            linear: SourceHealth::Ok,
+            github: SourceHealth::Ok,
+            last_cycle_secs: Some(12),
+            last_source_ok_secs: Some(12),
+            interval_secs: 30,
+        };
+        assert!(header_style(&healthy).add_modifier.contains(Modifier::DIM));
+
+        // Both broken states have to shout on a light terminal, where dim
+        // collapses towards the background, and on a monochrome one, where the
+        // colour is gone — so: not dim, coloured, and bold.
+        let source_down = SyncStatus {
+            linear: SourceHealth::Down {
+                error: "refused".into(),
+                retry_in: 30,
+            },
+            ..healthy.clone()
+        };
+        let daemon_dead = SyncStatus {
+            last_cycle_secs: Some(240),
+            ..healthy.clone()
+        };
+        for s in [&source_down, &daemon_dead] {
+            let style = header_style(s);
+            assert!(!style.add_modifier.contains(Modifier::DIM));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(style.fg, Some(Color::Red));
+            // Rule 2 holds here too.
+            assert_eq!(style.bg, None);
+        }
     }
 
     #[test]

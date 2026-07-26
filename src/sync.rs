@@ -1,7 +1,7 @@
 //! The sync cycle: poll sources, reconcile panes, derive state, drain
 //! writebacks (impl spec §4, §6, §7).
 
-use crate::config::{Paths, RouteContext, RoutingConfig};
+use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback};
 use crate::herdr::{Herdr, PaneInfo};
 use crate::log::Logger;
@@ -43,6 +43,7 @@ pub enum SourceHealth {
 pub struct SyncEngine {
     pub db: Db,
     pub cfg: RoutingConfig,
+    pub credentials: Credentials,
     pub paths: Paths,
     pub log: Arc<Logger>,
     pub linear: Option<Linear<Box<dyn GraphQl>>>,
@@ -849,6 +850,7 @@ mod tests {
                 defaults: Defaults::default(),
                 github: Default::default(),
             },
+            credentials: Default::default(),
             paths: Paths {
                 config_dir: tmp.clone(),
                 state_dir: tmp,

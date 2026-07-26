@@ -94,7 +94,6 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
-    config::load_env(&paths);
 
     match cli.command {
         // The board and the picker draw on the terminal, so their logs go to the

@@ -314,10 +314,10 @@ pub fn setup_hints(cfg: &RoutingConfig, paths: &crate::config::Paths) -> Vec<Str
     if !paths.routing().exists() {
         out.push("No routing.toml yet — run  herdr-board init".to_string());
     }
-    if crate::config::linear_api_key().is_none() {
+    if crate::config::linear_api_key(paths).is_none() {
         out.push(format!("No LINEAR_API_KEY, so Linear is never polled — add it to {env}"));
     }
-    if !cfg.github.repos.is_empty() && crate::config::github_token().is_none() {
+    if !cfg.github.repos.is_empty() && crate::config::github_token(paths).is_none() {
         out.push(format!(
             "No GITHUB_TOKEN, and {} repo(s) are configured — private repos answer 404 without it",
             cfg.github.repos.len()

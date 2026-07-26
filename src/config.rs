@@ -126,21 +126,58 @@ impl Paths {
     }
 }
 
-/// Load `.env` from the plugin config dir into the process environment. Values
-/// already present in the environment win, so a shell export can override.
-pub fn load_env(paths: &Paths) {
-    let f = paths.env_file();
-    if f.exists() {
-        let _ = dotenvy::from_path(&f);
+/// Credentials effective for one configuration read.
+///
+/// Shell variables take precedence over `.env`, but file values are read
+/// directly instead of copied into the process environment. That distinction
+/// lets long-lived board and daemon processes observe both added and edited
+/// keys on their next reload.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Credentials {
+    pub(crate) linear_api_key: Option<String>,
+    pub(crate) github_token: Option<String>,
+}
+
+impl Credentials {
+    pub fn load(paths: &Paths) -> Credentials {
+        Self::load_with(paths, |key| std::env::var(key))
+    }
+
+    fn load_with<F>(paths: &Paths, inherited: F) -> Credentials
+    where
+        F: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+    {
+        Credentials {
+            linear_api_key: credential(paths, "LINEAR_API_KEY", &inherited),
+            github_token: credential(paths, "GITHUB_TOKEN", &inherited),
+        }
     }
 }
 
-pub fn linear_api_key() -> Option<String> {
-    std::env::var("LINEAR_API_KEY").ok().filter(|s| !s.is_empty())
+fn credential<F>(paths: &Paths, key: &str, inherited: &F) -> Option<String>
+where
+    F: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+{
+    match inherited(key) {
+        // An explicitly empty shell variable still overrides the file.
+        Ok(value) => return (!value.is_empty()).then_some(value),
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+        Err(std::env::VarError::NotPresent) => {}
+    }
+
+    dotenvy::from_path_iter(paths.env_file())
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .find_map(|(name, value)| (name == key).then_some(value))
+        .filter(|value| !value.is_empty())
 }
 
-pub fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty())
+pub fn linear_api_key(paths: &Paths) -> Option<String> {
+    Credentials::load(paths).linear_api_key
+}
+
+pub fn github_token(paths: &Paths) -> Option<String> {
+    Credentials::load(paths).github_token
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -718,5 +755,80 @@ runtime = "claude"
             labels: vec![],
         };
         assert_eq!(s.interval_secs(), 5);
+    }
+
+    #[test]
+    fn credentials_are_re_read_after_the_env_file_is_edited() {
+        fn no_inherited(_: &str) -> std::result::Result<String, std::env::VarError> {
+            Err(std::env::VarError::NotPresent)
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "hb-credentials-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        std::fs::write(paths.env_file(), "LINEAR_API_KEY=first\n").unwrap();
+        let first = Credentials::load_with(&paths, no_inherited);
+        assert_eq!(first.linear_api_key.as_deref(), Some("first"));
+        assert_eq!(first.github_token, None);
+
+        std::fs::write(
+            paths.env_file(),
+            "LINEAR_API_KEY=second\nGITHUB_TOKEN=github\n",
+        )
+        .unwrap();
+        let edited = Credentials::load_with(&paths, no_inherited);
+        assert_eq!(edited.linear_api_key.as_deref(), Some("second"));
+        assert_eq!(edited.github_token.as_deref(), Some("github"));
+
+        std::fs::write(paths.env_file(), "GITHUB_TOKEN=github\n").unwrap();
+        let removed = Credentials::load_with(&paths, no_inherited);
+        assert_eq!(removed.linear_api_key, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inherited_credentials_override_the_env_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hb-credential-precedence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        std::fs::write(
+            paths.env_file(),
+            "LINEAR_API_KEY=file-linear\nGITHUB_TOKEN=file-github\n",
+        )
+        .unwrap();
+
+        let credentials = Credentials::load_with(&paths, |key| match key {
+            "LINEAR_API_KEY" => Ok("shell-linear".to_string()),
+            "GITHUB_TOKEN" => Ok(String::new()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert_eq!(
+            credentials.linear_api_key.as_deref(),
+            Some("shell-linear")
+        );
+        assert_eq!(credentials.github_token, None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

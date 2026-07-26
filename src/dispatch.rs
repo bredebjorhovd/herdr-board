@@ -487,14 +487,73 @@ fn prepare_worktree(
     Ok(worktree.to_path_buf())
 }
 
+/// The agent that released a task, as the operator would recognise it.
+///
+/// Cancelling is the one board action with a consequence off the board: it can
+/// strand a parent agent that is blocked on the child. The herd has no push
+/// channel — the board is how agents learn anything (see `list --json`'s
+/// `last_outcome`) — so the operator is the only actor who can go tell the
+/// parent, and that only works if the board says a parent exists.
+#[derive(Debug, Clone)]
+pub struct Parent {
+    /// The parent's issue identifier, e.g. `LIN-138`. Falls back to the raw task
+    /// id if the row is not on the board.
+    pub identifier: String,
+    /// The parent still holds a live attempt, so it is plausibly waiting. A
+    /// parent that has already finished is named without the claim.
+    pub live: bool,
+}
+
+impl Parent {
+    /// The clause appended to a cancel confirmation.
+    pub fn phrase(&self) -> String {
+        if self.live {
+            format!("released by {}, which may be waiting on it", self.identifier)
+        } else {
+            format!("released by {}", self.identifier)
+        }
+    }
+}
+
+/// Resolve a `dispatched_by` task id into something worth showing.
+fn parent_of(db: &Db, task_id: &str) -> Parent {
+    match db.get_task(task_id) {
+        Ok(Some(p)) => Parent {
+            identifier: p.identifier.clone(),
+            live: p.live_attempt().is_some(),
+        },
+        // The parent's row may have been reaped; the id is still the truth we
+        // have, and naming it beats saying nothing.
+        _ => Parent {
+            identifier: task_id.to_string(),
+            live: false,
+        },
+    }
+}
+
 /// Cancel a live attempt: kill the pane, close the attempt, queue the trail.
 ///
 /// Cancelling ends the **attempt**, not the issue — the task derives back to
 /// `ready` with its history intact.
-pub fn cancel(engine: &SyncEngine, herdr: &Herdr, log: &Logger, task: &Task) -> Result<()> {
+///
+/// Returns the parent agent that released this task, when one did. The caller is
+/// expected to say so: the parent is not notified — nothing in the herd pushes —
+/// and the operator who pressed `x` is the only one in a position to tell it.
+pub fn cancel(
+    engine: &SyncEngine,
+    herdr: &Herdr,
+    log: &Logger,
+    task: &Task,
+) -> Result<Option<Parent>> {
     let Some(attempt) = task.live_attempt() else {
         bail!("{} has no live attempt", task.identifier);
     };
+    // Read the parent off the attempt before closing it: afterwards there is no
+    // live attempt to read it from.
+    let parent = attempt
+        .dispatched_by
+        .as_deref()
+        .map(|id| parent_of(&engine.db, id));
     if let Some(pane) = attempt.pane_id.as_deref()
         && let Err(e) = herdr.pane_close(pane)
     {
@@ -504,8 +563,15 @@ pub fn cancel(engine: &SyncEngine, herdr: &Herdr, log: &Logger, task: &Task) -> 
     }
     engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
     engine.enqueue_outcome(task, Outcome::Cancelled, None)?;
-    log.info(format!("cancelled {}", task.identifier));
-    Ok(())
+    match &parent {
+        Some(p) => log.info(format!(
+            "cancelled {} — {} (not notified; the board is the channel)",
+            task.identifier,
+            p.phrase()
+        )),
+        None => log.info(format!("cancelled {}", task.identifier)),
+    }
+    Ok(parent)
 }
 
 #[cfg(test)]
@@ -598,6 +664,120 @@ branch_template = "board/{identifier_lower}"
             })
             .unwrap();
         db.set_attempt_pane(a, pane).unwrap();
+    }
+
+    fn engine_with(db: Db) -> SyncEngine {
+        SyncEngine {
+            db,
+            cfg: cfg(),
+            credentials: Default::default(),
+            paths: paths(),
+            log: std::sync::Arc::new(Logger::new("", false)),
+            linear: None,
+            github: None,
+        }
+    }
+
+    /// Cancelling an agent-dispatched task hands the parent back, so the
+    /// operator can be told. Nothing in the herd pushes; this is the whole
+    /// notification path (AGE-3).
+    #[test]
+    fn cancelling_a_child_names_the_parent_that_released_it() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        working_agent(&db, "linear:LIN-138", "w1:p4");
+        // The child, released by LIN-138 and still live.
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-138".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        // Named by identifier, not the raw task id — that is what is on screen.
+        assert_eq!(parent.identifier, "LIN-138");
+        assert!(parent.live, "LIN-138 still holds its own attempt");
+        assert_eq!(
+            parent.phrase(),
+            "released by LIN-138, which may be waiting on it"
+        );
+    }
+
+    /// A parent that has already finished is named without the claim that it is
+    /// waiting — the operator should not be sent after an agent that is gone.
+    #[test]
+    fn a_finished_parent_is_named_but_not_called_waiting() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        working_agent(&db, "linear:LIN-138", "w1:p4");
+        let parent_attempt = db.live_attempts().unwrap()[0].id;
+        db.close_attempt(parent_attempt, Outcome::Done).unwrap();
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-138".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        assert_eq!(parent.phrase(), "released by LIN-138");
+    }
+
+    #[test]
+    fn cancelling_an_operator_dispatched_task_names_nobody() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        assert!(cancel(&engine, &h, &engine.log, &t).unwrap().is_none());
+    }
+
+    /// A reaped parent leaves an id with no row behind it. The id is still the
+    /// truth we have, and naming it beats saying nothing.
+    #[test]
+    fn a_parent_whose_row_is_gone_is_named_by_its_id() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-999".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        assert_eq!(parent.identifier, "linear:LIN-999");
+        assert!(!parent.live);
     }
 
     #[test]

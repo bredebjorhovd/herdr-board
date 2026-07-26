@@ -457,7 +457,60 @@ pub struct TaskRow {
     pub branch: Option<String>,
     /// Parent task id when an agent released this one; null means the operator.
     pub dispatched_by: Option<String>,
+    /// How the most recent *ended* attempt ended: `done`, `failed`, `cancelled`
+    /// or `orphaned`. Null means no attempt has ever ended.
+    ///
+    /// This is what makes cancellation legible to a parent agent. `cancelled`
+    /// derives back to `ready` — deliberately, since the issue is still owed —
+    /// so without this field a child the operator killed is indistinguishable
+    /// from one that was never dispatched. A parent polling its child reads
+    /// `state: ready` with `last_outcome: cancelled` and knows to stop waiting.
+    /// Set even while a *newer* attempt is live, so a retry does not erase how
+    /// the previous one went.
+    pub last_outcome: Option<String>,
+    /// When that attempt ended (RFC 3339). Pairs with `last_outcome` so a
+    /// long-lived poller can tell a fresh cancellation from one it already saw.
+    pub last_outcome_at: Option<String>,
     pub attempts: usize,
+}
+
+/// One task, in the shape callers are promised.
+///
+/// Separate from `list_tasks` because this shape is the published contract and
+/// the surrounding function is filtering and database wiring.
+fn task_row(task: &crate::model::Task, route: Option<&crate::config::Route>) -> TaskRow {
+    let live = task.live_attempt();
+    let last = task.attempts.last();
+    let closed = task.last_closed_attempt();
+    let gone = task.upstream == crate::model::UpstreamState::Gone;
+    TaskRow {
+        id: task.id.clone(),
+        identifier: task.identifier.clone(),
+        title: task.title.clone(),
+        state: task.state.as_str().to_string(),
+        source: task.source.as_str().to_string(),
+        url: task.url.clone(),
+        labels: task.labels.clone(),
+        dispatchable: route.is_some() && !gone,
+        gone,
+        route: route.map(|r| r.display_name().to_string()),
+        workspace: live
+            .or(last)
+            .map(|a| a.workspace.clone())
+            .or_else(|| route.map(|r| r.workspace.clone())),
+        runtime: live
+            .or(last)
+            .map(|a| a.runtime.clone())
+            .or_else(|| route.map(|r| r.runtime.clone())),
+        pane_id: live.and_then(|a| a.pane_id.clone()),
+        pr_url: task.pr_url.clone(),
+        pr_number: task.pr_number,
+        branch: live.or(last).and_then(|a| a.branch.clone()),
+        dispatched_by: live.or(last).and_then(|a| a.dispatched_by.clone()),
+        last_outcome: closed.and_then(|a| a.outcome).map(|o| o.as_str().to_string()),
+        last_outcome_at: closed.and_then(|a| a.ended_at.clone()),
+        attempts: task.attempts.len(),
+    }
 }
 
 /// Read the board.
@@ -508,35 +561,7 @@ pub fn list_tasks(
             continue;
         }
         let route = cfg.resolve(&crate::sync::route_context(&task));
-        let live = task.live_attempt();
-        let last = task.attempts.last();
-        let gone = task.upstream == crate::model::UpstreamState::Gone;
-        rows.push(TaskRow {
-            id: task.id.clone(),
-            identifier: task.identifier.clone(),
-            title: task.title.clone(),
-            state: task.state.as_str().to_string(),
-            source: task.source.as_str().to_string(),
-            url: task.url.clone(),
-            labels: task.labels.clone(),
-            dispatchable: route.is_some() && !gone,
-            gone,
-            route: route.map(|r| r.display_name().to_string()),
-            workspace: live
-                .or(last)
-                .map(|a| a.workspace.clone())
-                .or_else(|| route.map(|r| r.workspace.clone())),
-            runtime: live
-                .or(last)
-                .map(|a| a.runtime.clone())
-                .or_else(|| route.map(|r| r.runtime.clone())),
-            pane_id: live.and_then(|a| a.pane_id.clone()),
-            pr_url: task.pr_url.clone(),
-            pr_number: task.pr_number,
-            branch: live.or(last).and_then(|a| a.branch.clone()),
-            dispatched_by: live.or(last).and_then(|a| a.dispatched_by.clone()),
-            attempts: task.attempts.len(),
-        });
+        rows.push(task_row(&task, route));
     }
 
     // Board order, so `list` and the pane agree on what is most urgent.
@@ -1034,6 +1059,96 @@ mod tests {
             .unwrap();
         }
         db
+    }
+
+    /// Add an attempt to a seeded task and close it.
+    fn closed_attempt(db: &Db, task_id: &str, outcome: crate::model::Outcome, by: Option<&str>) {
+        let a = db
+            .insert_attempt(&crate::db::NewAttempt {
+                task_id: task_id.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: None,
+                dispatched_by: by.map(str::to_string),
+            })
+            .unwrap();
+        db.close_attempt(a, outcome).unwrap();
+    }
+
+    fn row(db: &Db, task_id: &str) -> TaskRow {
+        let t = db.get_task(task_id).unwrap().unwrap();
+        task_row(&t, None)
+    }
+
+    /// The AGE-3 contract. Cancelling derives back to `ready` — the issue is
+    /// still owed — so `ready` alone cannot tell a parent whether its child was
+    /// killed or never started. `last_outcome` is what makes the two legible,
+    /// and it is the only channel: nothing notifies the parent.
+    #[test]
+    fn a_cancelled_child_is_distinguishable_from_one_that_never_ran() {
+        let db = seeded_db();
+        closed_attempt(
+            &db,
+            "linear:LIN-142",
+            crate::model::Outcome::Cancelled,
+            Some("linear:LIN-138"),
+        );
+
+        let cancelled = row(&db, "linear:LIN-142");
+        let never_ran = row(&db, "gh:offhand/tally#87");
+
+        // Both sit in the same section...
+        assert_eq!(cancelled.state, "ready");
+        assert_eq!(never_ran.state, "ready");
+        // ...and only this tells the parent to stop waiting.
+        assert_eq!(cancelled.last_outcome.as_deref(), Some("cancelled"));
+        assert_eq!(never_ran.last_outcome, None);
+        assert!(cancelled.last_outcome_at.is_some());
+        assert_eq!(never_ran.last_outcome_at, None);
+        // The parent can still tell the child was its own.
+        assert_eq!(cancelled.dispatched_by.as_deref(), Some("linear:LIN-138"));
+    }
+
+    /// A retry must not erase how the previous attempt ended: a parent that
+    /// polls between the cancel and the re-dispatch would otherwise see the
+    /// cancellation appear and vanish.
+    #[test]
+    fn a_live_retry_keeps_the_previous_outcome_visible() {
+        let db = seeded_db();
+        closed_attempt(
+            &db,
+            "linear:LIN-142",
+            crate::model::Outcome::Cancelled,
+            None,
+        );
+        db.insert_attempt(&crate::db::NewAttempt {
+            task_id: "linear:LIN-142".into(),
+            pane_id: Some("w1:p2".into()),
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+        })
+        .unwrap();
+
+        let r = row(&db, "linear:LIN-142");
+        assert_eq!(r.attempts, 2);
+        assert_eq!(r.last_outcome.as_deref(), Some("cancelled"));
+    }
+
+    /// `last_outcome` reports the most recent ending, not the first.
+    #[test]
+    fn the_most_recent_ending_wins() {
+        let db = seeded_db();
+        closed_attempt(&db, "linear:LIN-142", crate::model::Outcome::Failed, None);
+        closed_attempt(&db, "linear:LIN-142", crate::model::Outcome::Cancelled, None);
+        assert_eq!(
+            row(&db, "linear:LIN-142").last_outcome.as_deref(),
+            Some("cancelled")
+        );
     }
 
     #[test]

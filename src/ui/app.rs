@@ -368,7 +368,17 @@ impl Board {
             return Ok(());
         };
         match dispatch::cancel(&self.engine, &self.herdr, &self.log, &task) {
-            Ok(()) => {
+            // When an agent released this, that displaces "the issue is still
+            // open" — the row returning to `ready` says that by itself, and a
+            // parent nobody will tell is the fact the operator can still act on.
+            Ok(Some(parent)) => {
+                self.app.flash(format!(
+                    "✓ cancelled {} — {}",
+                    task.identifier,
+                    parent.phrase()
+                ));
+            }
+            Ok(None) => {
                 self.app.flash(format!(
                     "✓ cancelled {} — the issue is still open",
                     task.identifier

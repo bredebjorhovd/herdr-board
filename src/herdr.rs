@@ -343,6 +343,14 @@ impl Herdr {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Send literal keys to an agent's UI.
+    pub fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<()> {
+        let mut args = vec!["agent", "send-keys", target];
+        args.extend_from_slice(keys);
+        self.run_quiet(&args)?;
+        Ok(())
+    }
+
     pub fn agent_focus(&self, target: &str) -> Result<()> {
         self.run(&["agent", "focus", target])?;
         Ok(())

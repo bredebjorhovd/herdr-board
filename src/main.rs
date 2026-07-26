@@ -1,7 +1,7 @@
 //! herdr-board — a task board fed by Linear and GitHub, dispatching into herdr
 //! panes and reconciling pane state back to the board.
 
-use herdr_board::{cli, config, dispatch, gc, herdr, log, ui};
+use herdr_board::{cli, config, dispatch, gc, herdr, integration, log, ui};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -18,6 +18,16 @@ use std::sync::Arc;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand)]
+enum IntegrationAction {
+    /// Install the hooks (writes to ~/.claude/settings.json; backed up first).
+    Install { agent: String },
+    /// Remove them again, touching nothing else.
+    Uninstall { agent: String },
+    /// Report whether they are installed.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -90,6 +100,11 @@ enum Command {
         /// Say what would go, remove nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Report Claude Code's state to herdr, which cannot read it from the screen.
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
     },
     /// Check the environment.
     Doctor,
@@ -239,6 +254,36 @@ fn main() -> Result<()> {
             // act on, not a detail in the middle of a summary.
             if !report.skipped.is_empty() {
                 std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::Integration { action } => {
+            let log = Arc::new(Logger::new(paths.logfile(), true));
+            match action {
+                IntegrationAction::Install { agent } => {
+                    integration::check_supported(&agent)?;
+                    integration::install(&log)?;
+                    println!(
+                        "installed {} hooks — new Claude Code sessions will report \
+                         working/idle/blocked to herdr",
+                        integration::expected_count()
+                    );
+                    println!("existing sessions keep screen detection until they restart");
+                }
+                IntegrationAction::Uninstall { agent } => {
+                    integration::check_supported(&agent)?;
+                    integration::uninstall(&log)?;
+                    println!("removed");
+                }
+                IntegrationAction::Status => {
+                    let n = integration::installed_count();
+                    println!(
+                        "{}/{} hooks installed ({})",
+                        n,
+                        integration::expected_count(),
+                        integration::hook_path()?.display()
+                    );
+                }
             }
             Ok(())
         }

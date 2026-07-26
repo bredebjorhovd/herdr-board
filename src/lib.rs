@@ -7,6 +7,7 @@ pub mod db;
 pub mod dispatch;
 pub mod gc;
 pub mod herdr;
+pub mod integration;
 pub mod log;
 pub mod model;
 pub mod sources;

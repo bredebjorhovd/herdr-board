@@ -935,6 +935,24 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
         }
     }
 
+    // herdr cannot read Claude Code's state off the screen; without our hooks a
+    // working or blocked Claude pane reports `idle`, and the board's BLOCKED
+    // section never fires for it.
+    let installed = crate::integration::installed_count();
+    let expected = crate::integration::expected_count();
+    checks.push(Check {
+        name: "claude state hooks".into(),
+        ok: installed == expected,
+        detail: if installed == expected {
+            "installed — Claude Code reports its own state".into()
+        } else if installed == 0 {
+            "not installed — a working or blocked Claude pane will report `idle`.              Run `herdr-board integration install claude`"
+                .into()
+        } else {
+            format!("{installed}/{expected} installed — re-run `herdr-board integration install claude`")
+        },
+    });
+
     let daemon = running_pid(paths);
     checks.push(Check {
         name: "syncd".into(),

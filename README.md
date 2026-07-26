@@ -382,6 +382,7 @@ Two different things are called labels, which is easy to trip on:
 | `syncd [--ensure]` | the daemon; `--ensure` starts it if absent and exits |
 | `sync --once` | one sync cycle |
 | `list [--state S] [--source S] [--json]` | read the board (for agents) |
+| `wait [--task ID] [--state S] [--timeout N]` | block until watched work settles |
 | `dispatch --task <id>` | dispatch without the picker |
 | `cancel --task <id>` | end the live attempt, keep the issue open |
 | `gc [--older-than 14d] [--dry-run]` | remove the worktrees of finished attempts |
@@ -422,6 +423,20 @@ The fourth line is not optional. Polling is the **only** way work you released
 reports back — there is no callback, no signal, and no message. A child that
 finished, failed, or was cancelled by the operator looks like nothing at all
 until you look.
+
+`wait` blocks until the work settles — the counterpart to `dispatch`, so an
+orchestrator can release work and be told, instead of polling or falling silent
+until a human prods it:
+
+```bash
+herdr-board dispatch --task linear:AGE-14
+herdr-board wait --timeout 3600 --json
+```
+
+With no `--task` it watches whatever is in flight when it is called and returns
+as soon as any of it reaches `review`, `failed` or `done`. It reconciles as it
+goes rather than trusting the daemon's cycle, so it answers as soon as the
+answer is true.
 
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,

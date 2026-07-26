@@ -9,8 +9,9 @@ use crate::log::Logger;
 use crate::sources::github::{Github, HttpRest, Rest};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use crate::sync::SyncEngine;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Build a sync engine with whichever credentials are present. A missing key is
 /// not an error: the board still renders, and `doctor` says what is missing.
@@ -602,6 +603,87 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// ---- waiting -----------------------------------------------------------
+
+/// Block until a watched task settles.
+///
+/// The missing half of the orchestration loop. `list` answers when asked, but
+/// nothing tells an agent that the work it released has finished — so an
+/// orchestrator dispatches, goes quiet, and waits for a human to prod it. This
+/// is the board's equivalent of `herdr agent wait`.
+///
+/// Reconciles as it goes rather than trusting the daemon's cycle: a caller
+/// blocking on this wants the answer as soon as it is true, not up to thirty
+/// seconds later.
+pub fn wait_for(
+    paths: &Paths,
+    log: Arc<Logger>,
+    tasks: &[String],
+    states: &[String],
+    timeout: Option<Duration>,
+) -> Result<Vec<TaskRow>> {
+    for state in states {
+        if crate::model::BoardState::parse(state).is_none() {
+            bail!(
+                "unknown state `{state}`; expected one of: {}",
+                crate::model::BoardState::SECTION_ORDER
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    let engine = engine_from_paths(paths, log.clone())?;
+    let herdr = Herdr::discover(log.clone());
+
+    // With no explicit tasks, watch whatever is in flight right now. Resolved
+    // once, at the start: a task dispatched later is not what this call is
+    // waiting for.
+    let watching: Vec<String> = if tasks.is_empty() {
+        engine
+            .db
+            .live_attempts()?
+            .into_iter()
+            .map(|a| a.task_id)
+            .collect()
+    } else {
+        tasks.to_vec()
+    };
+    if watching.is_empty() {
+        // Distinct from "nothing matched": there was never anything to wait
+        // for, which usually means the caller dispatched nothing, or the work
+        // had already settled before it asked.
+        bail!("nothing is in flight to wait for");
+    }
+    log.info(format!("waiting on {} task(s) for {states:?}", watching.len()));
+
+    let started = std::time::Instant::now();
+    loop {
+        // Pane state only — no network, so this is cheap enough to run often.
+        if let Ok(panes) = herdr.pane_list() {
+            let _ = engine.reconcile(&panes);
+        }
+        engine.rederive_all()?;
+
+        let matched: Vec<TaskRow> = list_tasks(paths, log.clone(), None, None)?
+            .into_iter()
+            .filter(|r| watching.contains(&r.id) && states.contains(&r.state))
+            .collect();
+        if !matched.is_empty() {
+            return Ok(matched);
+        }
+        if timeout.is_some_and(|t| started.elapsed() >= t) {
+            bail!(
+                "timed out after {:?} waiting for {} task(s) to reach {states:?}",
+                started.elapsed(),
+                watching.len()
+            );
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
 
 // ---- the board toggle --------------------------------------------------

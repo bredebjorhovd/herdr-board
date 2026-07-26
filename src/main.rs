@@ -86,6 +86,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Block until watched work settles. The counterpart to `dispatch`.
+    Wait {
+        /// Task to watch; repeat for several. Omit to watch everything in
+        /// flight right now.
+        #[arg(long)]
+        task: Vec<String>,
+        /// States that count as settled. Defaults to review, failed and done.
+        #[arg(long)]
+        state: Vec<String>,
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Cancel a task's live attempt: kill the pane, keep the issue open.
     Cancel {
         #[arg(long)]
@@ -226,6 +241,29 @@ fn main() -> Result<()> {
         } => {
             let log = Arc::new(Logger::new(paths.logfile(), false));
             let rows = cli::list_tasks(&paths, log, state.as_deref(), source.as_deref())?;
+            cli::print_tasks(&rows, json)
+        }
+        Command::Wait {
+            task,
+            state,
+            timeout,
+            json,
+        } => {
+            let log = Arc::new(Logger::new(paths.logfile(), false));
+            // Finished, one way or another: work to look at, work that broke,
+            // or work whose ticket closed under it.
+            let states = if state.is_empty() {
+                vec!["review".to_string(), "failed".into(), "done".into()]
+            } else {
+                state
+            };
+            let rows = cli::wait_for(
+                &paths,
+                log,
+                &task,
+                &states,
+                timeout.map(std::time::Duration::from_secs),
+            )?;
             cli::print_tasks(&rows, json)
         }
         Command::Cancel { task } => {

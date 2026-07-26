@@ -475,26 +475,7 @@ impl SyncEngine {
     /// directly; otherwise the value stored on the attempt is used.
     pub fn rederive_with(&self, override_status: &HashMap<String, AgentStatus>) -> Result<()> {
         for task in self.db.load_tasks()? {
-            let live = task.live_attempt().map(|a| {
-                a.pane_id
-                    .as_deref()
-                    .and_then(|p| override_status.get(p).copied())
-                    .or(a.agent_status)
-                    .unwrap_or(AgentStatus::Unknown)
-            });
-            let last_outcome = task
-                .attempts
-                .iter()
-                .rev()
-                .find(|a| a.outcome.is_some())
-                .and_then(|a| a.outcome);
-            let state = derive_state(Derivation {
-                upstream: task.upstream,
-                live,
-                last_outcome,
-                open_pr: task.pr_open,
-                local_done: task.local_done,
-            });
+            let state = derive_state(derivation_for(&task, override_status));
             if state != task.state {
                 self.log
                     .info(format!("{}: {} → {}", task.identifier, task.state, state));
@@ -773,6 +754,36 @@ impl SyncEngine {
             _ if configured => SourceHealth::Ok,
             _ => SourceHealth::Absent,
         }
+    }
+}
+
+/// What `derive_state` gets to see for a task, read off its stored rows.
+///
+/// Pulled out of the sync cycle so anything that needs the current state without
+/// writing it — `gc`, which must not act on a stale `state` column — asks the
+/// same question the daemon does, rather than a second approximation of it.
+/// `override_status` supplies pane statuses by pane id; empty means "use what
+/// reconciliation last stored on the attempt".
+pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus>) -> Derivation {
+    let live = task.live_attempt().map(|a| {
+        a.pane_id
+            .as_deref()
+            .and_then(|p| override_status.get(p).copied())
+            .or(a.agent_status)
+            .unwrap_or(AgentStatus::Unknown)
+    });
+    let last_outcome = task
+        .attempts
+        .iter()
+        .rev()
+        .find(|a| a.outcome.is_some())
+        .and_then(|a| a.outcome);
+    Derivation {
+        upstream: task.upstream,
+        live,
+        last_outcome,
+        open_pr: task.pr_open,
+        local_done: task.local_done,
     }
 }
 

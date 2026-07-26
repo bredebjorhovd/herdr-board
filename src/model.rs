@@ -370,6 +370,9 @@ pub struct Task {
     pub pr_open: bool,
     /// Merged, rather than closed without merging.
     pub pr_merged: bool,
+    /// GitHub's `mergeable_state` — `behind` and `dirty` are the ones that
+    /// matter when several branches are in flight at once.
+    pub pr_mergeable: Option<String>,
     pub updated_at: String,
     pub synced_at: String,
     /// Populated by the read path, not stored on the row.

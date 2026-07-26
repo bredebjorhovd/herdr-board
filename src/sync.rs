@@ -335,6 +335,11 @@ impl SyncEngine {
             self.log.error(format!("linking PRs: {e}"));
         }
 
+        // Mergeability costs one call per open PR, so it rides the full sweep
+        // rather than every poll. It is the fact that matters most about a PR
+        // waiting on you when several branches are in flight at once.
+        let check_mergeable = self.due_for_full_sweep();
+
         if self.cfg.github.pull_requests {
             for pr in &all_pulls {
                 if attempt_branches.contains(&pr.head_ref) {
@@ -354,6 +359,10 @@ impl SyncEngine {
                     pr.open,
                 );
                 let _ = self.db.set_pr_merged(&pr.task_id(), pr.merged);
+                if check_mergeable && pr.open {
+                    let state = gh.mergeable_state(&pr.repo, pr.number);
+                    let _ = self.db.set_pr_mergeable(&pr.task_id(), state.as_deref());
+                }
             }
         }
         // Only reap when every repo answered: a failed poll would otherwise look
@@ -383,6 +392,8 @@ impl SyncEngine {
         if pulls.is_empty() {
             return Ok(());
         }
+        let check_mergeable = self.due_for_full_sweep();
+        let gh = self.github.as_ref();
         for task in self.db.load_tasks()? {
             let branches: Vec<String> = task
                 .attempts
@@ -398,6 +409,13 @@ impl SyncEngine {
             self.db
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), pr.open)?;
             self.db.set_pr_merged(&task.id, pr.merged)?;
+            if check_mergeable
+                && pr.open
+                && let Some(gh) = gh
+            {
+                let state = gh.mergeable_state(&pr.repo, pr.number);
+                self.db.set_pr_mergeable(&task.id, state.as_deref())?;
+            }
         }
         Ok(())
     }

@@ -262,7 +262,15 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
             // A merged PR means the work landed and only the ticket is left —
             // otherwise the row sits in `review` saying nothing about why.
             (Some(n), _) if v.task.pr_merged => format!("PR #{n} merged · close the issue"),
-            (Some(n), _) => format!("PR #{n} open · waiting on you"),
+            // With several branches in flight, whether it can still merge is
+            // the most useful thing to say about a PR waiting on you.
+            (Some(n), _) => match v.task.pr_mergeable.as_deref() {
+                Some("behind") => format!("PR #{n} · behind master"),
+                Some("dirty") => format!("PR #{n} · conflicts"),
+                Some("blocked") => format!("PR #{n} · blocked on a check"),
+                Some("unstable") => format!("PR #{n} · a check is failing"),
+                _ => format!("PR #{n} open · waiting on you"),
+            },
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
             (None, Some(b)) => format!("{b} · no PR"),
@@ -1707,6 +1715,27 @@ mod tests {
         let hints = footer_hints(&app);
         assert!(hints.iter().any(|(_, l, _)| *l == "open issue"), "{hints:?}");
         assert!(!hints.iter().any(|(k, _, _)| *k == "m"), "nothing to merge");
+    }
+
+    #[test]
+    fn a_review_row_says_when_a_pr_cannot_merge() {
+        // Four branches merged to master tonight without seeing each other;
+        // "open · waiting on you" is not the useful thing to say about one.
+        let mut v = fixtures::app(fixtures::POPULATED)
+            .views
+            .iter()
+            .find(|v| v.state() == BoardState::Review && v.task.pr_number.is_some())
+            .cloned()
+            .unwrap();
+        let n = v.task.pr_number.unwrap();
+
+        v.task.pr_mergeable = Some("behind".into());
+        assert_eq!(metadata(&v, false, 80), format!("PR #{n} · behind master"));
+        v.task.pr_mergeable = Some("dirty".into());
+        assert_eq!(metadata(&v, false, 80), format!("PR #{n} · conflicts"));
+        // Clean says nothing extra — the row is already telling you to look.
+        v.task.pr_mergeable = Some("clean".into());
+        assert_eq!(metadata(&v, false, 80), format!("PR #{n} open · waiting on you"));
     }
 
     #[test]

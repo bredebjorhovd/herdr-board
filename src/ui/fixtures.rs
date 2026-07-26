@@ -41,6 +41,7 @@ fn task(identifier: &str, title: &str, state: BoardState) -> Task {
         pr_number: None,
         pr_open: false,
         pr_merged: false,
+        pr_mergeable: None,
         updated_at: crate::db::now(),
         synced_at: crate::db::now(),
         attempts: vec![],

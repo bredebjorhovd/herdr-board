@@ -230,6 +230,24 @@ impl<T: Rest> Github<T> {
         Ok(())
     }
 
+    /// Whether a pull request can merge as it stands.
+    ///
+    /// The list endpoint does not carry this, so it is one call per open PR —
+    /// worth it only on a full sweep, not every poll.
+    ///
+    /// GitHub answers `clean`, `behind` (master moved under it), `dirty`
+    /// (conflicts), `blocked` (a required check or review), `unstable` (a
+    /// non-required check failing), or `unknown` while it recomputes.
+    pub fn mergeable_state(&self, repo: &str, number: i64) -> Option<String> {
+        self.rest
+            .get(&format!("/repos/{repo}/pulls/{number}"))
+            .ok()?
+            .get("mergeable_state")?
+            .as_str()
+            .map(str::to_string)
+            .filter(|s| s != "unknown")
+    }
+
     /// Merge a pull request.
     ///
     /// Only ever from an explicit keypress with a confirmation — this is the

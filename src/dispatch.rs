@@ -6,10 +6,9 @@ use crate::herdr::{Herdr, agent_name};
 use crate::log::Logger;
 use crate::model::{AgentStatus, Outcome, Task};
 use crate::sync::{SyncEngine, route_context};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Per-dispatch choices the picker can override.
 #[derive(Debug, Clone, Default)]
@@ -223,58 +222,37 @@ pub fn dispatch(
     })?;
 
     let result = (|| -> Result<String> {
-        // The actual worktree may differ from the planned path: a retry reuses
-        // the one already holding this branch.
-        let worktree = prepare_worktree(&p.repo, &p.worktree, &p.branch, log)?;
-        if worktree != p.worktree {
-            engine
-                .db
-                .conn
-                .execute(
-                    "UPDATE attempts SET worktree = ?2 WHERE id = ?1",
-                    rusqlite::params![attempt_id, worktree.to_string_lossy()],
-                )
-                .ok();
-        }
-
-        let workspace_id = herdr
-            .workspace_id_for_label(&p.workspace)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no herdr workspace labelled `{}` — create it, or fix routing.toml",
-                    p.workspace
-                )
-            })?;
-
-        // Split into the routed workspace's active tab, so the agent is
-        // visible there and its approval prompts can be answered. A tab per
-        // attempt hid the agent until you went looking for it.
-        let placement =
-            herdr.agent_placement(&workspace_id, engine.cfg.defaults.max_panes_per_tab);
-        let pane_id = match placement {
-            Some(crate::herdr::Placement::Split { target, direction }) => {
-                let direction = engine
-                    .cfg
-                    .defaults
-                    .split_direction
-                    .as_deref()
-                    .filter(|d| *d != "auto")
-                    .unwrap_or(direction);
-                log.info(format!("splitting {target} {direction} for the agent"));
-                herdr.pane_split(&target, &worktree, direction)?
+        // herdr cuts the checkout and opens it as its own workspace, grouped
+        // under the parent repo in the spaces sidebar. A dispatched agent
+        // belongs in a space of its own — not a sliver of the tab you happen to
+        // be working in, and not a tab you will not notice.
+        //
+        // A retry reuses the existing checkout, because git allows a branch in
+        // only one worktree.
+        let wt = match herdr.worktree_create(&p.repo, &p.branch, &p.identifier) {
+            Ok(wt) => wt,
+            Err(e) if e.to_string().contains("already") || e.to_string().contains("exists") => {
+                log.info(format!("{} already has a checkout; reopening it", p.branch));
+                herdr.worktree_open(&p.repo, &p.branch)?
             }
-            // The tab is full. A fourth sliver helps nobody; the agent gets a
-            // tab of its own, labelled so the tab bar says which task it is.
-            Some(crate::herdr::Placement::NewTab) | None => {
-                log.info(format!(
-                    "tab is at its pane limit; giving {} a tab of its own",
-                    p.identifier
-                ));
-                let tab = herdr.tab_create(&workspace_id, &worktree, &p.identifier)?;
-                tab.root_pane_id
-            }
+            Err(e) => return Err(e),
         };
-        log.info(format!("agent pane {pane_id} in ws:{}", p.workspace));
+        log.info(format!(
+            "{} → workspace {} at {}",
+            p.identifier,
+            wt.workspace_id,
+            wt.path.display()
+        ));
+        engine
+            .db
+            .conn
+            .execute(
+                "UPDATE attempts SET worktree = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, wt.path.to_string_lossy()],
+            )
+            .ok();
+
+        let pane_id = wt.root_pane_id.clone();
         engine.db.set_attempt_pane(attempt_id, &pane_id)?;
 
         let name = agent_name(&p.identifier, p.attempt_no);
@@ -417,98 +395,73 @@ fn started(herdr: &Herdr, name: &str, ticks: u32) -> bool {
     false
 }
 
-/// Where a branch is already checked out, if anywhere.
+/// The agent that released a task, as the operator would recognise it.
 ///
-/// git allows one worktree per branch, so a retry cannot cut a second checkout
-/// of the same branch — and worktrees are never removed automatically, so the
-/// previous attempt's is still holding it. Reusing that checkout is also the
-/// behaviour you want: a retry should continue the work, not start beside it.
-fn worktree_holding_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "worktree", "list", "--porcelain"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut current: Option<&str> = None;
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current = Some(path);
-        } else if let Some(head) = line.strip_prefix("branch ")
-            && head.trim_start_matches("refs/heads/") == branch
-        {
-            return current.map(PathBuf::from);
-        }
-    }
-    None
+/// Cancelling is the one board action with a consequence off the board: it can
+/// strand a parent agent that is blocked on the child. The herd has no push
+/// channel — the board is how agents learn anything (see `list --json`'s
+/// `last_outcome`) — so the operator is the only actor who can go tell the
+/// parent, and that only works if the board says a parent exists.
+#[derive(Debug, Clone)]
+pub struct Parent {
+    /// The parent's issue identifier, e.g. `LIN-138`. Falls back to the raw task
+    /// id if the row is not on the board.
+    pub identifier: String,
+    /// The parent still holds a live attempt, so it is plausibly waiting. A
+    /// parent that has already finished is named without the claim.
+    pub live: bool,
 }
 
-/// Create (or reuse) the git worktree for an attempt. Returns the path used.
-fn prepare_worktree(
-    repo: &Path,
-    worktree: &Path,
-    branch: &str,
-    log: &Logger,
-) -> Result<PathBuf> {
-    if !repo.exists() {
-        bail!("repo path {} does not exist", repo.display());
+impl Parent {
+    /// The clause appended to a cancel confirmation.
+    pub fn phrase(&self) -> String {
+        if self.live {
+            format!("released by {}, which may be waiting on it", self.identifier)
+        } else {
+            format!("released by {}", self.identifier)
+        }
     }
-    if worktree.exists() {
-        log.info(format!("reusing worktree {}", worktree.display()));
-        return Ok(worktree.to_path_buf());
-    }
-    if let Some(existing) = worktree_holding_branch(repo, branch) {
-        log.info(format!(
-            "branch {branch} is already checked out at {}; reusing it",
-            existing.display()
-        ));
-        return Ok(existing);
-    }
-    if let Some(parent) = worktree.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+}
 
-    // Reuse the branch if it already exists (a retry lands on the same branch).
-    let exists = Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "rev-parse", "--verify"])
-        .arg(format!("refs/heads/{branch}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let wt = worktree.to_string_lossy().into_owned();
-    let repo_s = repo.to_string_lossy().into_owned();
-    let mut args: Vec<String> = vec!["-C".into(), repo_s, "worktree".into(), "add".into()];
-    if exists {
-        args.push(wt);
-        args.push(branch.to_string());
-    } else {
-        args.push(wt);
-        args.push("-b".into());
-        args.push(branch.to_string());
+/// Resolve a `dispatched_by` task id into something worth showing.
+fn parent_of(db: &Db, task_id: &str) -> Parent {
+    match db.get_task(task_id) {
+        Ok(Some(p)) => Parent {
+            identifier: p.identifier.clone(),
+            live: p.live_attempt().is_some(),
+        },
+        // The parent's row may have been reaped; the id is still the truth we
+        // have, and naming it beats saying nothing.
+        _ => Parent {
+            identifier: task_id.to_string(),
+            live: false,
+        },
     }
-    log.info(format!("git {}", args.join(" ")));
-
-    let out = Command::new("git")
-        .args(&args)
-        .output()
-        .context("running git worktree add")?;
-    if !out.status.success() {
-        bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(worktree.to_path_buf())
 }
 
 /// Cancel a live attempt: kill the pane, close the attempt, queue the trail.
 ///
 /// Cancelling ends the **attempt**, not the issue — the task derives back to
 /// `ready` with its history intact.
-pub fn cancel(engine: &SyncEngine, herdr: &Herdr, log: &Logger, task: &Task) -> Result<()> {
+///
+/// Returns the parent agent that released this task, when one did. The caller is
+/// expected to say so: the parent is not notified — nothing in the herd pushes —
+/// and the operator who pressed `x` is the only one in a position to tell it.
+pub fn cancel(
+    engine: &SyncEngine,
+    herdr: &Herdr,
+    log: &Logger,
+    task: &Task,
+) -> Result<Option<Parent>> {
     let Some(attempt) = task.live_attempt() else {
         bail!("{} has no live attempt", task.identifier);
     };
+    // Read the parent off the attempt before closing it: afterwards there is no
+    // live attempt to read it from.
+    let parent = attempt
+        .dispatched_by
+        .as_deref()
+        .map(|id| parent_of(&engine.db, id));
     if let Some(pane) = attempt.pane_id.as_deref()
         && let Err(e) = herdr.pane_close(pane)
     {
@@ -518,8 +471,15 @@ pub fn cancel(engine: &SyncEngine, herdr: &Herdr, log: &Logger, task: &Task) -> 
     }
     engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
     engine.enqueue_outcome(task, Outcome::Cancelled, None)?;
-    log.info(format!("cancelled {}", task.identifier));
-    Ok(())
+    match &parent {
+        Some(p) => log.info(format!(
+            "cancelled {} — {} (not notified; the board is the channel)",
+            task.identifier,
+            p.phrase()
+        )),
+        None => log.info(format!("cancelled {}", task.identifier)),
+    }
+    Ok(parent)
 }
 
 #[cfg(test)]
@@ -612,6 +572,120 @@ branch_template = "board/{identifier_lower}"
             })
             .unwrap();
         db.set_attempt_pane(a, pane).unwrap();
+    }
+
+    fn engine_with(db: Db) -> SyncEngine {
+        SyncEngine {
+            db,
+            cfg: cfg(),
+            credentials: Default::default(),
+            paths: paths(),
+            log: std::sync::Arc::new(Logger::new("", false)),
+            linear: None,
+            github: None,
+        }
+    }
+
+    /// Cancelling an agent-dispatched task hands the parent back, so the
+    /// operator can be told. Nothing in the herd pushes; this is the whole
+    /// notification path (AGE-3).
+    #[test]
+    fn cancelling_a_child_names_the_parent_that_released_it() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        working_agent(&db, "linear:LIN-138", "w1:p4");
+        // The child, released by LIN-138 and still live.
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-138".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        // Named by identifier, not the raw task id — that is what is on screen.
+        assert_eq!(parent.identifier, "LIN-138");
+        assert!(parent.live, "LIN-138 still holds its own attempt");
+        assert_eq!(
+            parent.phrase(),
+            "released by LIN-138, which may be waiting on it"
+        );
+    }
+
+    /// A parent that has already finished is named without the claim that it is
+    /// waiting — the operator should not be sent after an agent that is gone.
+    #[test]
+    fn a_finished_parent_is_named_but_not_called_waiting() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        working_agent(&db, "linear:LIN-138", "w1:p4");
+        let parent_attempt = db.live_attempts().unwrap()[0].id;
+        db.close_attempt(parent_attempt, Outcome::Done).unwrap();
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-138".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        assert_eq!(parent.phrase(), "released by LIN-138");
+    }
+
+    #[test]
+    fn cancelling_an_operator_dispatched_task_names_nobody() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        assert!(cancel(&engine, &h, &engine.log, &t).unwrap().is_none());
+    }
+
+    /// A reaped parent leaves an id with no row behind it. The id is still the
+    /// truth we have, and naming it beats saying nothing.
+    #[test]
+    fn a_parent_whose_row_is_gone_is_named_by_its_id() {
+        let db = Db::open_in_memory().unwrap();
+        let t = task(&db);
+        db.insert_attempt(&NewAttempt {
+            task_id: t.id.clone(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: Some("linear:LIN-999".into()),
+        })
+        .unwrap();
+        let engine = engine_with(db);
+        let t = engine.db.get_task(&t.id).unwrap().unwrap();
+        let h = Herdr::discover(engine.log.clone());
+        let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
+        assert_eq!(parent.identifier, "linear:LIN-999");
+        assert!(!parent.live);
     }
 
     #[test]

@@ -71,6 +71,16 @@ pub struct CreatedTab {
     pub root_pane_id: String,
 }
 
+/// A git worktree that herdr has opened as its own workspace, grouped under the
+/// parent repo in the spaces sidebar.
+#[derive(Debug, Clone)]
+pub struct CreatedWorktree {
+    pub workspace_id: String,
+    pub root_pane_id: String,
+    /// Where herdr put the checkout.
+    pub path: PathBuf,
+}
+
 pub struct Herdr {
     bin: PathBuf,
     log: Arc<Logger>,
@@ -209,6 +219,53 @@ impl Herdr {
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("pane list: no `panes` array"))?;
         Ok(arr.iter().filter_map(parse_pane).collect())
+    }
+
+    /// Cut a git worktree and open it as its own workspace.
+    ///
+    /// herdr does the checkout, the workspace, and the grouping under the
+    /// parent repo — which is where a dispatched agent belongs: a space of its
+    /// own in the sidebar, not a sliver of somebody else's tab.
+    ///
+    /// `--cwd` rather than `--workspace`: the routing config names a repo path,
+    /// and it works whether or not herdr has classified the routed workspace as
+    /// a repo.
+    pub fn worktree_create(
+        &self,
+        repo: &Path,
+        branch: &str,
+        label: &str,
+    ) -> Result<CreatedWorktree> {
+        let repo = repo.to_string_lossy().into_owned();
+        let r = self.run(&[
+            "worktree",
+            "create",
+            "--cwd",
+            &repo,
+            "--branch",
+            branch,
+            "--label",
+            label,
+            // Dispatching must not yank the operator out of the board.
+            "--no-focus",
+        ])?;
+        parse_worktree(&r)
+    }
+
+    /// Reopen the workspace for a branch that already has a checkout — what a
+    /// retry needs, since git allows a branch in only one worktree.
+    pub fn worktree_open(&self, repo: &Path, branch: &str) -> Result<CreatedWorktree> {
+        let repo = repo.to_string_lossy().into_owned();
+        let r = self.run(&[
+            "worktree",
+            "open",
+            "--cwd",
+            &repo,
+            "--branch",
+            branch,
+            "--no-focus",
+        ])?;
+        parse_worktree(&r)
     }
 
     pub fn tab_create(
@@ -612,6 +669,29 @@ pub fn tallest_rightmost(rects: &[PaneRect]) -> Option<String> {
         .map(|r| r.pane_id.clone())
 }
 
+fn parse_worktree(r: &Value) -> Result<CreatedWorktree> {
+    let root = r
+        .get("root_pane")
+        .ok_or_else(|| anyhow!("worktree: no .result.root_pane"))?;
+    Ok(CreatedWorktree {
+        workspace_id: root
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        root_pane_id: root
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("worktree: no root pane id"))?
+            .to_string(),
+        path: root
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("worktree: no cwd"))?,
+    })
+}
+
 fn parse_pane(p: &Value) -> Option<PaneInfo> {
     Some(PaneInfo {
         pane_id: p.get("pane_id")?.as_str()?.to_string(),
@@ -743,9 +823,8 @@ mod tests {
     }
 
     #[test]
-    fn two_agents_and_the_board_fill_a_tab() {
-        // The default: two agents stacked beside the board is the limit of what
-        // stays readable, so the third gets a tab.
+    fn a_tab_fills_before_anything_opens_a_new_one() {
+        // The board never counts, so the limit is about the working column.
         let mut panes = vec![board("w1:b", "w1", "w1:t1")];
         assert!(matches!(
             agent_placement_for(&panes, "w1", 2),
@@ -760,8 +839,14 @@ mod tests {
         assert_eq!(
             agent_placement_for(&panes, "w1", 2),
             Some(Placement::NewTab),
-            "a third agent belongs in its own tab"
+            "past the limit, a tab"
         );
+        // ...and the limit is the operator's to set: a tab is easy to miss, so
+        // some will prefer a tighter column to an agent out of sight.
+        assert!(matches!(
+            agent_placement_for(&panes, "w1", 3),
+            Some(Placement::Split { .. })
+        ));
     }
 
     #[test]

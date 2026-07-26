@@ -237,9 +237,12 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
             }
         }
         BoardState::Failed => "pane exited without completing".into(),
-        BoardState::Review => match v.task.pr_number {
-            Some(n) => format!("PR #{n} open · waiting on you"),
-            None => "waiting on you".into(),
+        BoardState::Review => match (v.task.pr_number, v.branch.as_deref()) {
+            (Some(n), _) => format!("PR #{n} open · waiting on you"),
+            // Finished on commits with no PR raised: say which branch, or the
+            // row reads as "waiting on you" with nowhere to look.
+            (None, Some(b)) => format!("{b} · no PR"),
+            (None, None) => "waiting on you".into(),
         },
         BoardState::Ready => {
             if !v.has_route {
@@ -569,11 +572,25 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
                 ("o", "open", 'o'),
                 ("?", "help", '?'),
             ],
-            Some(BoardState::Review) => vec![
-                ("o", "open PR", 'o'),
-                ("enter", "detail", '\r'),
-                ("?", "help", '?'),
-            ],
+            // Only promise a PR when there is one: work can reach `review` on
+            // commits alone, and `o` then opens the issue.
+            Some(BoardState::Review) => {
+                let has_pr = app.selected().is_some_and(|v| v.task.pr_number.is_some());
+                if has_pr {
+                    vec![
+                        ("m", "merge", 'm'),
+                        ("o", "open PR", 'o'),
+                        ("enter", "detail", '\r'),
+                        ("?", "help", '?'),
+                    ]
+                } else {
+                    vec![
+                        ("o", "open issue", 'o'),
+                        ("enter", "detail", '\r'),
+                        ("?", "help", '?'),
+                    ]
+                }
+            }
             Some(BoardState::Failed) => vec![
                 ("r", "retry", 'r'),
                 ("d", "mark done", 'd'),
@@ -594,21 +611,20 @@ fn render_footer(buf: &mut Buffer, area: Rect, y: u16, app: &mut App) {
     // A transient message and the cancel confirmation both replace the footer
     // inline rather than opening a second modal.
     if let Some(id) = &app.confirm {
-        let ident = app
-            .views
-            .iter()
-            .find(|v| v.id() == id)
-            .map(|v| v.task.identifier.clone())
-            .unwrap_or_default();
+        let merging = id.starts_with("merge:");
+        let bare = id.trim_start_matches("merge:");
+        let v = app.views.iter().find(|v| v.id() == bare);
+        let ident = v.map(|v| v.task.identifier.clone()).unwrap_or_default();
+        let question = if merging {
+            match v.and_then(|v| v.task.pr_number) {
+                Some(n) => format!("merge PR #{n} for {ident}?  "),
+                None => format!("merge {ident}?  "),
+            }
+        } else {
+            format!("cancel {ident} and kill its pane?  ")
+        };
         let mut x = 1;
-        x += put(
-            buf,
-            area,
-            x,
-            y,
-            &format!("cancel {ident} and kill its pane?  "),
-            theme::fg_default(),
-        );
+        x += put(buf, area, x, y, &question, theme::fg_default());
         x += put(buf, area, x, y, "y", theme::fg_default());
         x += put(buf, area, x, y, " yes  ", theme::dim());
         x += put(buf, area, x, y, "n", theme::fg_default());
@@ -1490,6 +1506,45 @@ mod tests {
             hints.iter().any(|(k, l, _)| *k == "l" && l.contains("detail")),
             "no detail hint on a ready row: {hints:?}"
         );
+    }
+
+    #[test]
+    fn a_review_row_only_promises_a_pr_when_there_is_one() {
+        // Work reaches `review` on commits alone, and `o` then opens the issue.
+        // A footer saying "open PR" in that case is simply a lie.
+        let mut app = fixtures::app(fixtures::POPULATED);
+        let with_pr = app
+            .views
+            .iter()
+            .find(|v| v.state() == BoardState::Review && v.task.pr_number.is_some())
+            .map(|v| v.id().to_string())
+            .unwrap();
+        app.selected_id = Some(with_pr);
+        let hints = footer_hints(&app);
+        assert!(hints.iter().any(|(_, l, _)| *l == "open PR"), "{hints:?}");
+        assert!(hints.iter().any(|(k, _, _)| *k == "m"), "merge offered");
+
+        // Strip the PR and the offer goes with it.
+        for v in &mut app.views {
+            v.task.pr_number = None;
+            v.task.pr_url = None;
+        }
+        let hints = footer_hints(&app);
+        assert!(hints.iter().any(|(_, l, _)| *l == "open issue"), "{hints:?}");
+        assert!(!hints.iter().any(|(k, _, _)| *k == "m"), "nothing to merge");
+    }
+
+    #[test]
+    fn a_review_row_without_a_pr_names_its_branch() {
+        let mut v = fixtures::app(fixtures::POPULATED)
+            .views
+            .iter()
+            .find(|v| v.state() == BoardState::Review)
+            .cloned()
+            .unwrap();
+        v.task.pr_number = None;
+        v.branch = Some("board/age-6".into());
+        assert_eq!(metadata(&v, false, 80), "board/age-6 · no PR");
     }
 
     #[test]

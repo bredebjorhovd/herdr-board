@@ -45,6 +45,8 @@ pub enum Action {
     Retry,
     MarkDone,
     Cancel,
+    /// Merge the pull request on a `review` row.
+    Merge,
     Sync,
     Help,
     ConfirmYes,
@@ -88,6 +90,7 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Retry,
         KeyCode::Char('d') => Action::MarkDone,
         KeyCode::Char('x') => Action::Cancel,
+        KeyCode::Char('m') => Action::Merge,
         KeyCode::Char('s') => Action::Sync,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
@@ -113,6 +116,7 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
                 'g' => Action::GoToPane,
                 'o' => Action::Open,
                 'x' => Action::Cancel,
+                'm' => Action::Merge,
                 'r' => Action::Retry,
                 'd' => Action::MarkDone,
                 's' => Action::Sync,
@@ -246,6 +250,17 @@ impl Board {
                     self.app.confirm = Some(v.id().to_string());
                 }
             }
+            Action::Merge => {
+                // Merging is the one thing the board does that cannot be undone
+                // from the board, so it confirms like a cancel does.
+                if let Some(v) = self.app.selected()
+                    && v.task.pr_number.is_some()
+                {
+                    self.app.confirm = Some(format!("{MERGE_PREFIX}{}", v.id()));
+                } else {
+                    self.app.flash("no pull request on this row");
+                }
+            }
             Action::ConfirmNo => self.app.confirm = None,
             Action::ConfirmYes => self.do_cancel()?,
             Action::Retry => self.retry()?,
@@ -343,6 +358,10 @@ impl Board {
         let Some(id) = self.app.confirm.take() else {
             return Ok(());
         };
+        if let Some(task_id) = id.strip_prefix(MERGE_PREFIX) {
+            let task_id = task_id.to_string();
+            return self.do_merge(&task_id);
+        }
         let Some(task) = self.engine.db.get_task(&id)? else {
             return Ok(());
         };
@@ -355,6 +374,23 @@ impl Board {
         }
         self.engine.rederive_all()?;
         self.reload()
+    }
+
+    fn do_merge(&mut self, task_id: &str) -> Result<()> {
+        let Some(task) = self.engine.db.get_task(task_id)? else {
+            return Ok(());
+        };
+        match self.engine.merge_pull_request(&task) {
+            Ok(what) => {
+                self.app.flash(format!("merged {what}"));
+                // The row only leaves `review` once the source says the PR is
+                // closed, so ask now rather than waiting for the next poll.
+                let _ = self.engine.sync_once(Some(&self.herdr));
+                self.reload()?;
+            }
+            Err(e) => self.app.flash(format!("merge failed: {e}")),
+        }
+        Ok(())
     }
 
     fn retry(&mut self) -> Result<()> {
@@ -387,6 +423,9 @@ impl Board {
         Ok(())
     }
 }
+
+/// Distinguishes a pending merge confirmation from a pending cancel.
+const MERGE_PREFIX: &str = "merge:";
 
 pub const PICKER_TASK: &str = "picker_task";
 pub const PICKER_RESULT: &str = "picker_result";

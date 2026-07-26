@@ -160,19 +160,32 @@ impl<T: GraphQl> Linear<T> {
         &self,
         labels: &[String],
         since: Option<&str>,
+        closed_since: Option<&str>,
     ) -> Result<Vec<LinearIssue>> {
-        let mut or_clauses = vec![json!({ "assignee": { "isMe": { "eq": true } } })];
+        let mut mine = vec![json!({ "assignee": { "isMe": { "eq": true } } })];
         if !labels.is_empty() {
-            or_clauses.push(json!({ "labels": { "name": { "in": labels } } }));
+            mine.push(json!({ "labels": { "name": { "in": labels } } }));
         }
-        let mut filter = json!({
-            "or": or_clauses,
-            "state": { "type": { "nin": ["completed", "canceled"] } },
-        });
+
+        // Unfinished work, plus anything finished recently.
+        //
+        // Excluding completed issues outright meant a Linear issue you closed
+        // simply vanished: dropped from the fetch, then reaped, and it never
+        // reached the board's `done` section at all. `closed_since` keeps
+        // today's finished work visible, and tomorrow it falls out of the
+        // filter and is reaped on its own.
+        let mut relevant = vec![json!({
+            "state": { "type": { "nin": ["completed", "canceled"] } }
+        })];
+        if let Some(c) = closed_since {
+            relevant.push(json!({ "updatedAt": { "gte": c } }));
+        }
+
+        let mut and = vec![json!({ "or": mine }), json!({ "or": relevant })];
         if let Some(s) = since {
-            filter["updatedAt"] = json!({ "gt": s });
+            and.push(json!({ "updatedAt": { "gt": s } }));
         }
-        self.paged_issues(filter)
+        self.paged_issues(json!({ "and": and }))
     }
 
     /// Issues we hold open attempts against, fetched regardless of the board
@@ -476,7 +489,7 @@ mod tests {
         let l = Linear::new(FixtureTransport::new(vec![one_page(
             json!([issue_json()]),
         )]));
-        let issues = l.fetch_board_issues(&["herd".into()], None).unwrap();
+        let issues = l.fetch_board_issues(&["herd".into()], None, None).unwrap();
         assert_eq!(issues.len(), 1);
         let i = &issues[0];
         assert_eq!(i.task_id(), "linear:LIN-142");
@@ -490,25 +503,45 @@ mod tests {
     #[test]
     fn filter_asks_for_viewer_or_label_and_excludes_terminal_states() {
         let l = Linear::new(FixtureTransport::new(vec![one_page(json!([]))]));
-        l.fetch_board_issues(&["herd".into()], Some("2026-07-25T00:00:00Z"))
+        l.fetch_board_issues(&["herd".into()], Some("2026-07-25T00:00:00Z"), None)
             .unwrap();
         let sent = l.transport.sent.borrow();
-        let f = &sent[0]["variables"]["filter"];
-        assert_eq!(f["or"][0]["assignee"]["isMe"]["eq"], json!(true));
-        assert_eq!(f["or"][1]["labels"]["name"]["in"], json!(["herd"]));
-        assert_eq!(f["state"]["type"]["nin"], json!(["completed", "canceled"]));
+        let and = &sent[0]["variables"]["filter"]["and"];
+        // Mine: assigned to me, or carrying a routing label.
+        assert_eq!(and[0]["or"][0]["assignee"]["isMe"]["eq"], json!(true));
+        assert_eq!(and[0]["or"][1]["labels"]["name"]["in"], json!(["herd"]));
+        // Relevant: not finished.
+        assert_eq!(
+            and[1]["or"][0]["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
         // The watermark keeps polls cheap.
-        assert_eq!(f["updatedAt"]["gt"], json!("2026-07-25T00:00:00Z"));
+        assert_eq!(and[2]["updatedAt"]["gt"], json!("2026-07-25T00:00:00Z"));
+    }
+
+    #[test]
+    fn recently_closed_issues_are_asked_for_too() {
+        // Otherwise a Linear issue you closed vanishes instead of appearing
+        // under `done today`.
+        let l = Linear::new(FixtureTransport::new(vec![one_page(json!([]))]));
+        l.fetch_board_issues(&[], None, Some("2026-07-26T00:00:00Z"))
+            .unwrap();
+        let sent = l.transport.sent.borrow();
+        let relevant = &sent[0]["variables"]["filter"]["and"][1]["or"];
+        assert_eq!(
+            relevant[1]["updatedAt"]["gte"],
+            json!("2026-07-26T00:00:00Z")
+        );
     }
 
     #[test]
     fn without_labels_the_filter_is_viewer_only() {
         let l = Linear::new(FixtureTransport::new(vec![one_page(json!([]))]));
-        l.fetch_board_issues(&[], None).unwrap();
+        l.fetch_board_issues(&[], None, None).unwrap();
         let sent = l.transport.sent.borrow();
-        let f = &sent[0]["variables"]["filter"];
-        assert_eq!(f["or"].as_array().unwrap().len(), 1);
-        assert!(f.get("updatedAt").is_none());
+        let and = &sent[0]["variables"]["filter"]["and"];
+        assert_eq!(and[0]["or"].as_array().unwrap().len(), 1);
+        assert_eq!(and.as_array().unwrap().len(), 2, "no watermark clause");
     }
 
     #[test]
@@ -523,7 +556,7 @@ mod tests {
         second["identifier"] = json!("LIN-143");
         second["id"] = json!("uuid-2");
         let l = Linear::new(FixtureTransport::new(vec![page1, one_page(json!([second]))]));
-        let issues = l.fetch_board_issues(&["herd".into()], None).unwrap();
+        let issues = l.fetch_board_issues(&["herd".into()], None, None).unwrap();
         assert_eq!(issues.len(), 2);
         // The second request carried the cursor.
         assert_eq!(l.transport.sent.borrow()[1]["variables"]["after"], json!("c1"));
@@ -541,7 +574,7 @@ mod tests {
             let mut n = issue_json();
             n["state"] = json!({ "name": "Anything At All", "type": ty });
             let l = Linear::new(FixtureTransport::new(vec![one_page(json!([n]))]));
-            let i = &l.fetch_board_issues(&[], None).unwrap()[0];
+            let i = &l.fetch_board_issues(&[], None, None).unwrap()[0];
             assert_eq!(i.upstream(), want, "state type {ty}");
         }
     }
@@ -585,7 +618,7 @@ mod tests {
             }
         }
         let l = Linear::new(Failing);
-        assert!(l.fetch_board_issues(&[], None).is_err());
+        assert!(l.fetch_board_issues(&[], None, None).is_err());
     }
 
     #[test]

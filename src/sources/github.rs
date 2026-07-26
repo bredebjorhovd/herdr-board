@@ -16,6 +16,8 @@ pub trait Rest {
     fn post(&self, path: &str, body: &Value) -> Result<Value>;
     /// PATCH with a JSON body (closing an issue).
     fn patch(&self, path: &str, body: &Value) -> Result<Value>;
+    /// PUT with a JSON body (merging a pull request).
+    fn put(&self, path: &str, body: &Value) -> Result<Value>;
 }
 
 pub struct HttpRest {
@@ -77,6 +79,10 @@ impl Rest for HttpRest {
 
     fn patch(&self, path: &str, body: &Value) -> Result<Value> {
         self.request(reqwest::Method::PATCH, path, Some(body))
+    }
+
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        self.request(reqwest::Method::PUT, path, Some(body))
     }
 }
 
@@ -221,6 +227,26 @@ impl<T: Rest> Github<T> {
         Ok(())
     }
 
+    /// Merge a pull request.
+    ///
+    /// Only ever from an explicit keypress with a confirmation — this is the
+    /// one action the board takes that cannot be undone from the board.
+    pub fn merge_pr(&self, repo: &str, number: i64) -> Result<()> {
+        let r = self.rest.put(
+            &format!("/repos/{repo}/pulls/{number}/merge"),
+            &serde_json::json!({ "merge_method": "merge" }),
+        )?;
+        // GitHub answers 200 with `merged: false` when it declines — a dirty
+        // mergeable_state, a required check, a review still outstanding.
+        if r.get("merged").and_then(Value::as_bool) == Some(false) {
+            bail!(
+                "github refused the merge: {}",
+                r.get("message").and_then(Value::as_str).unwrap_or("no reason given")
+            );
+        }
+        Ok(())
+    }
+
     /// Close on done. Without this, `d mark done` moves the row and the next
     /// poll recomputes `open` upstream and moves it straight back — a key that
     /// undoes itself.
@@ -358,6 +384,11 @@ impl Rest for FixtureRest {
         self.wrote.borrow_mut().push(("PATCH".into(), path.into(), body.clone()));
         Ok(Value::Null)
     }
+
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        self.wrote.borrow_mut().push(("PUT".into(), path.into(), body.clone()));
+        Ok(serde_json::json!({ "merged": true }))
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +494,32 @@ mod tests {
         assert_eq!(w[0].0, "PATCH");
         assert_eq!(w[0].1, "/repos/o/r/issues/87");
         assert_eq!(w[0].2["state"], "closed");
+    }
+
+    #[test]
+    fn merging_puts_to_the_merge_endpoint() {
+        let g = Github::new(FixtureRest::new(vec![]));
+        g.merge_pr("o/r", 508).unwrap();
+        let w = g.rest.wrote.borrow();
+        assert_eq!(w[0].0, "PUT");
+        assert_eq!(w[0].1, "/repos/o/r/pulls/508/merge");
+    }
+
+    #[test]
+    fn a_refused_merge_is_an_error_not_a_success() {
+        // GitHub answers 200 with merged:false when a check or review blocks it.
+        struct Refuses;
+        impl Rest for Refuses {
+            fn get(&self, _: &str) -> Result<Value> { Ok(Value::Null) }
+            fn post(&self, _: &str, _: &Value) -> Result<Value> { Ok(Value::Null) }
+            fn patch(&self, _: &str, _: &Value) -> Result<Value> { Ok(Value::Null) }
+            fn put(&self, _: &str, _: &Value) -> Result<Value> {
+                Ok(json!({ "merged": false, "message": "required status check is pending" }))
+            }
+        }
+        let g = Github::new(Refuses);
+        let err = g.merge_pr("o/r", 508).unwrap_err().to_string();
+        assert!(err.contains("required status check"), "{err}");
     }
 
     #[test]

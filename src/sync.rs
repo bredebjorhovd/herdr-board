@@ -30,6 +30,9 @@ impl Rest for Box<dyn Rest> {
     fn patch(&self, path: &str, body: &Value) -> Result<Value> {
         (**self).patch(path, body)
     }
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).put(path, body)
+    }
 }
 
 /// Health of one upstream source, rendered in the board header.
@@ -185,8 +188,24 @@ impl SyncEngine {
             .map(|t| t.source_id)
             .collect();
 
+        // Local midnight, so today's finished work stays on the board and
+        // yesterday's falls off by itself.
+        let today = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|d| {
+                d.and_local_timezone(chrono::Local)
+                    .earliest()
+                    .map(|t| crate::db::rfc3339(t.with_timezone(&chrono::Utc)))
+            })
+            .unwrap_or_default();
+
         let result = linear
-            .fetch_board_issues(&self.cfg.sync.labels, watermark.as_deref())
+            .fetch_board_issues(
+                &self.cfg.sync.labels,
+                watermark.as_deref(),
+                today.as_deref(),
+            )
             .and_then(|mut issues| {
                 let extra = linear.fetch_issues_by_id(&live_ids)?;
                 let known: std::collections::HashSet<_> =
@@ -859,6 +878,32 @@ impl SyncEngine {
             }
         }
         Ok(())
+    }
+
+    /// Merge the pull request on a task, if it has one.
+    pub fn merge_pull_request(&self, task: &Task) -> Result<String> {
+        let Some(number) = task.pr_number else {
+            anyhow::bail!("{} has no pull request", task.identifier);
+        };
+        let Some(gh) = &self.github else {
+            anyhow::bail!("no GitHub credentials");
+        };
+        // The repo comes from the task id for a PR row, or from the PR url for
+        // a task whose PR was linked by branch.
+        let repo = split_gh_task_id(&task.id)
+            .map(|(r, _)| r)
+            .or_else(|| {
+                let url = task.pr_url.as_deref()?;
+                let rest = url.split("github.com/").nth(1)?;
+                let mut parts = rest.split('/');
+                Some(format!("{}/{}", parts.next()?, parts.next()?))
+            })
+            .ok_or_else(|| anyhow::anyhow!("cannot tell which repo {} belongs to", task.identifier))?;
+
+        gh.merge_pr(&repo, number)?;
+        self.log
+            .info(format!("merged {repo}#{number} for {}", task.identifier));
+        Ok(format!("{repo}#{number}"))
     }
 
     // ---- health for the header -----------------------------------------

@@ -223,6 +223,7 @@ would find out about anything else.
 | `o` | any row | open the issue (or the PR) in a browser |
 | `r` | failed row | re-dispatch as a new attempt |
 | `d` | failed row | mark done on the board |
+| `m` | review with a PR | merge the pull request — confirms first |
 | `x` | working, blocked | cancel — confirms, then kills the pane |
 | `s` | anywhere | sync now |
 | `?` | anywhere | help |
@@ -240,7 +241,7 @@ prefix always reaches herdr.
 | blocked | `▲` | the agent is waiting on an approval or a question |
 | working | `●` | an agent has the task |
 | ready | `▸` | nothing running; `enter` dispatches |
-| review | `✓` | finished, or a PR is open — waiting on you |
+| review | `✓` | finished, or a PR is open — waiting on you. `m` merges it |
 | failed | `✕` | the pane exited without completing |
 | done | `·` | the issue is closed |
 

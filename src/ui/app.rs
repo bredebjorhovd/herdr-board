@@ -272,9 +272,8 @@ impl Board {
     fn on_enter(&mut self) -> Result<()> {
         // On the collapsed done header, enter expands it in place.
         if self.app.on_done_header() {
-            self.app.done_expanded = true;
-            // Land on the first row it revealed, rather than nowhere.
-            self.app.selected_id = self.app.visible_task_ids().last().cloned();
+            // Toggle: the header is the only way in and the only way out.
+            self.app.done_expanded = !self.app.done_expanded;
             return Ok(());
         }
         let Some(v) = self.app.selected().cloned() else {

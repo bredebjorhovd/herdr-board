@@ -256,10 +256,14 @@ impl App {
     pub fn visible_task_ids(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (state, rows) in self.sections() {
-            if state == BoardState::Done && !self.done_expanded {
-                // The collapsed header itself is where the cursor lands.
+            if state == BoardState::Done {
+                // The header is a row either way: collapsed it is the only way
+                // to open the section, expanded it is the only way to close it
+                // again.
                 out.push(DONE_ROW.to_string());
-                continue;
+                if !self.done_expanded {
+                    continue;
+                }
             }
             out.extend(rows.iter().map(|v| v.id().to_string()));
         }
@@ -512,13 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_done_header_is_reachable_by_keyboard() {
-        // `enter` is the only thing that expands it, so if the cursor cannot
-        // land there the section can only be opened with a mouse.
+    fn the_done_header_is_reachable_however_it_is_folded() {
+        // `enter` on the header is the only way in and the only way out, so it
+        // has to stay selectable in both states.
         let mut a = app();
         assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", DONE_ROW]);
         a.done_expanded = true;
-        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", "c"]);
+        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", DONE_ROW, "c"]);
     }
 
     #[test]

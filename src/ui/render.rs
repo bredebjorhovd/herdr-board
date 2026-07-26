@@ -307,8 +307,13 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
         // most of the board.
         let mut lines: Vec<Row> = Vec::new();
         for (state, rows) in sections {
-            if state == BoardState::Done && !app.done_expanded {
+            if state == BoardState::Done {
+                // One selectable header, whichever way the section is folded.
                 lines.push(Row::DoneCollapsed);
+                if !app.done_expanded {
+                    continue;
+                }
+                lines.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
                 continue;
             }
             lines.push(Row::Section(state));
@@ -322,7 +327,7 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
         for row in lines.iter().skip(app.scroll).take(height) {
             match row {
                 Row::DoneCollapsed => {
-                    render_done_collapsed(buf, area, y);
+                    render_done_header(buf, area, y, app.done_expanded);
                     if app.on_done_header() {
                         reverse_row(buf, area, y, COL_GUTTER);
                     }
@@ -428,7 +433,7 @@ fn render_section_header(buf: &mut Buffer, area: Rect, y: u16, state: BoardState
     );
 }
 
-fn render_done_collapsed(buf: &mut Buffer, area: Rect, y: u16) {
+fn render_done_header(buf: &mut Buffer, area: Rect, y: u16, expanded: bool) {
     put(
         buf,
         area,
@@ -439,7 +444,11 @@ fn render_done_collapsed(buf: &mut Buffer, area: Rect, y: u16) {
     );
     let label = "DONE today  ";
     let used = put(buf, area, COL_ID, y, label, theme::bold());
-    let hint = "enter to expand  ";
+    let hint = if expanded {
+        "enter to collapse  "
+    } else {
+        "enter to expand  "
+    };
     let used2 = put(buf, area, COL_ID + used, y, hint, theme::dim());
     rule(
         buf,
@@ -523,6 +532,10 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
                 }
                 _ => {}
             }
+            // Detail is where you go to decide; merging is the decision.
+            if app.selected().is_some_and(|v| v.task.pr_number.is_some()) {
+                v.push(("m", "merge", 'm'));
+            }
             v.push(("?", "help", '?'));
             v
         }
@@ -542,7 +555,11 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
             v
         }
         Screen::List if app.on_done_header() => vec![
-            ("enter", "expand", '\r'),
+            (
+                "enter",
+                if app.done_expanded { "collapse" } else { "expand" },
+                '\r',
+            ),
             ("s", "sync", 's'),
             ("?", "help", '?'),
         ],
@@ -965,10 +982,13 @@ pub fn clamp_scroll(
     let Some(id) = selected else {
         return scroll.min(max);
     };
-    let Some(ix) = lines
-        .iter()
-        .position(|r| matches!(r, Row::Task(t) if t == id))
-    else {
+    // The `done` header is a selectable row that is not a task, so it has to be
+    // findable here too or selecting it below the fold scrolls nowhere.
+    let Some(ix) = lines.iter().position(|r| match r {
+        Row::Task(t) => t == id,
+        Row::DoneCollapsed => id == crate::ui::state::DONE_ROW,
+        Row::Section(_) => false,
+    }) else {
         return scroll.min(max);
     };
     // Keep the section header above the selection visible where it is cheap to
@@ -1107,11 +1127,13 @@ mod tests {
         for id in &ids {
             app.selected_id = Some(id.clone());
             let buf = draw(&mut app, 80, 12);
-            let on_screen = app
-                .rows
-                .iter()
-                .any(|(_, r)| matches!(r, Row::Task(t) if t == id));
-            assert!(on_screen, "{id} was selected but never drawn");
+            let on_screen = app.rows.iter().any(|(_, r)| match r {
+                Row::Task(t) => t == id,
+                // The `done` header is selectable but is not a task.
+                Row::DoneCollapsed => id == crate::ui::state::DONE_ROW,
+                Row::Section(_) => false,
+            });
+            assert!(on_screen, "{id:?} was selected but never drawn");
             let _ = buf;
         }
     }
@@ -1506,6 +1528,41 @@ mod tests {
             hints.iter().any(|(k, l, _)| *k == "l" && l.contains("detail")),
             "no detail hint on a ready row: {hints:?}"
         );
+    }
+
+    #[test]
+    fn detail_offers_merge_when_the_task_has_a_pr() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.screen = Screen::Detail;
+        app.selected_id = app
+            .views
+            .iter()
+            .find(|v| v.task.pr_number.is_some())
+            .map(|v| v.id().to_string());
+        assert!(footer_hints(&app).iter().any(|(k, l, _)| *k == "m" && *l == "merge"));
+
+        // ...and not otherwise.
+        app.selected_id = app
+            .views
+            .iter()
+            .find(|v| v.task.pr_number.is_none())
+            .map(|v| v.id().to_string());
+        assert!(!footer_hints(&app).iter().any(|(k, _, _)| *k == "m"));
+    }
+
+    #[test]
+    fn the_done_header_toggles_both_ways() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.selected_id = Some(crate::ui::state::DONE_ROW.into());
+        let collapsed = footer_hints(&app);
+        assert!(collapsed.iter().any(|(_, l, _)| *l == "expand"), "{collapsed:?}");
+
+        app.done_expanded = true;
+        let expanded = footer_hints(&app);
+        assert!(expanded.iter().any(|(_, l, _)| *l == "collapse"), "{expanded:?}");
+
+        // The header survives expansion, or there is no way back.
+        assert!(app.visible_task_ids().contains(&crate::ui::state::DONE_ROW.to_string()));
     }
 
     #[test]

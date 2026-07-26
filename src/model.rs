@@ -382,6 +382,16 @@ impl Task {
         self.attempts.iter().find(|a| a.outcome.is_none())
     }
 
+    /// The most recent attempt that has ended, if any.
+    ///
+    /// The single definition of "how did the last go", shared by `derive_state`
+    /// and by `list --json`. A parent agent polling for its child reads the same
+    /// fact the board derives from, so the two can never disagree about whether
+    /// a `ready` row was cancelled or never ran.
+    pub fn last_closed_attempt(&self) -> Option<&Attempt> {
+        self.attempts.iter().rev().find(|a| a.outcome.is_some())
+    }
+
     /// Attempt count, used for the `attempt <n>` writeback comment.
     pub fn attempt_count(&self) -> usize {
         self.attempts.len()

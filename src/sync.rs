@@ -1040,12 +1040,7 @@ pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus
             .or(a.agent_status)
             .unwrap_or(AgentStatus::Unknown)
     });
-    let last_outcome = task
-        .attempts
-        .iter()
-        .rev()
-        .find(|a| a.outcome.is_some())
-        .and_then(|a| a.outcome);
+    let last_outcome = task.last_closed_attempt().and_then(|a| a.outcome);
     Derivation {
         upstream: task.upstream,
         live,

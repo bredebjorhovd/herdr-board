@@ -202,11 +202,53 @@ and parents routinely sit in different sections — a child in `ready` under a
 parent in `working` — and the fixed section order is the spine of the design.
 If chains need to be legible as chains, that is a separate view.
 
-**Still open:** cancelling an agent-dispatched task with `x` does not notify the
-parent agent, which may be blocking on it. That needs a decision about whether
-the herd has any parent/child signalling at all before there is anything to
-design — so for now, cancel kills the child and the parent finds out the way it
-would find out about anything else.
+### Cancelling a child, and what the parent is told
+
+Nothing is pushed to the parent. **The board is the channel** — the same one it
+already learns everything through.
+
+The question this settles is whether the herd gains parent/child signalling.
+It does not. A parent agent already discovers completion, failure and open pull
+requests exactly one way: by polling `herdr-board list --json`. Cancellation was
+not missing a channel, it was invisible *on* the existing one — `cancelled`
+derives back to `ready`, deliberately, because the issue is still owed, and a
+`ready` row looked identical whether the operator had killed it or it had never
+been dispatched. So the fix is a field, not a protocol:
+
+```json
+{ "identifier": "LIN-145", "state": "ready",
+  "last_outcome": "cancelled", "last_outcome_at": "2026-07-26T20:41:07Z",
+  "dispatched_by": "linear:LIN-138" }
+```
+
+A parent polling its child sees `ready` + `cancelled` and knows to stop waiting.
+
+**The contract for a parent agent:** if you dispatch, you poll. Do not block
+indefinitely on a child — it can be cancelled out from under you at any moment
+by an operator who owes you nothing. Poll `list --json`, and treat
+`last_outcome: cancelled` on a row you released as the end of that line of work.
+
+**Pushing a prompt into the parent's pane was rejected.** herdr can do it —
+`agent prompt` is right there, and dispatch already uses it — but delivery into a
+running agent is unreliable by construction (see `deliver_prompt`, which exists
+entirely to fight this: agents swallow pastes mid-turn, and the only evidence of
+arrival is the screen changing). Beyond that, `dispatched_by` names a *task*, and
+the parent's own pane is frequently gone by the time you cancel; and one operator
+keystroke turning into a second agent talking unprompted is action at a distance
+in a tool whose whole premise is that you can see what is running.
+
+**What the operator is told instead.** Cancelling is the one board action with a
+consequence off the board, and the operator is the only one who can act on it —
+so `x` on an agent-dispatched row names the parent rather than repeating that the
+issue is still open:
+
+```
+✓ cancelled LIN-145 — released by LIN-138, which may be waiting on it
+```
+
+`herdr-board cancel` prints the same, followed by `— not notified`. A parent
+whose own attempt has already ended is still named, without the claim that it is
+waiting: telling you to go poke a finished agent would be worse than silence.
 
 ## Using it
 
@@ -365,27 +407,43 @@ The header tells you which layer is unhappy:
 
 ## Driving the board from an agent
 
-An orchestrator has a complete loop: read the board, release work, cancel it.
+An orchestrator has a complete loop: read the board, release work, follow it,
+cancel it.
 
 ```bash
 herdr-board list --state ready --json     # what can be picked up
 herdr-board list --state review --json    # finished work with PRs waiting
 herdr-board dispatch --task gh:owner/repo#87
+herdr-board list --json                   # poll: how is my child doing?
 herdr-board cancel   --task gh:owner/repo#87
 ```
 
+The fourth line is not optional. Polling is the **only** way work you released
+reports back — there is no callback, no signal, and no message. A child that
+finished, failed, or was cancelled by the operator looks like nothing at all
+until you look.
+
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,
-`pr_number`, `branch`, `dispatched_by`, `attempts`, `dispatchable`, and `gone`.
+`pr_number`, `branch`, `dispatched_by`, `last_outcome`, `last_outcome_at`,
+`attempts`, `dispatchable`, and `gone`.
 `dispatchable` is false when no route matches *or* the row is `gone`, in which
 case `dispatch` will refuse it; `gone` tells the two apart, since only one of
 them is fixed by editing `routing.toml`. Rows come back in board order, so the
 most urgent are first. Read this rather than `board.db` directly: the schema is
 ours to change, this shape is not.
 
+`last_outcome` is how the most recent *ended* attempt ended — `done`, `failed`,
+`cancelled` or `orphaned` — with `last_outcome_at` saying when. It stays set
+while a newer attempt is live, so a retry does not erase how the previous one
+went. This is what makes a cancelled child legible: `state` alone cannot
+distinguish a row the operator killed from one that was never dispatched, since
+both are `ready`. See "Cancelling a child, and what the parent is told".
+
 `dispatch` from inside an agent's own pane records that agent as the parent
 automatically (see above), so a chain of work stays attributable without anyone
-passing ids around.
+passing ids around. **If you dispatch, you poll** — nothing notifies you, and a
+child can be cancelled out from under you at any time.
 
 `list` reads whatever the daemon last wrote. Force a refresh first with
 `herdr-board sync --once` if freshness matters more than latency.

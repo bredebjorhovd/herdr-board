@@ -236,9 +236,14 @@ fn main() -> Result<()> {
                 .db
                 .get_task(&task)?
                 .ok_or_else(|| anyhow::anyhow!("no task {task}"))?;
-            dispatch::cancel(&engine, &h, &log, &t)?;
+            let parent = dispatch::cancel(&engine, &h, &log, &t)?;
             engine.rederive_all()?;
             println!("cancelled {} — the issue is still open", t.identifier);
+            // Nothing tells the parent. Say so where the operator will see it,
+            // rather than leaving a blocked agent to be discovered later.
+            if let Some(p) = parent {
+                println!("{} — not notified", p.phrase());
+            }
             Ok(())
         }
         Command::Gc {

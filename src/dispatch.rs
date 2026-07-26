@@ -668,7 +668,7 @@ branch_template = "board/{identifier_lower}"
     fn a_github_identifier_makes_a_shell_safe_branch() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_task(&crate::db::UpsertTask {
-            id: "gh:Florin-AS/Tally#506".into(),
+            id: "gh:acme/widgets#506".into(),
             source: Source::Github,
             source_id: "n".into(),
             identifier: "gh#506".into(),
@@ -683,11 +683,11 @@ branch_template = "board/{identifier_lower}"
             updated_at: crate::db::now(),
         })
         .unwrap();
-        let t = db.get_task("gh:Florin-AS/Tally#506").unwrap().unwrap();
+        let t = db.get_task("gh:acme/widgets#506").unwrap().unwrap();
         let c: RoutingConfig = toml::from_str(
             r#"
 [[route]]
-match = { gh_repo = "Florin-AS/Tally" }
+match = { gh_repo = "acme/widgets" }
 workspace = "tally"
 repo = "/tmp"
 runtime = "claude-code"

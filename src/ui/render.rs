@@ -318,7 +318,12 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
         let mut y = body_top;
         for row in lines.iter().skip(app.scroll).take(height) {
             match row {
-                Row::DoneCollapsed => render_done_collapsed(buf, area, y),
+                Row::DoneCollapsed => {
+                    render_done_collapsed(buf, area, y);
+                    if app.on_done_header() {
+                        reverse_row(buf, area, y, COL_GUTTER);
+                    }
+                }
                 Row::Section(state) => render_section_header(buf, area, y, *state),
                 Row::Task(id) => {
                     let Some(v) = app.views.iter().find(|v| v.id() == id) else {
@@ -533,6 +538,11 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
             v.push(("?", "help", '?'));
             v
         }
+        Screen::List if app.on_done_header() => vec![
+            ("enter", "expand", '\r'),
+            ("s", "sync", 's'),
+            ("?", "help", '?'),
+        ],
         Screen::List => match app.selected().map(|s| s.state()) {
             // `l detail` is a deliberate addition to the design's footer table.
             // On a ready row `enter` dispatches, so without this there is no

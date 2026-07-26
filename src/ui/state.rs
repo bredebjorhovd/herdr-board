@@ -162,6 +162,13 @@ impl SyncStatus {
     }
 }
 
+/// The collapsed `done` header, as a selectable row.
+///
+/// It has to be reachable by keyboard or the section cannot be expanded without
+/// a mouse — `enter` is the only thing that opens it, and the cursor could never
+/// land there.
+pub const DONE_ROW: &str = "\u{0}done";
+
 /// A row on screen, for rendering and for mouse hit-testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
@@ -242,6 +249,8 @@ impl App {
         let mut out = Vec::new();
         for (state, rows) in self.sections() {
             if state == BoardState::Done && !self.done_expanded {
+                // The collapsed header itself is where the cursor lands.
+                out.push(DONE_ROW.to_string());
                 continue;
             }
             out.extend(rows.iter().map(|v| v.id().to_string()));
@@ -249,6 +258,13 @@ impl App {
         out
     }
 
+    /// Is the cursor on the collapsed `done` header?
+    pub fn on_done_header(&self) -> bool {
+        self.selected_id.as_deref() == Some(DONE_ROW)
+    }
+
+    /// The selected task, or `None` — including when the cursor is on the
+    /// collapsed `done` header, which is a row but not a task.
     pub fn selected(&self) -> Option<&TaskView> {
         let id = self.selected_id.as_deref()?;
         self.views.iter().find(|v| v.id() == id)
@@ -443,11 +459,21 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_done_section_is_not_navigable() {
+    fn the_collapsed_done_header_is_reachable_by_keyboard() {
+        // `enter` is the only thing that expands it, so if the cursor cannot
+        // land there the section can only be opened with a mouse.
         let mut a = app();
-        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a"]);
+        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", DONE_ROW]);
         a.done_expanded = true;
         assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn the_done_header_is_a_row_but_not_a_task() {
+        let mut a = app();
+        a.selected_id = Some(DONE_ROW.into());
+        assert!(a.on_done_header());
+        assert!(a.selected().is_none());
     }
 
     #[test]
@@ -460,7 +486,10 @@ mod tests {
         let mut a = app();
         a.select_delta(-1);
         assert_eq!(a.selected_id.as_deref(), Some("d"));
+        // The last row is the collapsed `done` header, not a task.
         a.select_delta(99);
+        assert_eq!(a.selected_id.as_deref(), Some(DONE_ROW));
+        a.select_delta(-1);
         assert_eq!(a.selected_id.as_deref(), Some("a"));
     }
 

@@ -256,12 +256,10 @@ impl Board {
 
     fn on_enter(&mut self) -> Result<()> {
         // On the collapsed done header, enter expands it in place.
-        if self.app.screen == Screen::List
-            && self.app.selected().is_none_or(|v| v.state() != BoardState::Done)
-            && self.app.rows.iter().any(|(_, r)| *r == Row::DoneCollapsed)
-            && self.app.selected().is_none()
-        {
+        if self.app.on_done_header() {
             self.app.done_expanded = true;
+            // Land on the first row it revealed, rather than nowhere.
+            self.app.selected_id = self.app.visible_task_ids().last().cloned();
             return Ok(());
         }
         let Some(v) = self.app.selected().cloned() else {

@@ -93,6 +93,13 @@ impl SyncEngine {
         }
 
         self.rederive_all()?;
+        // After deriving, so a task that just reached `done` is disposed of on
+        // the same tick rather than the next.
+        if let Some(h) = herdr
+            && let Err(e) = self.dispose_finished_panes(h)
+        {
+            self.log.warn(format!("disposing finished panes: {e}"));
+        }
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(())
@@ -558,6 +565,50 @@ impl SyncEngine {
             self.rederive_all()?;
         }
         Ok(changed)
+    }
+
+    /// Close panes belonging to tasks that are finished for good.
+    ///
+    /// An attempt closing leaves its pane alone on purpose — that is the moment
+    /// you want to read what the agent did. Once the *task* reaches `done`,
+    /// though, the pane is an idle agent in a checkout nobody is going to look
+    /// at again, and leaving it costs a slot in the layout for the rest of the
+    /// session.
+    pub fn dispose_finished_panes(&self, herdr: &Herdr) -> Result<usize> {
+        let mut closed = 0;
+        for task in self.db.load_tasks()? {
+            if task.state != BoardState::Done {
+                continue;
+            }
+            let live_panes: std::collections::HashSet<String> = herdr
+                .pane_list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.pane_id)
+                .collect();
+            for attempt in &task.attempts {
+                // Only closed attempts: a live one is still running, and
+                // `cancel` is the way to end that.
+                let (Some(pane), Some(_)) = (attempt.pane_id.as_deref(), attempt.outcome)
+                else {
+                    continue;
+                };
+                if !live_panes.contains(pane) {
+                    continue;
+                }
+                match herdr.pane_close(pane) {
+                    Ok(()) => {
+                        self.log.info(format!(
+                            "{} is done — closed its pane {pane}",
+                            task.identifier
+                        ));
+                        closed += 1;
+                    }
+                    Err(e) => self.log.warn(format!("closing {pane}: {e}")),
+                }
+            }
+        }
+        Ok(closed)
     }
 
     /// Recompute and persist every task's derived state, using the agent status

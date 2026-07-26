@@ -1,0 +1,33 @@
+{
+  "issues": {
+    "pageInfo": { "hasNextPage": false, "endCursor": null },
+    "nodes": [
+      {
+        "id": "b1d4c9e0-0000-4000-8000-000000000151",
+        "identifier": "TAL-151",
+        "title": "Tidy the changelog script",
+        "description": "Nothing routes this team, so the board shows it but cannot dispatch it.",
+        "url": "https://linear.app/offhand/issue/TAL-151",
+        "updatedAt": "2026-07-25T12:00:00.000Z",
+        "state": { "name": "Backlog", "type": "backlog" },
+        "team": { "key": "TAL" },
+        "project": null,
+        "labels": { "nodes": [] },
+        "attachments": { "nodes": [] }
+      },
+      {
+        "id": "b1d4c9e0-0000-4000-8000-000000000118",
+        "identifier": "OFF-118",
+        "title": "Bump rusqlite to 0.40",
+        "description": null,
+        "url": "https://linear.app/offhand/issue/OFF-118",
+        "updatedAt": "2026-07-25T09:15:00.000Z",
+        "state": { "name": "Done", "type": "completed" },
+        "team": { "key": "OFF" },
+        "project": null,
+        "labels": { "nodes": [{ "name": "herd" }] },
+        "attachments": { "nodes": [] }
+      }
+    ]
+  }
+}

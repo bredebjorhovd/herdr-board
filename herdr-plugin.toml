@@ -1,0 +1,91 @@
+id = "board"
+name = "Board"
+version = "0.1.0"
+# 0.7.5 is the version every CLI verb and response shape here was verified
+# against (`herdr completion zsh` plus the docs). Some of these APIs are older,
+# but 0.7.5 is the oldest we have actually checked, so it is what we claim.
+min_herdr_version = "0.7.5"
+description = "Task board: Linear/GitHub in, herdr panes out"
+# Unix only: the daemon detaches with setsid(2).
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# One-shot, not supervised: `--ensure` checks the pidfile, spawns the daemon
+# detached if it is absent, and exits immediately. Safe to re-run, which matters
+# because startup hooks run again when a new server takes over during live
+# handoff.
+[[startup]]
+command = ["./target/release/herdr-board", "syncd", "--ensure"]
+
+# A split, not a tab and not an overlay. The board is global — one queue across
+# every workspace — but it has to sit *beside* what you are doing, not on top of
+# it: an overlay zooms over the active pane, so you cannot read the board and
+# your work at once, and you have to close it to get back. A split is an ordinary
+# pane, so prefix navigation moves between it and your work, and closing it
+# restores the layout.
+#
+# The direction is passed at open time (`--placement split --direction right`),
+# not declared here — the manifest has no direction field.
+[[panes]]
+id = "board"
+title = "Board"
+placement = "split"
+command = ["./target/release/herdr-board", "pane"]
+
+[[panes]]
+id = "picker"
+title = "Dispatch"
+placement = "popup"
+# Outer terminal cells. herdr draws the border, so the interior is roughly two
+# cells narrower and shorter — this yields the 60x14 interior the design
+# specifies. The picker renders relative to the area it is given, so a clamp to
+# the popup minimum degrades rather than breaks.
+width = 62
+height = 16
+command = ["./target/release/herdr-board", "picker"]
+
+[[actions]]
+id = "sync"
+title = "Sync board sources"
+contexts = ["workspace"]
+command = ["./target/release/herdr-board", "sync", "--once"]
+
+# Bind this to a key to get the toggle (see README):
+#   [[keys.command]]
+#   key = "prefix+b"
+#   type = "plugin_action"
+#   command = "board.toggle"
+[[actions]]
+id = "toggle"
+title = "Board"
+contexts = ["workspace"]
+command = ["./target/release/herdr-board", "toggle"]
+
+[[actions]]
+id = "open-link"
+title = "Open in board"
+contexts = ["workspace"]
+command = ["./target/release/herdr-board", "open-link"]
+
+# An optimization, never a dependency: a pane exiting is how an attempt becomes
+# orphaned, and reacting to the event finds it sooner than the next poll would.
+# The daemon's poll loop remains authoritative and sufficient on its own.
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-board", "sync", "--once"]
+
+[[link_handlers]]
+id = "github-issue"
+title = "Open in board"
+pattern = "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+"
+action = "open-link"
+
+[[link_handlers]]
+id = "linear-issue"
+title = "Open in board"
+pattern = "^https://linear\\.app/[^/]+/issue/[A-Z0-9]+-[0-9]+"
+# Lands on the list with that row selected, focusing the board if it is already
+# open rather than opening a second copy.
+action = "open-link"

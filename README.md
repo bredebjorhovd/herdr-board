@@ -1,0 +1,563 @@
+# herdr-board
+
+A personal task board that runs inside [herdr](https://herdr.dev). Linear issues
+(read-write) and GitHub issues/PRs (read-only) come in; one keypress sends a task
+into a herdr pane with a coding agent; pane state reconciles back to the board
+and to Linear.
+
+Single operator, local-first, no cloud components. Target: herdr ≥ 0.7.5.
+
+```
+ herdr-board                                       linear ✓   gh ✓   synced 12s
+ ──────────────────────────────────────────────────────────────────────────────
+ ▲ BLOCKED  ───────────────────────────────────────────────────────────────────
+ ▲ LIN-131   Signicat callback drops the state …  claude-code ws:offhand  6m52s
+ ● WORKING  ───────────────────────────────────────────────────────────────────
+ ● LIN-138   Rewrite the Tripletex sync cursor    claude-code ws:offhand  9m04s
+ ● LIN-140   Backfill missing orgnr on le…  claude-code ws:offhand  idle 11m06s
+ ▸ READY  ─────────────────────────────────────────────────────────────────────
+ ▸ LIN-145   Add retry to Altinn poller                     [enter to dispatch]
+ ▸ LIN-151   Tidy the changelog script                                 no route
+ ✓ REVIEW  ────────────────────────────────────────────────────────────────────
+ ✓ LIN-129   Split the MVA report by term         PR #291 open · waiting on you
+ ✕ FAILED  ────────────────────────────────────────────────────────────────────
+ ✕ LIN-122   Migrate the Maskinporten client id  pane exited without completing
+ · DONE today  enter to expand  ───────────────────────────────────────────────
+ ──────────────────────────────────────────────────────────────────────────────
+ enter dispatch · o open in browser · s sync · ? help
+```
+
+## Setup
+
+### 1. Build and link
+
+```bash
+git clone <this repo> ~/dev/herdr-board
+cd ~/dev/herdr-board
+cargo build --release
+herdr plugin link "$PWD"
+```
+
+`plugin link` is the right command while developing locally; it does not run
+build commands, so build first. Installation is global to your user and
+available in every herdr session.
+
+### 2. Add credentials
+
+Both keys live in one file. **Append** to it rather than overwriting, or you
+will drop whichever key is already there:
+
+```bash
+CFG="$(herdr plugin config-dir board)"
+cat >> "$CFG/.env" <<'EOF'
+LINEAR_API_KEY=lin_api_...
+# Needed as soon as any repo is listed under [github]. A private repo answers
+# 404 rather than 401 without it, so the symptom is not obviously an auth
+# problem — `doctor` checks each repo and says so.
+GITHUB_TOKEN=ghp_...
+EOF
+chmod 600 "$CFG/.env"
+```
+
+If you already use the `gh` CLI, its token works and needs no new secret:
+
+```bash
+{ printf 'GITHUB_TOKEN='; gh auth token; } >> "$CFG/.env"
+```
+
+Note it is tied to your `gh` login, so `gh auth logout` breaks the board; a
+dedicated fine-grained PAT is steadier if this sticks.
+
+`syncd` re-reads this file every cycle, so a key added while it is running takes
+effect on the next poll — no restart. (It picks up keys that were *added*; an
+edited value needs a restart, because the old one is already in the daemon's
+environment.)
+
+The GitHub token needs `repo` scope: the board comments on dispatch and outcome
+and closes issues on done. Set `[github] writeback = false` if you would rather
+it only read, in which case read scope is enough.
+
+Create the Linear key at **Settings → Security & access → Personal API keys**.
+It is sent as a bare `Authorization` header (personal keys do not take `Bearer`).
+
+### 3. Configure routing
+
+```bash
+herdr-board init          # generates routing.toml from your herdr workspaces
+$EDITOR "$CFG/routing.toml"
+```
+
+`init` walks the workspaces herdr already knows about, reads each one's git
+remote, and writes a route per GitHub repo — so you do not have to hand-write
+repo lists to see anything. Linked worktrees are skipped: those are attempts the
+board creates, not projects to route to. It will not overwrite an existing
+`routing.toml` without `--force`.
+
+If `LINEAR_API_KEY` is already set it also lists your Linear teams and writes a
+route per team, matching each to a herdr workspace by name or key. A team it
+cannot match is written commented-out with `CHANGE-ME` rather than guessed at,
+and reported on stdout. So the useful order is: key first, then `init`.
+
+Or start from the fuller example instead:
+
+```bash
+cp routing.example.toml "$CFG/routing.toml"
+```
+
+A route maps issues to a herdr workspace, a repo, and a runtime. First matching
+route wins; all keys inside one `match` must match. `workspace` is a herdr
+workspace **label** — check yours with `herdr workspace list`.
+
+A task with no matching route still appears on the board, marked `no route`, and
+`enter` refuses it rather than guessing.
+
+### 4. Check it
+
+```bash
+./target/release/herdr-board doctor
+```
+
+`doctor` validates each route against reality: that the herdr workspace exists,
+that the repo is a git repo, and that the runtime maps to a herdr agent kind. It
+exits non-zero if anything fails.
+
+### 5. Bind the toggle
+
+The board is **global** — one queue across every workspace — but it opens as a
+**split beside whatever you are looking at**, not as a tab and not as an overlay.
+A tab pins a global queue inside one workspace's layout; an overlay zooms over
+your work so you cannot read both at once and have to close it to get back. A
+split is an ordinary herdr pane: prefix navigation moves between it and your
+work, and closing it restores the layout.
+
+Add to `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+b"
+type = "plugin_action"
+command = "board.toggle"
+description = "board"
+```
+
+Then `prefix+shift+b` opens the board beside you, and the same again closes it
+and restores the layout. `prefix` is herdr's leader key — `ctrl+b` by default —
+so that is `ctrl+b`, release, then `shift+b`.
+
+**Not `prefix+b`**: herdr binds that to `toggle_sidebar`, and the built-in wins.
+Check `herdr --default-config` before choosing a key; as of 0.7.5 the free
+single letters in prefix mode are roughly `a d f i m t u y`, and `shift+b` keeps
+the mnemonic. The board never binds `ctrl+b` or any other
+control chord, so herdr's command layer keeps working while the board has focus.
+
+Without a binding, the same thing by hand:
+
+```bash
+herdr-board toggle
+```
+
+Restart herdr (or start a new session) so the startup hook launches the sync
+daemon — or start it yourself with `herdr-board syncd --ensure`.
+
+> A control in herdr's own sidebar, next to `spaces` and `agents`, is not
+> available to a plugin: native non-terminal plugin UI is explicitly out of
+> scope for plugin v1, and the sidebar is herdr's own chrome. A key-bound split
+> is the closest herdr offers.
+
+## Agent-initiated dispatch
+
+**Any agent can dispatch from the board, and this is a primary path — not an
+escape hatch.** An agent working in a herdr pane runs:
+
+```bash
+herdr-board dispatch --task linear:LIN-145
+```
+
+and the row lands on the board within a tick. No flag is needed to say who did
+it: the command inherits `HERDR_PANE_ID` from the pane it ran in, and if a live
+attempt owns that pane, the agent in it is recorded as the parent. The board pane
+and the picker popup own no attempt — a popup gets no pane id at all — so an
+operator dispatch resolves to "you" on its own. Pass `--via <task-id>` to state
+it explicitly.
+
+Because rows now appear in `working` that you never released, routinely, the
+board says who released them:
+
+- **List, from 80 columns**: `via LIN-138` takes the **runtime column** on
+  agent-dispatched rows. When an agent chose the runtime, which one it picked is
+  the least interesting fact on the row and the parent is the most — so this
+  costs zero title width, and the runtime is still in detail.
+- **List, from 100 columns**: both — runtime, workspace, `via LIN-138`, elapsed.
+- **Detail**, always: a `dispatched by` row — dim `you`, or default fg
+  `LIN-138  ·  agent, not you`, because that is the case worth noticing.
+- **Prompt view**, always: appended to the provenance line —
+  `as sent, attempt 1 · codex · dispatched by LIN-138`.
+- **Upstream**: the dispatch comment names the parent too, so reading the Linear
+  issue tells you an agent released it.
+
+Provenance names the parent **task**, not the pane: the pane is transient, the
+task is what you can navigate to.
+
+**Deliberately not built:** any tree or indent showing dispatch chains. Children
+and parents routinely sit in different sections — a child in `ready` under a
+parent in `working` — and the fixed section order is the spine of the design.
+If chains need to be legible as chains, that is a separate view.
+
+**Still open:** cancelling an agent-dispatched task with `x` does not notify the
+parent agent, which may be blocking on it. That needs a decision about whether
+the herd has any parent/child signalling at all before there is anything to
+design — so for now, cancel kills the child and the parent finds out the way it
+would find out about anything else.
+
+## Using it
+
+| key | context | effect |
+|---|---|---|
+| `j` `k` `↓` `↑` | list | move selection |
+| `enter` | ready row | open the dispatch picker |
+| `enter` | other row | detail view |
+| `enter` | collapsed done | expand the section |
+| `l` | list | detail view |
+| `p` | any row | prompt view; again to toggle back |
+| `h` `esc` | detail, prompt, help | back |
+| `g` | bound row | focus the herdr pane running that task |
+| `o` | any row | open the issue (or the PR) in a browser |
+| `r` | failed row | re-dispatch as a new attempt |
+| `d` | failed row | mark done on the board |
+| `x` | working, blocked | cancel — confirms, then kills the pane |
+| `s` | anywhere | sync now |
+| `?` | anywhere | help |
+
+Mouse works everywhere: click selects, double-click is `enter`, and every footer
+hint is a click target.
+
+`ctrl+b` is never claimed. The board ignores every control chord, so the herdr
+prefix always reaches herdr.
+
+### What the states mean
+
+| state | glyph | meaning |
+|---|---|---|
+| blocked | `▲` | the agent is waiting on an approval or a question |
+| working | `●` | an agent has the task |
+| ready | `▸` | nothing running; `enter` dispatches |
+| review | `✓` | finished, or a PR is open — waiting on you |
+| failed | `✕` | the pane exited without completing |
+| done | `·` | the issue is closed |
+
+`done` here means the *issue* is closed. herdr's own `done` — an agent finished
+and you have not looked yet — is this board's `review`. Same word, different
+scope; the difference is deliberate.
+
+State is **derived** on every read from upstream state plus the live attempt, so
+it cannot drift. Cancelling ends the attempt, not the issue: the row returns to
+`ready` with its attempt history intact.
+
+## How it fits together
+
+```
+syncd (daemon) ──poll──> Linear / GitHub
+      │
+      ├──reconcile──> herdr pane + agent state
+      │
+      └──writes──> board.db  <──reads── board pane (TUI)
+                       ↑                      │
+                       └────── picker ────────┘
+```
+
+`board.db` (SQLite, WAL) is the only bus between our processes — no sockets of
+our own. The TUI re-reads on a 1 s tick and whenever the file changes.
+
+The plugin and its data are global: one database, every task across every
+workspace, linked once per user. Only the overlay is summoned into whichever
+workspace you are in at the time. Routing maps tasks *to* workspaces; the board
+always shows all of them.
+
+Files, all under the herdr-managed plugin directories:
+
+| path | what |
+|---|---|
+| `$CONFIG/.env` | `LINEAR_API_KEY`, optional `GITHUB_TOKEN` |
+| `$CONFIG/routing.toml` | routes, sync interval, defaults |
+| `$STATE/board.db` | tasks, attempts, writeback queue |
+| `$STATE/syncd.pid` | daemon pidfile (pid + start time) |
+| `$STATE/syncd.log` | every state transition and every herdr argv, rotated at 5 MB |
+| `$STATE/wt/` | git worktrees, one per attempt |
+
+Nothing is ever written to `HERDR_PLUGIN_ROOT`.
+
+### Routing Linear tickets to repos
+
+Routes match on four keys, ANDed within one `match`, first matching route wins:
+
+| key | matches |
+|---|---|
+| `linear_team` | team key, e.g. `AGE` |
+| `linear_project` | Linear project name |
+| `label` | any label on the issue |
+| `gh_repo` | `owner/repo`, for GitHub issues |
+
+With one Linear team and several repos, the team says nothing about which
+codebase a ticket belongs to — labels are the usual discriminator. Add a label
+per repo in Linear and route on it, keeping a team-wide catch-all **last**:
+
+```toml
+[[route]]
+match = { label = "tally" }
+workspace = "tally"
+repo = "~/dev/tally"
+runtime = "claude-code"
+
+# last: anything in the team with no repo label
+[[route]]
+match = { linear_team = "AGE" }
+workspace = "herdr-board"
+repo = "~/dev/herdr-board"
+runtime = "claude-code"
+```
+
+A catch-all that is not last shadows every route after it, and `doctor` refuses
+that config rather than letting it silently mis-route.
+
+Two different things are called labels, which is easy to trip on:
+
+- `[sync] labels` — the **filter**: which issues reach the board at all
+  (assigned to you **OR** carrying one of these).
+- `[[route]] match = { label = ... }` — the **router**: where a task goes once
+  it is on the board.
+
+### Subcommands
+
+| command | role |
+|---|---|
+| `init` | write a starter routing.toml from your herdr workspaces |
+| `toggle` | open the board beside you, or close it if it is up (bind this to a key) |
+| `pane` | the board TUI itself (herdr launches this; you do not run it) |
+| `picker` | the dispatch popup |
+| `syncd [--ensure]` | the daemon; `--ensure` starts it if absent and exits |
+| `sync --once` | one sync cycle |
+| `list [--state S] [--source S] [--json]` | read the board (for agents) |
+| `dispatch --task <id>` | dispatch without the picker |
+| `cancel --task <id>` | end the live attempt, keep the issue open |
+| `doctor` | check the environment |
+| `demo [scenario]` | render the TUI on fixtures (`--list` for the scenarios) |
+
+### Debugging
+
+`syncd.log` is the story. It records every state transition and the exact argv of
+every herdr call, so a misbehaving dispatch can be replayed by hand:
+
+```bash
+tail -f ~/.local/state/herdr/plugins/board/syncd.log
+```
+
+The header tells you which layer is unhappy:
+
+- `linear ✗ retrying 30s` — the source is down. Rows stay on screen; the
+  writeback queue drains when it returns. Backoff caps at 5 minutes.
+- `syncd not running   sync stale 4m` — the **daemon** is dead, which is not the
+  same thing. The sources may be fine and nobody is asking them. Run
+  `herdr-board syncd --ensure`.
+
+## Driving the board from an agent
+
+An orchestrator has a complete loop: read the board, release work, cancel it.
+
+```bash
+herdr-board list --state ready --json     # what can be picked up
+herdr-board list --state review --json    # finished work with PRs waiting
+herdr-board dispatch --task gh:owner/repo#87
+herdr-board cancel   --task gh:owner/repo#87
+```
+
+`list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
+`source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,
+`pr_number`, `branch`, `dispatched_by`, `attempts`, and `dispatchable` — false
+when no route matches, in which case `dispatch` will refuse it. Rows come back in
+board order, so the most urgent are first. Read this rather than `board.db`
+directly: the schema is ours to change, this shape is not.
+
+`dispatch` from inside an agent's own pane records that agent as the parent
+automatically (see above), so a chain of work stays attributable without anyone
+passing ids around.
+
+`list` reads whatever the daemon last wrote. Force a refresh first with
+`herdr-board sync --once` if freshness matters more than latency.
+
+## Arriving from a link
+
+Ctrl-clicking a Linear or GitHub issue URL in any herdr pane routes to the board
+instead of the browser. It lands on the **list with that row selected** — detail
+would hide the queue you came to see — expanding the `done` section if the row is
+in there. If the board is already open it is focused rather than opened a second
+time; if the issue has not been polled yet the handler syncs once and tries
+again, and says plainly when the URL matches nothing on the board.
+
+## Notes on the herdr integration
+
+Everything herdr-facing goes through `src/herdr.rs`, which logs every argv. It is
+the only file to touch if a herdr verb ever differs from expectation. Verified
+against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
+
+- **`runtime` is not a herdr agent kind.** `routing.toml` says `claude-code`
+  because that is what the board displays, but herdr's kind is `claude`. The
+  mapping lives in `config::herdr_kind_for_runtime`, and `doctor` rejects a
+  runtime with no mapping rather than failing at dispatch time.
+- **`agent start` cannot create a pane.** It requires an existing pane already at
+  its shell prompt, so dispatch does `tab create` first and starts the agent in
+  the returned `root_pane`. Each attempt gets its own tab, created with
+  `--no-focus` so dispatching does not yank you out of the board.
+- **Worktrees are cut with plain `git worktree add`**, not `herdr worktree
+  create`. herdr's version opens each worktree as its *own workspace*, which
+  would break `max_concurrent_per_workspace` and the picker's `1 of 2 working`
+  line — both of which count attempts within one workspace.
+- **`pane focus` is directional** (`--direction left|right|…`) and cannot target
+  a pane id. `g` uses `agent focus <pane_id>`, falling back to `tab focus`.
+- **The picker popup is not a herdr pane.** It has no pane id and is outside
+  every pane and agent API, so it cannot reconcile anything. It performs the
+  dispatch and exits; the board picks the result up from the database.
+- **Popup size is declared in the manifest, not on the command line.** herdr
+  0.7.5's shell completion does not offer `popup` as a `--placement` value even
+  though the docs list it, so `plugin pane open` is called without `--placement`
+  and the manifest decides. `width`/`height` are outer cells; 62×16 gives the
+  60×14 interior the design specifies.
+- **Splits pick their own direction.** Into a tab holding one pane, right; into
+  one already holding two or more, down — three narrow columns is worse than a
+  stacked pane, and both the board and an agent read fine at reduced height.
+  Only the target tab is counted, not the whole workspace. This governs the
+  board's own pane and dispatched agent panes alike; force it with
+  `[defaults] split_direction = "right" | "down"`.
+- **A dispatched agent lands as a split, not a new tab.** A new tab is invisible
+  until you switch to it, so an agent that goes `blocked` waiting for approval
+  would sit unseen. Splitting the routed workspace's active tab puts it beside
+  your work, where you can answer it — and `g` on the board jumps straight to it.
+- **One branch, one worktree, and worktrees are never auto-removed.** git allows
+  a branch in only one worktree, so a retry cannot cut a second checkout of the
+  same branch — the cancelled attempt's is still holding it. Dispatch reuses that
+  checkout, which is also the behaviour you want: a retry continues the work
+  rather than starting beside it.
+- **`agent start` races the shell it is given.** `tab create` returns as soon as
+  the pane exists, but `agent start` needs the shell at its prompt owning the
+  foreground; starting immediately gets `agent_pane_busy` and leaves an empty
+  terminal with no agent. There is no readiness signal to wait on, so dispatch
+  retries for a few seconds.
+- **Dispatch is handed to a detached child.** Worktree, pane and agent startup
+  take seconds, and doing them inline froze the picker while the operator
+  watched a terminal boot. The picker spawns the work and closes; results come
+  back through the database and surface as a board message.
+- **`agent prompt` is sent without `--wait`.** Blocking would hold the picker
+  open for the length of an agent turn; the daemon reconciles instead.
+- **The board is a split, not a tab or an overlay.** A tab pins a global queue
+  inside one workspace's layout; an overlay covers the work you are consulting
+  the board about. `--placement split --direction right` is passed at open time
+  because the manifest has no direction field. Splits are ordinary herdr panes
+  once open, so the board has a pane id and can be closed by id — unlike the
+  picker popup.
+- **A recorded pane id is a hint, not proof.** Pane ids are reused, so the
+  toggle confirms a pane is ours by the label herdr sets from the manifest title
+  before closing it — otherwise a stale note eventually points at somebody
+  else's pane. `plugin pane close` also only knows panes of a *currently
+  registered* plugin, so a board left over from an earlier plugin id needs the
+  ordinary `pane close`.
+- **A key binding can only fire a `plugin_action`,** not `plugin pane open`
+  directly, so the toggle is an action (`board.toggle`) that opens or
+  closes the overlay itself.
+- **Pane commands are resolved through `PATH`, not the plugin root.** Despite
+  runtime commands running with the plugin directory as their working directory,
+  a bare `target/release/herdr-board` fails to spawn with *"No viable candidates
+  found in PATH"*. The manifest uses `./target/release/herdr-board`; the leading
+  `./` is load-bearing.
+
+The raw socket (`HERDR_SOCKET_PATH`) is never used — everything is expressible
+through the CLI via `HERDR_BIN_PATH`, which is also what keeps this portable.
+
+The `[[events]] on = "pane.exited"` hook is an optimization only: it shortens the
+delay before a vanished pane is noticed. The poll loop remains authoritative and
+is sufficient on its own.
+
+## Decisions worth knowing
+
+These were underspecified or contradictory across the two source specs, and were
+resolved here rather than guessed at repeatedly.
+
+- **A cancelled task returns to `ready`.** The derivation matrix did not cover
+  "upstream `started`, no live attempt, no PR". Cancelling ends the attempt, not
+  the issue — the work is still owed.
+- **`d mark done` writes a local override.** State is derived, so without one the
+  next poll would recompute `open` upstream and the row would come straight back:
+  a key that undoes itself. The override survives re-derivation and is cleared by
+  a retry. This also makes `d` honest on GitHub rows while GitHub stays read-only.
+- **Open pull requests are rows, not just signals.** The impl spec treated a PR
+  as something that flips an existing task to `review`. That leaves every PR
+  nobody dispatched invisible — and an open PR is the definition of work waiting
+  on you. Open PRs in configured repos now appear as their own `review` rows,
+  ids using `!` (`gh:owner/repo!508`) so a PR and an issue of the same number
+  stay distinct. A PR whose branch belongs to an attempt still attaches to that
+  task instead, so dispatched work never appears twice. Turn it off with
+  `[github] pull_requests = false`.
+- **GitHub is no longer read-only.** As originally specced, `d mark done` moved a
+  GitHub row and the next poll recomputed `open` upstream and moved it straight
+  back — a key that undoes itself. The board now leaves the same trail on GitHub
+  that Linear gets: a comment on dispatch and on outcome, and **close on done**.
+  In-flight state (`working`/`blocked`/`review`) still has nowhere to live
+  upstream and does not need to: it is derived from the live attempt in
+  `board.db`, and upstream only has to carry the terminal state. Set
+  `[github] writeback = false` to keep it strictly read-only. The loop guard
+  carries across — there are two writers on one issue now, the board and the
+  agent in the pane.
+- **Branch template follows the impl spec** (`board/{identifier_lower}` →
+  `board/lin-145`), not the design fixtures. It is config either way.
+- **Daemon liveness and source freshness are separate clocks.** During an outage
+  the daemon keeps cycling on time while the sources go stale, so the header
+  shows a live daemon and `last synced 4m`. Conflating them would report a dead
+  daemon every time Linear hiccuped.
+- **The board draws no vertical rules at all.** The design handoff flagged
+  unbroken vertical rules as an open risk that the HTML prototype could not
+  settle. The preferred resolution there was to draw none — herdr already owns
+  pane chrome via `ui.pane_borders`, and drawing our own would double every
+  divider. A test asserts no `│` is ever emitted, on every screen at every size,
+  so the font question never arises.
+
+## Development
+
+```bash
+cargo test                 # 177 tests
+cargo clippy --all-targets -- -D warnings
+cargo run -- demo --list   # every board state, no network or database
+cargo run -- demo linear-down
+```
+
+The demo covers: populated, empty, source-down, syncd-dead and stale-binding,
+including the `no route` row, the idle working row, and all four screens. `n`
+cycles scenarios.
+
+Tests cover the state-derivation matrix, routing resolution, writeback
+idempotency, reconciliation and orphan handling, dispatch provenance, schema
+migration from an older database, the full key map, and cell-exact rendering at
+80×24, 120×40, 160×38 and 60×20. `tests/sync_once.rs` drives whole
+sync cycles against recorded Linear responses in `tests/fixtures/`.
+
+### Tasks that vanish upstream
+
+An incremental poll cannot see a deletion: a deleted issue is simply never
+returned again, which is indistinguishable from one that has not changed. So
+every two minutes Linear is polled *without* the watermark, and anything of ours
+missing from that complete response is removed along with its history. GitHub is
+always polled in full, so it reaps every cycle — but only when every configured
+repo answered, since a failed poll would otherwise look like an emptied repo.
+
+A task with a live attempt is never reaped: an agent is working on it, and the
+row vanishing from under a running pane is worse than a stale row.
+
+### Schema changes
+
+`board.db` is migrated in place on open: missing columns are added, so upgrading
+the binary does not strand an existing database. This matters more than it
+sounds — a missing column makes `load_tasks` fail, which takes the board pane
+down with it.
+
+### Not in v0
+
+Multi-operator anything, Linear webhooks and agent sessions (polling is enough
+for one person), auto-dispatch rules, and `gc` for old worktrees. Worktrees are
+never deleted automatically.

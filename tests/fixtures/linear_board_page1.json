@@ -1,0 +1,48 @@
+{
+  "issues": {
+    "pageInfo": { "hasNextPage": true, "endCursor": "cursor-page-2" },
+    "nodes": [
+      {
+        "id": "b1d4c9e0-0000-4000-8000-000000000145",
+        "identifier": "OFF-145",
+        "title": "Add retry to Altinn poller",
+        "description": "The poller gives up on the first 502 from Altinn and never retries, so an overnight run loses the whole batch.",
+        "url": "https://linear.app/offhand/issue/OFF-145",
+        "updatedAt": "2026-07-25T18:04:11.000Z",
+        "state": { "name": "Todo", "type": "unstarted" },
+        "team": { "key": "OFF" },
+        "project": { "name": "Compliance" },
+        "labels": { "nodes": [{ "name": "herd" }] },
+        "attachments": { "nodes": [] }
+      },
+      {
+        "id": "b1d4c9e0-0000-4000-8000-000000000138",
+        "identifier": "OFF-138",
+        "title": "Rewrite the Tripletex sync cursor",
+        "description": "Cursor pagination drifts when a voucher is edited mid-page.",
+        "url": "https://linear.app/offhand/issue/OFF-138",
+        "updatedAt": "2026-07-25T17:52:00.000Z",
+        "state": { "name": "In Progress", "type": "started" },
+        "team": { "key": "OFF" },
+        "project": { "name": "Compliance" },
+        "labels": { "nodes": [{ "name": "herd" }, { "name": "fintech" }] },
+        "attachments": { "nodes": [] }
+      },
+      {
+        "id": "b1d4c9e0-0000-4000-8000-000000000129",
+        "identifier": "OFF-129",
+        "title": "Split the MVA report by term",
+        "description": "Accountants file per term, the report is annual.",
+        "url": "https://linear.app/offhand/issue/OFF-129",
+        "updatedAt": "2026-07-25T16:30:00.000Z",
+        "state": { "name": "In Review", "type": "started" },
+        "team": { "key": "OFF" },
+        "project": { "name": "Reporting" },
+        "labels": { "nodes": [{ "name": "herd" }] },
+        "attachments": {
+          "nodes": [{ "url": "https://github.com/offhand/tally/pull/291" }]
+        }
+      }
+    ]
+  }
+}

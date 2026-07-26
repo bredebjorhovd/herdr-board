@@ -1,0 +1,53 @@
+# Copy to the plugin config dir and edit:
+#   cp routing.example.toml "$(herdr plugin config-dir board)/routing.toml"
+
+[sync]
+# How often syncd polls. Floors at 5s.
+interval = "30s"
+# Linear labels that mean "dispatchable". Issues assigned to you are always
+# included; these labels widen that set.
+labels = ["herd"]
+
+# First matching route wins. All keys given in `match` must match (AND).
+# Available keys: linear_team, linear_project, gh_repo, label.
+[[route]]
+match = { linear_team = "OFF" }
+workspace = "offhand"          # a herdr workspace LABEL (see `herdr workspace list`)
+repo = "~/code/offhand"        # the git repo worktrees are cut from
+runtime = "claude-code"        # display name; mapped to herdr kind `claude`
+prompt = """
+You are working on: {title} ({identifier})
+
+{body}
+
+Work in this worktree. Open a PR when done; branch {branch} is prepared.
+"""
+
+[[route]]
+match = { label = "fintech" }
+workspace = "fintech"
+repo = "~/code/tripletex-int"
+runtime = "claude-code"
+
+# A route with no `match` is a catch-all and must come last.
+
+[defaults]
+max_concurrent_per_workspace = 3
+branch_template = "board/{identifier_lower}"
+# Which way panes split — the board's own and dispatched agents' alike.
+# "auto" (default): right into a tab with one pane, down once it holds two or
+# more, so a busy tab does not become a row of narrow columns.
+# split_direction = "auto"
+
+# GitHub is entirely optional. With no repos listed it is never polled, the
+# header omits it, and GITHUB_TOKEN is not needed at all.
+[github]
+repos = []
+labels = ["herd"]
+# Show open pull requests as their own `review` rows — work waiting on you that
+# nobody dispatched. A PR from a board dispatch attaches to its task instead.
+pull_requests = true
+# Leave the same trail on GitHub that Linear gets: a comment on dispatch and on
+# outcome, and close the issue on done. Needs a token with `repo` scope.
+# Set false to keep the board strictly read-only against GitHub.
+writeback = true

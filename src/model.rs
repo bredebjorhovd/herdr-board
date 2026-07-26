@@ -368,6 +368,8 @@ pub struct Task {
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
     pub pr_open: bool,
+    /// Merged, rather than closed without merging.
+    pub pr_merged: bool,
     pub updated_at: String,
     pub synced_at: String,
     /// Populated by the read path, not stored on the row.

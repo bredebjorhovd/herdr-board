@@ -461,6 +461,7 @@ mod tests {
                 pr_url: None,
                 pr_number: None,
                 pr_open: false,
+                pr_merged: false,
                 // Today, so a `done` fixture row is inside the section's bound.
                 updated_at: crate::db::rfc3339(chrono::Utc::now()),
                 synced_at: String::new(),

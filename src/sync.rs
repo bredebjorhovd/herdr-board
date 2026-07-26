@@ -353,6 +353,7 @@ impl SyncEngine {
                     Some(pr.number),
                     pr.open,
                 );
+                let _ = self.db.set_pr_merged(&pr.task_id(), pr.merged);
             }
         }
         // Only reap when every repo answered: a failed poll would otherwise look
@@ -396,6 +397,7 @@ impl SyncEngine {
             };
             self.db
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), pr.open)?;
+            self.db.set_pr_merged(&task.id, pr.merged)?;
         }
         Ok(())
     }
@@ -966,6 +968,7 @@ impl SyncEngine {
         // Reflect it immediately rather than waiting for a poll: the operator
         // just pressed the key and needs the row to move.
         self.db.set_pr(&task.id, task.pr_url.as_deref(), Some(number), false)?;
+        self.db.set_pr_merged(&task.id, true)?;
         // A merged pull request is finished work. For a PR row that is the
         // whole task; for an issue whose PR this was, the work is done and the
         // ticket is what remains.
@@ -1289,6 +1292,7 @@ mod tests {
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
             open: true,
+            merged: false,
             draft: false,
             updated_at: crate::db::now(),
         }])

@@ -141,6 +141,9 @@ pub struct PullRequest {
     pub url: String,
     pub head_ref: String,
     pub open: bool,
+    /// Merged, as opposed to closed without merging — a real difference to
+    /// whoever has to decide what happens next.
+    pub merged: bool,
     pub draft: bool,
     pub updated_at: String,
 }
@@ -318,6 +321,7 @@ fn parse_pull(repo: &str, n: &Value) -> Option<PullRequest> {
             .unwrap_or_default()
             .to_string(),
         body: n.get("body").and_then(Value::as_str).map(str::to_string),
+        merged: n.get("merged_at").is_some_and(|v| !v.is_null()),
         draft: n.get("draft").and_then(Value::as_bool).unwrap_or(false),
         updated_at: n
             .get("updated_at")

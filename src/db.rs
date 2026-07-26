@@ -61,6 +61,7 @@ impl Db {
               pr_url       TEXT,
               pr_number    INTEGER,
               pr_open      INTEGER NOT NULL DEFAULT 0,
+              pr_merged    INTEGER NOT NULL DEFAULT 0,
               updated_at   TEXT NOT NULL,
               synced_at    TEXT NOT NULL
             );
@@ -133,6 +134,7 @@ impl Db {
                 ("pr_url", "TEXT"),
                 ("pr_number", "INTEGER"),
                 ("pr_open", "INTEGER NOT NULL DEFAULT 0"),
+                ("pr_merged", "INTEGER NOT NULL DEFAULT 0"),
                 ("upstream", "TEXT NOT NULL DEFAULT 'unstarted'"),
             ],
         )?;
@@ -323,6 +325,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_pr_merged(&self, task_id: &str, merged: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET pr_merged = ?2 WHERE id = ?1",
+            params![task_id, merged as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn set_local_done(&self, task_id: &str, done: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET local_done = ?2 WHERE id = ?1",
@@ -345,7 +355,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, source, source_id, identifier, title, body, url, labels,
                     state, source_state, linear_team, linear_project, upstream,
-                    local_done, pr_url, pr_number, pr_open, updated_at, synced_at
+                    local_done, pr_url, pr_number, pr_open, pr_merged,
+                    updated_at, synced_at
              FROM tasks",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -369,8 +380,9 @@ impl Db {
                 pr_url: r.get(14)?,
                 pr_number: r.get(15)?,
                 pr_open: r.get::<_, i64>(16)? != 0,
-                updated_at: r.get(17)?,
-                synced_at: r.get(18)?,
+                pr_merged: r.get::<_, i64>(17)? != 0,
+                updated_at: r.get(18)?,
+                synced_at: r.get(19)?,
                 attempts: Vec::new(),
             })
         })?;

@@ -238,6 +238,9 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
         }
         BoardState::Failed => "pane exited without completing".into(),
         BoardState::Review => match (v.task.pr_number, v.branch.as_deref()) {
+            // A merged PR means the work landed and only the ticket is left —
+            // otherwise the row sits in `review` saying nothing about why.
+            (Some(n), _) if v.task.pr_merged => format!("PR #{n} merged · close the issue"),
             (Some(n), _) => format!("PR #{n} open · waiting on you"),
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.

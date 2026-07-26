@@ -211,9 +211,21 @@ pub struct Defaults {
     /// tab does not become a row of narrow columns. `right` or `down` force it.
     #[serde(default)]
     pub split_direction: Option<String>,
+    /// How many panes a tab may hold before the next agent gets a tab of its
+    /// own instead of another split.
+    ///
+    /// Splitting without a limit ends in a tab of unreadable slivers. Past this
+    /// point a new tab is the better trade: it costs a keystroke to reach, but
+    /// what is on screen stays legible.
+    #[serde(default = "default_max_panes_per_tab")]
+    pub max_panes_per_tab: usize,
 }
 
 fn default_max_concurrent() -> usize {
+    3
+}
+
+fn default_max_panes_per_tab() -> usize {
     3
 }
 
@@ -229,6 +241,7 @@ impl Default for Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
             branch_template: default_branch_template(),
             split_direction: None,
+            max_panes_per_tab: default_max_panes_per_tab(),
         }
     }
 }

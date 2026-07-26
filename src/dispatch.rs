@@ -238,8 +238,10 @@ pub fn dispatch(
         // Split into the routed workspace's active tab, so the agent is
         // visible there and its approval prompts can be answered. A tab per
         // attempt hid the agent until you went looking for it.
-        let pane_id = match herdr.split_target_and_direction(&workspace_id) {
-            Some((target, direction)) => {
+        let placement =
+            herdr.tab_placement(&workspace_id, engine.cfg.defaults.max_panes_per_tab);
+        let pane_id = match placement {
+            Some(crate::herdr::Placement::Split { target, direction }) => {
                 let direction = engine
                     .cfg
                     .defaults
@@ -250,9 +252,13 @@ pub fn dispatch(
                 log.info(format!("splitting {target} {direction}"));
                 herdr.pane_split(&target, &worktree, direction)?
             }
-            None => {
-                // A workspace with no panes to split is not a state herdr
-                // normally allows, but a tab is a correct fallback.
+            // The tab is full. A fourth sliver helps nobody; the agent gets a
+            // tab of its own, labelled so the tab bar says which task it is.
+            Some(crate::herdr::Placement::NewTab) | None => {
+                log.info(format!(
+                    "tab is at its pane limit; giving {} a tab of its own",
+                    p.identifier
+                ));
                 let tab = herdr.tab_create(&workspace_id, &worktree, &p.identifier)?;
                 tab.root_pane_id
             }
@@ -263,12 +269,7 @@ pub fn dispatch(
         let name = agent_name(&p.identifier, p.attempt_no);
         start_agent_when_ready(herdr, log, &name, p.herdr_kind, &pane_id)?;
 
-        // Async on purpose: no `--wait`. The daemon reconciles pane state on its
-        // own tick, and blocking here would hold the picker open for the length
-        // of an agent turn.
-        if let Err(e) = herdr.agent_prompt(&name, &p.prompt) {
-            log.warn(format!("prompt delivery failed for {name}: {e}"));
-        }
+        deliver_prompt(herdr, log, &name, &pane_id, &p.prompt);
         Ok(pane_id)
     })();
 
@@ -336,6 +337,59 @@ fn start_agent_when_ready(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("agent {name} never became startable")))
+}
+
+/// Send the prompt, and make sure it actually arrived.
+///
+/// `agent start` returns once herdr *detects* the agent, but a full-screen agent
+/// is often still painting its welcome screen and silently swallows a paste that
+/// arrives too early. herdr reports the send as successful either way, so the
+/// only evidence of delivery is the agent leaving its idle state.
+///
+/// Deliberately still not `--wait`: that would block for the length of the whole
+/// turn. This waits only for the agent to *start* reacting.
+fn deliver_prompt(herdr: &Herdr, log: &Logger, name: &str, pane_id: &str, prompt: &str) {
+    // Let the agent's UI settle before typing into it.
+    for _ in 0..20 {
+        if herdr.agent_status(name).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // Delivery is confirmed by the screen changing, not by the agent's reported
+    // state. herdr's detection can report `idle` for an agent that is visibly
+    // working — Claude Code 2.1.220 keeps an empty prompt box live while it
+    // thinks, and the `live_prompt_box` rule matches it — so waiting for
+    // `working` produces false negatives and re-sends a prompt that landed.
+    let before = herdr.pane_read_visible(pane_id).unwrap_or_default();
+
+    for attempt in 1..=2 {
+        if let Err(e) = herdr.agent_prompt(name, prompt) {
+            log.warn(format!("prompt delivery failed for {name}: {e}"));
+            return;
+        }
+        for _ in 0..24 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match herdr.pane_read_visible(pane_id) {
+                Some(now) if now != before => {
+                    if attempt > 1 {
+                        log.info(format!("prompt for {name} landed on attempt {attempt}"));
+                    }
+                    return;
+                }
+                None => return,
+                _ => {}
+            }
+        }
+        log.warn(format!(
+            "{name} showed no reaction to its prompt (attempt {attempt})"
+        ));
+    }
+    log.error(format!(
+        "{name} never reacted to its prompt — it may be running with no instructions"
+    ));
 }
 
 /// Where a branch is already checked out, if anywhere.

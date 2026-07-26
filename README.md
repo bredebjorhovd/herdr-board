@@ -421,6 +421,11 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   though the docs list it, so `plugin pane open` is called without `--placement`
   and the manifest decides. `width`/`height` are outer cells; 62×16 gives the
   60×14 interior the design specifies.
+- **Panes overflow to a new tab.** Right, then down, then a tab of its own:
+  splitting without a limit ends in a tab of unreadable slivers, and past three
+  panes a new tab is the better trade — it costs a keystroke to reach, but what
+  is on screen stays legible. The tab is labelled with the task identifier, so
+  the tab bar says which agent is where. `[defaults] max_panes_per_tab`.
 - **Splits pick their own direction.** Into a tab holding one pane, right; into
   one already holding two or more, down — three narrow columns is worse than a
   stacked pane, and both the board and an agent read fine at reduced height.

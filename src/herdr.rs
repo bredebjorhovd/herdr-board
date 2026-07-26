@@ -47,6 +47,16 @@ pub struct PaneInfo {
     pub label: Option<String>,
 }
 
+/// Where a new pane goes: beside something, or in a tab of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Split {
+        target: String,
+        direction: &'static str,
+    },
+    NewTab,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreatedTab {
     pub tab_id: String,
@@ -297,6 +307,27 @@ impl Herdr {
         Ok(())
     }
 
+    /// Current status of an agent, or `None` if herdr does not know it.
+    pub fn agent_status(&self, target: &str) -> Option<AgentStatus> {
+        self.run_quiet(&["agent", "get", target])
+            .ok()?
+            .get("agent")?
+            .get("agent_status")?
+            .as_str()
+            .map(AgentStatus::parse)
+    }
+
+    /// The pane's visible screen, for detecting that *something* changed.
+    pub fn pane_read_visible(&self, pane_id: &str) -> Option<String> {
+        let out = Command::new(&self.bin)
+            .args(["pane", "read", pane_id, "--source", "visible"])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     pub fn agent_focus(&self, target: &str) -> Result<()> {
         self.run(&["agent", "focus", target])?;
         Ok(())
@@ -335,19 +366,33 @@ impl Herdr {
         &self,
         workspace_id: &str,
     ) -> Option<(String, &'static str)> {
+        self.tab_placement(workspace_id, usize::MAX)
+            .and_then(|p| match p {
+                Placement::Split { target, direction } => Some((target, direction)),
+                Placement::NewTab => None,
+            })
+    }
+
+    /// Where the next pane should go in a workspace.
+    pub fn tab_placement(&self, workspace_id: &str, max_panes_per_tab: usize) -> Option<Placement> {
         let panes = self.pane_list().ok()?;
         let here: Vec<&PaneInfo> = panes
             .iter()
             .filter(|p| p.workspace_id == workspace_id)
             .collect();
         let target = here.iter().find(|p| p.focused).or_else(|| here.first())?;
-        // Count only the tab we are actually splitting into.
+        // Count only the tab we would actually split into.
         let in_tab = here
             .iter()
             .filter(|p| p.tab_id.is_some() && p.tab_id == target.tab_id)
             .count();
-        let direction = if in_tab >= 2 { "down" } else { "right" };
-        Some((target.pane_id.clone(), direction))
+        if in_tab >= max_panes_per_tab {
+            return Some(Placement::NewTab);
+        }
+        Some(Placement::Split {
+            target: target.pane_id.clone(),
+            direction: if in_tab >= 2 { "down" } else { "right" },
+        })
     }
 
     pub fn pane_get(&self, pane_id: &str) -> Result<Option<PaneInfo>> {
@@ -529,6 +574,56 @@ mod tests {
             target.pane_id.clone(),
             if in_tab >= 2 { "down" } else { "right" },
         ))
+    }
+
+    /// The placement rule, without a running herdr.
+    fn placement_for(panes: &[PaneInfo], ws: &str, max: usize) -> Option<Placement> {
+        let here: Vec<&PaneInfo> = panes.iter().filter(|p| p.workspace_id == ws).collect();
+        let target = here.iter().find(|p| p.focused).or_else(|| here.first())?;
+        let in_tab = here
+            .iter()
+            .filter(|p| p.tab_id.is_some() && p.tab_id == target.tab_id)
+            .count();
+        if in_tab >= max {
+            return Some(Placement::NewTab);
+        }
+        Some(Placement::Split {
+            target: target.pane_id.clone(),
+            direction: if in_tab >= 2 { "down" } else { "right" },
+        })
+    }
+
+    #[test]
+    fn a_full_tab_overflows_to_a_new_tab() {
+        // Right, then down, then a tab of its own — rather than an endless row
+        // of slivers.
+        let mut panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
+        assert!(matches!(
+            placement_for(&panes, "w1", 3),
+            Some(Placement::Split { direction, .. }) if direction == "right"
+        ));
+
+        panes.push(pane("w1:p2", "w1", "w1:t1", false));
+        assert!(matches!(
+            placement_for(&panes, "w1", 3),
+            Some(Placement::Split { direction, .. }) if direction == "down"
+        ));
+
+        panes.push(pane("w1:p3", "w1", "w1:t1", false));
+        assert_eq!(placement_for(&panes, "w1", 3), Some(Placement::NewTab));
+    }
+
+    #[test]
+    fn the_pane_limit_is_configurable() {
+        let panes = vec![
+            pane("w1:p1", "w1", "w1:t1", true),
+            pane("w1:p2", "w1", "w1:t1", false),
+        ];
+        assert_eq!(placement_for(&panes, "w1", 2), Some(Placement::NewTab));
+        assert!(matches!(
+            placement_for(&panes, "w1", 4),
+            Some(Placement::Split { .. })
+        ));
     }
 
     #[test]

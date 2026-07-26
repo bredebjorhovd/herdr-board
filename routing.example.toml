@@ -38,6 +38,9 @@ branch_template = "board/{identifier_lower}"
 # "auto" (default): right into a tab with one pane, down once it holds two or
 # more, so a busy tab does not become a row of narrow columns.
 # split_direction = "auto"
+# Panes a tab may hold before the next agent gets a tab of its own. Three splits
+# in one tab is about the limit of readability.
+# max_panes_per_tab = 3
 
 # GitHub is entirely optional. With no repos listed it is never polled, the
 # header omits it, and GITHUB_TOKEN is not needed at all.

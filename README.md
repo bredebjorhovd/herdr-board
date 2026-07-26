@@ -393,6 +393,41 @@ in there. If the board is already open it is focused rather than opened a second
 time; if the issue has not been polled yet the handler syncs once and tries
 again, and says plainly when the URL matches nothing on the board.
 
+## Claude Code state detection
+
+herdr classifies agent state by matching rules against the bottom of the pane.
+Its stock Claude Code manifest has one general `working` rule —
+`osc_title_working`, matching a braille spinner in the *terminal title* — and
+Claude Code emits no title in a herdr pane, so it can never fire. Meanwhile
+`live_prompt_box` (priority 950) matches the prompt box, which Claude Code keeps
+on screen while working and beneath its own approval dialogs.
+
+So a thinking or blocked Claude agent reports `idle`, and the board's `blocked`
+section — the one state that exists to say "an agent needs you" — never fires
+for one. Codex is detected correctly; this is Claude-specific.
+
+```bash
+herdr-board integration install claude
+```
+
+That writes a local agent-detection override — herdr's supported extension
+point, and local overrides always win — adding a rule that matches Claude Code's
+on-screen working line, whose token counter only appears mid-turn. It sits above
+`live_prompt_box` and below the blocked rules, so an approval prompt still wins.
+
+Two things it is not:
+
+- **Not hooks.** herdr accepts `pane report-agent` from anyone, but Claude
+  Code's state authority is the screen manifest and its integrations are
+  "intentionally not lifecycle authorities" — reports are accepted and ignored.
+- **Not `herdr integration install claude`.** That installs one `SessionStart`
+  hook calling `pane.report_agent_session`, which records session identity and
+  explicitly not lifecycle state.
+
+An override replaces the manifest wholesale, so it snapshots the active one and
+will shadow later upstream updates. `herdr-board integration uninstall claude`
+puts it back.
+
 ## Notes on the herdr integration
 
 Everything herdr-facing goes through `src/herdr.rs`, which logs every argv. It is

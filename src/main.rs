@@ -101,7 +101,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Report Claude Code's state to herdr, which cannot read it from the screen.
+    /// Teach herdr to read Claude Code's working state off the screen.
     Integration {
         #[command(subcommand)]
         action: IntegrationAction,
@@ -263,26 +263,35 @@ fn main() -> Result<()> {
                 IntegrationAction::Install { agent } => {
                     integration::check_supported(&agent)?;
                     integration::install(&log)?;
-                    println!(
-                        "installed {} hooks — new Claude Code sessions will report \
-                         working/idle/blocked to herdr",
-                        integration::expected_count()
-                    );
-                    println!("existing sessions keep screen detection until they restart");
+                    println!("wrote {}", integration::override_path()?.display());
+                    // The running server holds manifests in memory.
+                    let h = herdr::Herdr::discover(log.clone());
+                    match h.reload_agent_manifests() {
+                        Ok(()) => println!("herdr reloaded its manifests — working state is live"),
+                        Err(e) => println!(
+                            "could not reload herdr's manifests ({e}); \
+                             run `herdr server reload-agent-manifests`"
+                        ),
+                    }
                 }
                 IntegrationAction::Uninstall { agent } => {
                     integration::check_supported(&agent)?;
                     integration::uninstall(&log)?;
+                    let h = herdr::Herdr::discover(log.clone());
+                    let _ = h.reload_agent_manifests();
                     println!("removed");
                 }
                 IntegrationAction::Status => {
-                    let n = integration::installed_count();
-                    println!(
-                        "{}/{} hooks installed ({})",
-                        n,
-                        integration::expected_count(),
-                        integration::hook_path()?.display()
-                    );
+                    if integration::installed() {
+                        println!(
+                            "installed ({})",
+                            integration::override_path()?.display()
+                        );
+                    } else {
+                        println!(
+                            "not installed — a working or blocked Claude pane reports `idle`"
+                        );
+                    }
                 }
             }
             Ok(())

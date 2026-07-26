@@ -935,21 +935,19 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
         }
     }
 
-    // herdr cannot read Claude Code's state off the screen; without our hooks a
-    // working or blocked Claude pane reports `idle`, and the board's BLOCKED
-    // section never fires for it.
-    let installed = crate::integration::installed_count();
-    let expected = crate::integration::expected_count();
+    // herdr's stock Claude Code manifest has no working rule that can fire in a
+    // pane, so a thinking or blocked agent reports `idle` and the board's
+    // BLOCKED section never lights up for one.
+    let claude_ok = crate::integration::installed();
     checks.push(Check {
-        name: "claude state hooks".into(),
-        ok: installed == expected,
-        detail: if installed == expected {
-            "installed — Claude Code reports its own state".into()
-        } else if installed == 0 {
-            "not installed — a working or blocked Claude pane will report `idle`.              Run `herdr-board integration install claude`"
-                .into()
+        name: "claude state detection".into(),
+        ok: claude_ok,
+        detail: if claude_ok {
+            "manifest override installed — working and blocked are detected".into()
         } else {
-            format!("{installed}/{expected} installed — re-run `herdr-board integration install claude`")
+            "stock manifest — a working or blocked Claude pane reports `idle`. \
+             Run `herdr-board integration install claude`"
+                .into()
         },
     });
 

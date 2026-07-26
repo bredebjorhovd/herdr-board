@@ -151,6 +151,13 @@ impl Herdr {
         Ok(v.get("result").cloned().unwrap_or(v))
     }
 
+    /// Reload agent-detection manifests in the running server, so a local
+    /// override applies without a restart.
+    pub fn reload_agent_manifests(&self) -> Result<()> {
+        self.run(&["server", "reload-agent-manifests"])?;
+        Ok(())
+    }
+
     pub fn version(&self) -> Result<String> {
         let out = Command::new(&self.bin).arg("--version").output()?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())

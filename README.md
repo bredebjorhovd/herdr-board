@@ -576,15 +576,32 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 222 tests
+cargo test                 # 265 tests (251 unit, 14 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
 ```
 
 The demo covers: populated, empty, source-down, syncd-dead and stale-binding,
-including the `no route` row, the idle working row, and all four screens. `n`
-cycles scenarios.
+including the `no route` row, the idle working row, both confirmations and the
+outcome lines that follow them, and all four screens. `n` cycles scenarios, and
+the mouse works exactly as it does on the real board — a demo that ignores
+clicks cannot be used to review the mouse.
+
+### Looking at it
+
+Some of the design's rules can only be settled by looking: that it survives a
+light terminal, that it survives a colourless one, and that the mouse really
+does what the keyboard does. `tools/render-check/` drives the demo in a live
+herdr pane, captures what it emits, and re-renders those captures under a dark,
+a light and a monochrome palette — plus a parity script that performs each
+action twice, once from the keyboard and once from a real mouse report, and
+diffs the screens. See `tools/render-check/README.md`.
+
+Worth knowing before you reach for a herdr theme: a pane app receives the
+**host terminal's** ANSI palette. Switching `[theme] name` restyles herdr's own
+chrome and leaves the board's sixteen colours untouched, so the palette to vary
+is the terminal's.
 
 Tests cover the state-derivation matrix, routing resolution, writeback
 idempotency, reconciliation and orphan handling, dispatch provenance, schema

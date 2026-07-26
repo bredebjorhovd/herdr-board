@@ -432,7 +432,7 @@ impl Board {
 }
 
 /// Distinguishes a pending merge confirmation from a pending cancel.
-const MERGE_PREFIX: &str = "merge:";
+pub const MERGE_PREFIX: &str = "merge:";
 
 pub const PICKER_TASK: &str = "picker_task";
 pub const PICKER_RESULT: &str = "picker_result";
@@ -676,6 +676,32 @@ mod tests {
     }
 
     #[test]
+    fn help_lists_every_key_the_board_binds() {
+        // `m` was bound, advertised in the footer of every review row, and
+        // documented in the README — and missing from the board's own key
+        // reference. Nothing but reading the help screen would have caught it.
+        let app = fixtures::app(fixtures::POPULATED);
+        let documented: Vec<&str> = render::HELP_GROUPS
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().map(|(k, _)| *k))
+            .collect();
+        for c in 'a'..='z' {
+            if key_action(&app, key(c)) == Action::None {
+                continue;
+            }
+            // `q` closes the pane, which is herdr's affordance rather than the
+            // board's, and the footer never offers it.
+            if c == 'q' {
+                continue;
+            }
+            assert!(
+                documented.iter().any(|k| k.split(' ').any(|p| p == c.to_string())),
+                "`{c}` is bound but the help screen never mentions it"
+            );
+        }
+    }
+
+    #[test]
     fn arrows_and_vim_keys_agree() {
         let app = fixtures::app(fixtures::POPULATED);
         assert_eq!(
@@ -721,7 +747,12 @@ mod tests {
     }
 
     fn laid_out() -> App {
+        laid_out_on(Screen::List)
+    }
+
+    fn laid_out_on(screen: Screen) -> App {
         let mut app = fixtures::app(fixtures::POPULATED);
+        app.screen = screen;
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         app.last_height = 24;
@@ -751,11 +782,34 @@ mod tests {
     #[test]
     fn clicking_a_footer_hint_fires_that_hint() {
         // Keyboard and mouse must produce identical behavior for every action.
-        let mut app = laid_out();
-        let (x1, _, ch) = app.footer_hits[0];
-        let mut last = None;
-        let action = mouse_action(&mut app, click(x1, 23), &mut last);
-        assert_ne!(action, Action::None, "footer hint {ch:?} was not clickable");
+        // Checking only that the click did *something* would pass even if every
+        // hint fired the wrong action, so compare against the key it advertises,
+        // for every hint, on every screen that draws a footer.
+        for screen in [Screen::List, Screen::Detail, Screen::Prompt, Screen::Help] {
+            let mut app = laid_out_on(screen);
+            assert!(
+                !app.footer_hits.is_empty(),
+                "{screen:?} drew no clickable hints"
+            );
+            for (x1, x2, ch) in app.footer_hits.clone() {
+                let mut last = None;
+                let clicked = mouse_action(&mut app, click(x1, 23), &mut last);
+                let typed = match ch {
+                    '\r' => key_action(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    '\u{1b}' => key_action(&app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                    c => key_action(&app, key(c)),
+                };
+                assert_eq!(clicked, typed, "hint {ch:?} on {screen:?}");
+                assert_ne!(clicked, Action::None, "hint {ch:?} on {screen:?} is inert");
+                // The whole hint is the target, not just its first cell.
+                let mut last = None;
+                assert_eq!(
+                    mouse_action(&mut app, click(x2 - 1, 23), &mut last),
+                    typed,
+                    "the last cell of hint {ch:?} on {screen:?} misses"
+                );
+            }
+        }
     }
 
     #[test]

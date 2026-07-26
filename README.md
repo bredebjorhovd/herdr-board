@@ -251,7 +251,10 @@ scope; the difference is deliberate.
 
 State is **derived** on every read from upstream state plus the live attempt, so
 it cannot drift. Cancelling ends the attempt, not the issue: the row returns to
-`ready` with its attempt history intact.
+`ready` with its attempt history intact. A row whose issue was *deleted* upstream
+also lands in `done` — see "Tasks that vanish upstream" — and says `gone
+upstream` where the others show a workspace, so the two reasons for being there
+stay distinguishable.
 
 ## How it fits together
 
@@ -373,10 +376,12 @@ herdr-board cancel   --task gh:owner/repo#87
 
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,
-`pr_number`, `branch`, `dispatched_by`, `attempts`, and `dispatchable` — false
-when no route matches, in which case `dispatch` will refuse it. Rows come back in
-board order, so the most urgent are first. Read this rather than `board.db`
-directly: the schema is ours to change, this shape is not.
+`pr_number`, `branch`, `dispatched_by`, `attempts`, `dispatchable`, and `gone`.
+`dispatchable` is false when no route matches *or* the row is `gone`, in which
+case `dispatch` will refuse it; `gone` tells the two apart, since only one of
+them is fixed by editing `routing.toml`. Rows come back in board order, so the
+most urgent are first. Read this rather than `board.db` directly: the schema is
+ours to change, this shape is not.
 
 `dispatch` from inside an agent's own pane records that agent as the parent
 automatically (see above), so a chain of work stays attributable without anyone
@@ -592,12 +597,33 @@ the branch survives, and a checkout with uncommitted work is refused.
 An incremental poll cannot see a deletion: a deleted issue is simply never
 returned again, which is indistinguishable from one that has not changed. So
 every two minutes Linear is polled *without* the watermark, and anything of ours
-missing from that complete response is removed along with its history. GitHub is
-always polled in full, so it reaps every cycle — but only when every configured
-repo answered, since a failed poll would otherwise look like an emptied repo.
+missing from that complete response is reaped. GitHub is always polled in full,
+so it reaps every cycle — but only when every configured repo answered, since a
+failed poll would otherwise look like an emptied repo.
 
-A task with a live attempt is never reaped: an agent is working on it, and the
-row vanishing from under a running pane is worse than a stale row.
+What reaping does depends on whether anyone ever worked on the task:
+
+- **Never dispatched** — the row was noise, an issue created and deleted again,
+  and it is forgotten outright, with any queued writebacks.
+- **It has attempts** — the row stays, marked `gone` upstream, and derives to
+  `done`. The attempts stay on it: which agent ran, on what branch, in what
+  worktree, and how it ended.
+
+Keeping the row is not only record-keeping. The attempt row is the only thing
+that knows where a checkout came from, so deleting it stranded the worktree —
+`gc` would report the directory as untracked and refuse to touch it, and it
+leaked until removed by hand. A `gone` row keeps the checkout attributable, and
+because `gone` is terminal the checkout ages out through `gc` like any other.
+
+A `gone` row cannot be dispatched — there is no issue behind it to work on, move
+or comment on — and `dispatch` says so rather than offering a route. Queued
+writebacks against it are dropped, since a comment aimed at a deleted issue
+would fail and back off forever; already-delivered rows stay, so their
+idempotency keys still hold if the issue ever comes back. If it does come back,
+the next poll upserts it and the row returns to life with its history intact.
+
+A task with a live attempt is never reaped at all: an agent is working on it,
+and the row vanishing from under a running pane is worse than a stale row.
 
 ### Schema changes
 
@@ -633,8 +659,11 @@ alone deletes work someone is coming back for:
 for a fresh worktree; deleting it would throw the work away. A checkout with
 uncommitted changes is refused by git and reported rather than forced, and gc
 exits non-zero when that happens. Directories under `$STATE/wt/` that no attempt
-claims — what a task reaped from the board leaves behind — are listed, never
-removed: nothing left in the database says which repo they came from.
+claims are listed, never removed: nothing left in the database says which repo
+they came from. Reaping used to be how they appeared and no longer is — a reaped
+task keeps its attempts, so its checkout stays claimed and collectable. What is
+left is a directory that was never ours: hand-made, or from a database that was
+thrown away.
 
 ### Not in v0
 

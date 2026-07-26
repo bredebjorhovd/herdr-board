@@ -133,6 +133,17 @@ pub fn plan(
     task: &Task,
     ov: &Overrides,
 ) -> Result<Plan> {
+    // A reaped task keeps its row for the history on it, but there is no issue
+    // behind it any more: no state to move, nothing to comment on, and no way
+    // to tell whether the work is still wanted.
+    if task.upstream == crate::model::UpstreamState::Gone {
+        bail!(
+            "{} no longer exists in {} — its row is kept for the attempts on it, \
+             not to dispatch from",
+            task.identifier,
+            task.source.as_str()
+        );
+    }
     let ctx = route_context(task);
     let route = cfg
         .resolve(&ctx)

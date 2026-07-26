@@ -6,7 +6,7 @@
 //! git's behaviour, not ours, so they are worth pinning to real git.
 
 use herdr_board::config::Paths;
-use herdr_board::db::{Db, NewAttempt, UpsertTask, rfc3339};
+use herdr_board::db::{Db, NewAttempt, Reaped, UpsertTask, rfc3339};
 use herdr_board::gc;
 use herdr_board::log::Logger;
 use herdr_board::model::{Outcome, Source, UpstreamState};
@@ -235,9 +235,46 @@ fn a_still_retryable_task_keeps_its_checkout() {
 }
 
 #[test]
+fn a_reaped_task_still_gives_up_its_checkout() {
+    // AGE-6, end to end, and the reason it was more than record-keeping: AGE-2
+    // and AGE-4 were closed in Linear once their work merged, the next sweep
+    // reaped them, and the attempts went with the rows. gc then had a directory
+    // it could not attribute to any repo and — correctly — refused to touch it,
+    // so the checkouts leaked until they were removed by hand.
+    //
+    // Now the row survives as `gone`, which keeps the worktree path and the repo
+    // behind it, and `gone` is terminal — so the checkout ages out the ordinary
+    // way instead of becoming untracked.
+    let f = Fixture::new("reaped");
+    let wt = f.attempt("LIN-1", "board/lin-1", Outcome::Done, 30);
+    let db = Db::open(&f.paths.db()).unwrap();
+    assert_eq!(
+        db.reap_task("linear:LIN-1").unwrap(),
+        Reaped::Kept { attempts: 1 },
+        "a task that was worked on is kept, not deleted"
+    );
+    drop(db);
+
+    let report = f.gc("14d", false);
+    assert!(
+        report.untracked.is_empty(),
+        "the checkout must still be attributable: {report:#?}"
+    );
+    assert_eq!(report.collected.len(), 1, "{report:#?}");
+    assert_eq!(report.collected[0].worktree, wt);
+    assert!(!wt.exists(), "the checkout should be collected, not leaked");
+    assert!(
+        f.branches().contains("board/lin-1"),
+        "and the branch still survives it: {}",
+        f.branches()
+    );
+}
+
+#[test]
 fn the_worktree_root_is_scanned_for_directories_no_attempt_claims() {
-    // A task reaped from the board takes its attempts with it and leaves the
-    // checkout behind. gc reports those; it does not guess at them.
+    // What is left once reaping no longer strands checkouts (AGE-6): a directory
+    // that was never ours — hand-made, or from a database that was thrown away.
+    // gc reports those; it does not guess at them.
     let f = Fixture::new("untracked");
     f.attempt("LIN-1", "board/lin-1", Outcome::Done, 30);
     let stray = f.paths.worktree_root().join("gh-503-1");

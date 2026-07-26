@@ -52,5 +52,6 @@ labels = ["herd"]
 pull_requests = true
 # Leave the same trail on GitHub that Linear gets: a comment on dispatch and on
 # outcome, and close the issue on done. Needs a token with `repo` scope.
-# Set false to keep the board strictly read-only against GitHub.
-writeback = true
+# Off by default: the board should not start writing to your issues just
+# because you pointed it at a repo.
+writeback = false

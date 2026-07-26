@@ -304,10 +304,13 @@ pub struct GithubConfig {
     /// Leave the same trail on GitHub that Linear gets: a comment on dispatch
     /// and on outcome, and close the issue when the task is done.
     ///
-    /// On by default, because the alternative — deriving state locally while
-    /// upstream never changes — makes `d mark done` a key that undoes itself.
-    /// Turn it off if the board should stay strictly read-only.
-    #[serde(default = "default_true")]
+    /// **Off by default.** Writing to someone's issues is not a thing to start
+    /// doing because they pointed the board at a repo — the first dispatch
+    /// would comment on production issues before anyone had decided that was
+    /// wanted. `d mark done` stays honest without it: the local override moves
+    /// the row and survives re-derivation, it just does not close the issue
+    /// upstream.
+    #[serde(default)]
     pub writeback: bool,
 }
 
@@ -321,7 +324,7 @@ impl Default for GithubConfig {
             repos: Vec::new(),
             labels: Vec::new(),
             pull_requests: true,
-            writeback: true,
+            writeback: false,
         }
     }
 }

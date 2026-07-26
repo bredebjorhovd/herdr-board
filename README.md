@@ -501,7 +501,13 @@ resolved here rather than guessed at repeatedly.
   stay distinct. A PR whose branch belongs to an attempt still attaches to that
   task instead, so dispatched work never appears twice. Turn it off with
   `[github] pull_requests = false`.
-- **GitHub is no longer read-only.** As originally specced, `d mark done` moved a
+- **GitHub writeback is opt-in.** The board can leave the same trail on GitHub
+  that Linear gets — a comment on dispatch and on outcome, and closing the issue
+  on done — but it is **off by default**: pointing the board at a repo is not
+  the same as asking it to write to your issues. `d mark done` stays honest
+  without it, because the local override moves the row and survives
+  re-derivation; it just does not close the issue upstream. `doctor` states
+  which posture you are in. As originally specced, `d mark done` moved a
   GitHub row and the next poll recomputed `open` upstream and moved it straight
   back — a key that undoes itself. The board now leaves the same trail on GitHub
   that Linear gets: a comment on dispatch and on outcome, and **close on done**.

@@ -849,6 +849,17 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                 },
             });
 
+            checks.push(Check {
+                name: "github writeback".into(),
+                ok: true,
+                detail: if cfg.github.writeback {
+                    "ON — dispatch comments on real issues and closes them on done".into()
+                } else {
+                    "off — the board only reads GitHub (`[github] writeback = true` to enable)"
+                        .into()
+                },
+            });
+
             for repo in repos {
                 let reachable = crate::sources::github::HttpRest::new(github_token(paths))
                     .ok()

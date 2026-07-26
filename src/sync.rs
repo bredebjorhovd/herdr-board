@@ -1418,6 +1418,14 @@ mod tests {
         .unwrap();
     }
 
+    /// An engine with GitHub writeback enabled — it is off by default now, so a
+    /// test about writeback has to ask for it.
+    fn engine_with_gh_writeback() -> SyncEngine {
+        let mut e = engine_with(None, Some(gh_client()));
+        e.cfg.github.writeback = true;
+        e
+    }
+
     fn gh_client() -> Github<Box<dyn Rest>> {
         Github::new(Box::new(crate::sources::github::FixtureRest::new(vec![]))
             as Box<dyn Rest>)
@@ -1443,7 +1451,7 @@ mod tests {
     fn a_github_row_that_reaches_done_queues_a_close() {
         // Otherwise the next poll recomputes `open` upstream and `d mark done`
         // undoes itself.
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with_gh_writeback();
         seed_gh(&e);
         e.db.set_local_done("gh:o/r#87", true).unwrap();
         e.rederive_all().unwrap();
@@ -1461,7 +1469,7 @@ mod tests {
 
     #[test]
     fn the_close_is_queued_once_however_many_times_we_rederive() {
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with_gh_writeback();
         seed_gh(&e);
         e.db.set_local_done("gh:o/r#87", true).unwrap();
         for _ in 0..5 {
@@ -1479,7 +1487,7 @@ mod tests {
 
     #[test]
     fn an_already_closed_issue_is_not_closed_again() {
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with_gh_writeback();
         e.db.upsert_task(&UpsertTask {
             id: "gh:o/r#88".into(),
             source: Source::Github,
@@ -1507,9 +1515,11 @@ mod tests {
     }
 
     #[test]
-    fn writeback_can_be_turned_off_for_github() {
-        let mut e = engine_with(None, Some(gh_client()));
-        e.cfg.github.writeback = false;
+    fn writeback_is_off_unless_asked_for() {
+        // Pointing the board at a repo is not the same as asking it to write to
+        // your issues.
+        let e = engine_with(None, Some(gh_client()));
+        assert!(!e.cfg.github.writeback, "writeback must default to off");
         seed_gh(&e);
         e.db.set_local_done("gh:o/r#87", true).unwrap();
         e.rederive_all().unwrap();

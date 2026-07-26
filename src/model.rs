@@ -116,6 +116,10 @@ pub enum UpstreamState {
     Started,
     /// Linear completed/canceled, GitHub closed.
     Terminal,
+    /// The issue itself is no longer there: a full sweep of the source stopped
+    /// returning it. Never set by a poll — only by reaping, and only on a task
+    /// that has attempts worth keeping (impl spec §4, AGE-6).
+    Gone,
 }
 
 impl UpstreamState {
@@ -124,6 +128,7 @@ impl UpstreamState {
             UpstreamState::Unstarted => "unstarted",
             UpstreamState::Started => "started",
             UpstreamState::Terminal => "terminal",
+            UpstreamState::Gone => "gone",
         }
     }
 
@@ -132,8 +137,15 @@ impl UpstreamState {
             "unstarted" => UpstreamState::Unstarted,
             "started" => UpstreamState::Started,
             "terminal" => UpstreamState::Terminal,
+            "gone" => UpstreamState::Gone,
             _ => return None,
         })
+    }
+
+    /// Nothing more is coming from upstream: the issue is closed, or the issue
+    /// is not there at all. Both end the task; neither can be written back to.
+    pub fn is_final(self) -> bool {
+        matches!(self, UpstreamState::Terminal | UpstreamState::Gone)
     }
 
     /// Map a Linear workflow state *type* onto our normalized upstream state.
@@ -284,10 +296,11 @@ pub fn derive_state(d: Derivation) -> BoardState {
         return BoardState::Done;
     }
 
-    // 2. Closed upstream is the end of the story. This outranks a live attempt:
-    //    if the issue was closed while an agent worked, the work is moot and the
-    //    operator should see it leave the queue.
-    if d.upstream == UpstreamState::Terminal {
+    // 2. Closed upstream is the end of the story, and so is deleted upstream —
+    //    `gone` is a task whose issue the source stopped returning. This
+    //    outranks a live attempt: if the issue was closed while an agent worked,
+    //    the work is moot and the operator should see it leave the queue.
+    if d.upstream.is_final() {
         return BoardState::Done;
     }
 
@@ -483,6 +496,48 @@ mod tests {
             }),
             BoardState::Done
         );
+    }
+
+    /// A reaped task keeps its attempts, so it must not derive back into a state
+    /// that invites a retry: there is no issue left to retry against. `gone` is
+    /// terminal exactly like `terminal`, which is also what lets `gc` collect its
+    /// checkout instead of stranding it.
+    #[test]
+    fn a_task_gone_from_upstream_is_done_whatever_its_last_attempt_did() {
+        for outcome in [
+            None,
+            Some(Outcome::Cancelled),
+            Some(Outcome::Failed),
+            Some(Outcome::Done),
+        ] {
+            let s = derive_state(Derivation {
+                upstream: UpstreamState::Gone,
+                last_outcome: outcome,
+                ..d()
+            });
+            assert_eq!(s, BoardState::Done, "gone + {outcome:?}");
+        }
+        assert!(BoardState::Done.is_terminal(), "so gc can collect it");
+    }
+
+    #[test]
+    fn gone_and_terminal_are_both_final_upstream() {
+        assert!(UpstreamState::Gone.is_final());
+        assert!(UpstreamState::Terminal.is_final());
+        assert!(!UpstreamState::Started.is_final());
+        assert!(!UpstreamState::Unstarted.is_final());
+    }
+
+    #[test]
+    fn upstream_states_round_trip() {
+        for s in [
+            UpstreamState::Unstarted,
+            UpstreamState::Started,
+            UpstreamState::Terminal,
+            UpstreamState::Gone,
+        ] {
+            assert_eq!(UpstreamState::parse(s.as_str()), Some(s));
+        }
     }
 
     /// Design-spec gap #5, resolved here: cancelling ends the attempt, not the

@@ -87,6 +87,16 @@ impl BoardState {
     pub fn holds_pane(self) -> bool {
         matches!(self, BoardState::Working | BoardState::Blocked)
     }
+
+    /// Finished for good, with no retry left to come.
+    ///
+    /// Only `done` qualifies: `review` is waiting for you and `failed` is
+    /// waiting for a retry, and both of those still have a use for the attempt's
+    /// worktree — a retry reuses the checkout already holding the branch. This
+    /// is the filter `gc` prunes by.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, BoardState::Done)
+    }
 }
 
 impl fmt::Display for BoardState {

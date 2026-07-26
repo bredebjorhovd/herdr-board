@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod dispatch;
+pub mod gc;
 pub mod herdr;
 pub mod log;
 pub mod model;

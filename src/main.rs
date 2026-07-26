@@ -1,7 +1,7 @@
 //! herdr-board — a task board fed by Linear and GitHub, dispatching into herdr
 //! panes and reconciling pane state back to the board.
 
-use herdr_board::{cli, config, dispatch, herdr, log, ui};
+use herdr_board::{cli, config, dispatch, gc, herdr, log, ui};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -80,6 +80,16 @@ enum Command {
     Cancel {
         #[arg(long)]
         task: String,
+    },
+    /// Remove the worktrees of finished attempts. Branches are left alone.
+    Gc {
+        /// Only checkouts whose last attempt ended longer ago than this:
+        /// `14d`, `36h`, `2w`. A bare number is refused.
+        #[arg(long, default_value = gc::DEFAULT_OLDER_THAN)]
+        older_than: String,
+        /// Say what would go, remove nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Check the environment.
     Doctor,
@@ -214,6 +224,22 @@ fn main() -> Result<()> {
             dispatch::cancel(&engine, &h, &log, &t)?;
             engine.rederive_all()?;
             println!("cancelled {} — the issue is still open", t.identifier);
+            Ok(())
+        }
+        Command::Gc {
+            older_than,
+            dry_run,
+        } => {
+            // File only: gc's stdout *is* the report, and argv logging on
+            // stderr interleaves straight through the middle of it.
+            let log = Arc::new(Logger::new(paths.logfile(), false));
+            let report = gc::run(&paths, log, &older_than, dry_run)?;
+            gc::print_report(&report);
+            // A checkout git refused to remove is a result the operator has to
+            // act on, not a detail in the middle of a summary.
+            if !report.skipped.is_empty() {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Command::Doctor => {

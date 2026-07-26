@@ -281,7 +281,7 @@ Files, all under the herdr-managed plugin directories:
 | `$STATE/board.db` | tasks, attempts, writeback queue |
 | `$STATE/syncd.pid` | daemon pidfile (pid + start time) |
 | `$STATE/syncd.log` | every state transition and every herdr argv, rotated at 5 MB |
-| `$STATE/wt/` | git worktrees, one per attempt |
+| `$STATE/wt/` | git worktrees, one per attempt; cleared by `gc`, never automatically |
 
 Nothing is ever written to `HERDR_PLUGIN_ROOT`.
 
@@ -338,6 +338,7 @@ Two different things are called labels, which is easy to trip on:
 | `list [--state S] [--source S] [--json]` | read the board (for agents) |
 | `dispatch --task <id>` | dispatch without the picker |
 | `cancel --task <id>` | end the live attempt, keep the issue open |
+| `gc [--older-than 14d] [--dry-run]` | remove the worktrees of finished attempts |
 | `doctor` | check the environment |
 | `demo [scenario]` | render the TUI on fixtures (`--list` for the scenarios) |
 
@@ -439,7 +440,8 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   a branch in only one worktree, so a retry cannot cut a second checkout of the
   same branch — the cancelled attempt's is still holding it. Dispatch reuses that
   checkout, which is also the behaviour you want: a retry continues the work
-  rather than starting beside it.
+  rather than starting beside it. Clearing them out is a thing you ask for:
+  `herdr-board gc`.
 - **`agent start` races the shell it is given.** `tab create` returns as soon as
   the pane exists, but `agent start` needs the shell at its prompt owning the
   foreground; starting immediately gets `agent_pane_busy` and leaves an empty
@@ -525,7 +527,7 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 177 tests
+cargo test                 # 222 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
@@ -539,7 +541,9 @@ Tests cover the state-derivation matrix, routing resolution, writeback
 idempotency, reconciliation and orphan handling, dispatch provenance, schema
 migration from an older database, the full key map, and cell-exact rendering at
 80×24, 120×40, 160×38 and 60×20. `tests/sync_once.rs` drives whole
-sync cycles against recorded Linear responses in `tests/fixtures/`.
+sync cycles against recorded Linear responses in `tests/fixtures/`, and
+`tests/gc_worktree.rs` runs `gc` against a real repository — the checkout goes,
+the branch survives, and a checkout with uncommitted work is refused.
 
 ### Tasks that vanish upstream
 
@@ -560,8 +564,37 @@ the binary does not strand an existing database. This matters more than it
 sounds — a missing column makes `load_tasks` fail, which takes the board pane
 down with it.
 
+### Clearing out old worktrees
+
+Nothing removes a worktree on its own, and that is deliberate — see "one branch,
+one worktree" above. `$STATE/wt/` therefore grows by one checkout per attempt and
+never shrinks, so there is a sweep you run when you want the space back:
+
+```bash
+herdr-board gc --dry-run           # what would go, and why the rest stays
+herdr-board gc                     # remove them
+herdr-board gc --older-than 2w     # 14d by default; also 36h, 2w
+```
+
+A checkout goes only when it is **terminal and aged** — both, because either one
+alone deletes work someone is coming back for:
+
+- **Terminal** is a property of the task, not the attempt. Only `done` counts. A
+  `cancelled` attempt puts its row back in `ready` and `failed` is the state you
+  retry from, and a retry reuses the checkout that already holds the branch — so
+  those stay however old they get. `--dry-run` prints the reason against each.
+- **Aged** is the last attempt in that checkout having ended longer ago than
+  `--older-than`. `--older-than` always needs a unit: a bare `14` means seconds
+  to `[sync] interval`, and reading it that way here would collect everything.
+
+**The branch is never touched.** Removing the checkout is what frees the branch
+for a fresh worktree; deleting it would throw the work away. A checkout with
+uncommitted changes is refused by git and reported rather than forced, and gc
+exits non-zero when that happens. Directories under `$STATE/wt/` that no attempt
+claims — what a task reaped from the board leaves behind — are listed, never
+removed: nothing left in the database says which repo they came from.
+
 ### Not in v0
 
 Multi-operator anything, Linear webhooks and agent sessions (polling is enough
-for one person), auto-dispatch rules, and `gc` for old worktrees. Worktrees are
-never deleted automatically.
+for one person), and auto-dispatch rules.

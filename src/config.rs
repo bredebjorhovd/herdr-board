@@ -232,6 +232,10 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
         's' => (&s[..s.len() - 1], 1),
         'm' => (&s[..s.len() - 1], 60),
         'h' => (&s[..s.len() - 1], 3600),
+        // `d` and `w` are for `gc --older-than`, where the interesting units are
+        // days and weeks rather than the sync interval's seconds.
+        'd' => (&s[..s.len() - 1], 86_400),
+        'w' => (&s[..s.len() - 1], 604_800),
         _ => (s, 1),
     };
     num.trim().parse::<u64>().ok().map(|n| n * mult)

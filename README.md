@@ -638,7 +638,7 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 265 tests (251 unit, 14 integration)
+cargo test                 # 272 tests (258 unit, 14 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down

@@ -47,6 +47,14 @@ pub struct PaneInfo {
     pub label: Option<String>,
 }
 
+/// A pane's position and size within its tab.
+#[derive(Debug, Clone)]
+pub struct PaneRect {
+    pub pane_id: String,
+    pub x: u16,
+    pub height: u16,
+}
+
 /// Where a new pane goes: beside something, or in a tab of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
@@ -354,7 +362,10 @@ impl Herdr {
     /// A pane to split from in a given workspace: the focused one if it is
     /// there, otherwise any of them.
     pub fn split_target_in(&self, workspace_id: &str) -> Option<String> {
-        self.split_target_and_direction(workspace_id).map(|(p, _)| p)
+        match self.board_placement(workspace_id)? {
+            Placement::Split { target, .. } => Some(target),
+            Placement::NewTab => None,
+        }
     }
 
     /// A pane to split from, and which way to split it.
@@ -362,36 +373,104 @@ impl Herdr {
     /// Splitting right every time turns a busy tab into a row of narrow
     /// columns; once a tab already holds two panes, splitting down keeps
     /// everything readable.
-    pub fn split_target_and_direction(
+    /// Where a dispatched **agent** pane should go.
+    ///
+    /// Agents stack down the left; the board keeps the right-hand column. The
+    /// board is excluded from the count, because the limit is about how many
+    /// agents you can read at once, not how many panes exist — counting it made
+    /// agents overflow a tab sooner and, worse, made the board itself overflow.
+    pub fn agent_placement(
         &self,
         workspace_id: &str,
-    ) -> Option<(String, &'static str)> {
-        self.tab_placement(workspace_id, usize::MAX)
-            .and_then(|p| match p {
-                Placement::Split { target, direction } => Some((target, direction)),
-                Placement::NewTab => None,
-            })
-    }
-
-    /// Where the next pane should go in a workspace.
-    pub fn tab_placement(&self, workspace_id: &str, max_panes_per_tab: usize) -> Option<Placement> {
+        max_agent_panes_per_tab: usize,
+    ) -> Option<Placement> {
         let panes = self.pane_list().ok()?;
         let here: Vec<&PaneInfo> = panes
             .iter()
             .filter(|p| p.workspace_id == workspace_id)
             .collect();
         let target = here.iter().find(|p| p.focused).or_else(|| here.first())?;
-        // Count only the tab we would actually split into.
-        let in_tab = here
+        let agents_in_tab = here
             .iter()
-            .filter(|p| p.tab_id.is_some() && p.tab_id == target.tab_id)
+            .filter(|p| {
+                p.tab_id.is_some()
+                    && p.tab_id == target.tab_id
+                    && p.label.as_deref() != Some("Board")
+            })
             .count();
-        if in_tab >= max_panes_per_tab {
+        if agents_in_tab >= max_agent_panes_per_tab {
             return Some(Placement::NewTab);
         }
+
+        // Stack down the tallest pane that is not the board, so agents grow
+        // their own column and the board keeps its one. Splitting whatever
+        // happens to be focused shaves a sliver off an arbitrary pane and the
+        // layout degrades differently every time.
+        let board_ids: std::collections::HashSet<&str> = here
+            .iter()
+            .filter(|p| p.label.as_deref() == Some("Board"))
+            .map(|p| p.pane_id.as_str())
+            .collect();
+        let split_from = self
+            .pane_layout(&target.pane_id)
+            .and_then(|rects| {
+                let candidates: Vec<PaneRect> = rects
+                    .into_iter()
+                    .filter(|r| !board_ids.contains(r.pane_id.as_str()))
+                    .collect();
+                tallest_leftmost(&candidates)
+            })
+            .unwrap_or_else(|| target.pane_id.clone());
+
         Some(Placement::Split {
-            target: target.pane_id.clone(),
-            direction: if in_tab >= 2 { "down" } else { "right" },
+            target: split_from,
+            direction: "down",
+        })
+    }
+
+    /// Geometry of every pane in the tab containing `pane_id`.
+    pub fn pane_layout(&self, pane_id: &str) -> Option<Vec<PaneRect>> {
+        let r = self.run_quiet(&["pane", "layout", "--pane", pane_id]).ok()?;
+        let panes = r.get("layout")?.get("panes")?.as_array()?;
+        Some(
+            panes
+                .iter()
+                .filter_map(|p| {
+                    let rect = p.get("rect")?;
+                    Some(PaneRect {
+                        pane_id: p.get("pane_id")?.as_str()?.to_string(),
+                        x: rect.get("x")?.as_u64()? as u16,
+                        height: rect.get("height")?.as_u64()? as u16,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Where the **board** should go: always beside your work, never in a tab
+    /// of its own. Being able to see what is in flight while you work is the
+    /// point of it; a tab you have to switch to defeats that entirely.
+    ///
+    /// A split inherits the height of the pane it came from, so splitting off
+    /// whichever pane happens to be focused can leave the board a few rows tall
+    /// in a stacked tab. Splitting off the *tallest* pane gives it the best
+    /// column available, and the rightmost of equals keeps it on the right.
+    pub fn board_placement(&self, workspace_id: &str) -> Option<Placement> {
+        let panes = self.pane_list().ok()?;
+        let here: Vec<&PaneInfo> = panes
+            .iter()
+            .filter(|p| p.workspace_id == workspace_id)
+            .collect();
+        let focused = here.iter().find(|p| p.focused).or_else(|| here.first())?;
+
+        let target = self
+            .pane_layout(&focused.pane_id)
+            .and_then(|rects| tallest_rightmost(&rects))
+            .unwrap_or_else(|| focused.pane_id.clone());
+
+        Some(Placement::Split {
+            target,
+            direction: "right",
         })
     }
 
@@ -502,6 +581,22 @@ impl Herdr {
     }
 }
 
+/// The tallest pane, preferring the left — where agents live.
+pub fn tallest_leftmost(rects: &[PaneRect]) -> Option<String> {
+    rects
+        .iter()
+        .min_by_key(|r| (std::cmp::Reverse(r.height), r.x))
+        .map(|r| r.pane_id.clone())
+}
+
+/// The pane that yields the tallest column: tallest, then rightmost.
+pub fn tallest_rightmost(rects: &[PaneRect]) -> Option<String> {
+    rects
+        .iter()
+        .max_by_key(|r| (r.height, r.x))
+        .map(|r| r.pane_id.clone())
+}
+
 fn parse_pane(p: &Value) -> Option<PaneInfo> {
     Some(PaneInfo {
         pane_id: p.get("pane_id")?.as_str()?.to_string(),
@@ -562,96 +657,144 @@ mod tests {
         }
     }
 
-    /// The direction rule, without a running herdr.
+    /// The board rule, without a running herdr: always right, always here.
     fn direction_for(panes: &[PaneInfo], ws: &str) -> Option<(String, &'static str)> {
         let here: Vec<&PaneInfo> = panes.iter().filter(|p| p.workspace_id == ws).collect();
         let target = here.iter().find(|p| p.focused).or_else(|| here.first())?;
-        let in_tab = here
-            .iter()
-            .filter(|p| p.tab_id.is_some() && p.tab_id == target.tab_id)
-            .count();
-        Some((
-            target.pane_id.clone(),
-            if in_tab >= 2 { "down" } else { "right" },
-        ))
+        Some((target.pane_id.clone(), "right"))
     }
 
-    /// The placement rule, without a running herdr.
-    fn placement_for(panes: &[PaneInfo], ws: &str, max: usize) -> Option<Placement> {
+    fn board(id: &str, ws: &str, tab: &str) -> PaneInfo {
+        let mut p = pane(id, ws, tab, false);
+        p.label = Some("Board".into());
+        p
+    }
+
+    /// The agent rule, without a running herdr.
+    fn agent_placement_for(panes: &[PaneInfo], ws: &str, max: usize) -> Option<Placement> {
         let here: Vec<&PaneInfo> = panes.iter().filter(|p| p.workspace_id == ws).collect();
         let target = here.iter().find(|p| p.focused).or_else(|| here.first())?;
-        let in_tab = here
+        let agents = here
             .iter()
-            .filter(|p| p.tab_id.is_some() && p.tab_id == target.tab_id)
+            .filter(|p| {
+                p.tab_id.is_some()
+                    && p.tab_id == target.tab_id
+                    && p.label.as_deref() != Some("Board")
+            })
             .count();
-        if in_tab >= max {
+        if agents >= max {
             return Some(Placement::NewTab);
         }
         Some(Placement::Split {
             target: target.pane_id.clone(),
-            direction: if in_tab >= 2 { "down" } else { "right" },
+            direction: "down",
         })
     }
 
     #[test]
-    fn a_full_tab_overflows_to_a_new_tab() {
-        // Right, then down, then a tab of its own — rather than an endless row
-        // of slivers.
-        let mut panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
-        assert!(matches!(
-            placement_for(&panes, "w1", 3),
-            Some(Placement::Split { direction, .. }) if direction == "right"
-        ));
-
-        panes.push(pane("w1:p2", "w1", "w1:t1", false));
-        assert!(matches!(
-            placement_for(&panes, "w1", 3),
-            Some(Placement::Split { direction, .. }) if direction == "down"
-        ));
-
-        panes.push(pane("w1:p3", "w1", "w1:t1", false));
-        assert_eq!(placement_for(&panes, "w1", 3), Some(Placement::NewTab));
+    fn agents_stack_off_the_tallest_pane_that_is_not_the_board() {
+        let rects = vec![
+            PaneRect { pane_id: "w1:p1".into(), x: 0, height: 53 },
+            PaneRect { pane_id: "w1:board".into(), x: 94, height: 53 },
+        ];
+        // The board is filtered out before this is called; of what remains the
+        // tallest and leftmost wins, keeping agents in their own column.
+        let without_board: Vec<PaneRect> =
+            rects.into_iter().filter(|r| r.pane_id != "w1:board").collect();
+        assert_eq!(tallest_leftmost(&without_board).as_deref(), Some("w1:p1"));
     }
 
     #[test]
-    fn the_pane_limit_is_configurable() {
+    fn the_board_never_counts_towards_the_agent_limit() {
+        // Counting it made agents overflow a tab sooner than asked, and made
+        // the board itself get shunted into a tab where it cannot be seen.
         let panes = vec![
             pane("w1:p1", "w1", "w1:t1", true),
-            pane("w1:p2", "w1", "w1:t1", false),
+            board("w1:p2", "w1", "w1:t1"),
         ];
-        assert_eq!(placement_for(&panes, "w1", 2), Some(Placement::NewTab));
         assert!(matches!(
-            placement_for(&panes, "w1", 4),
+            agent_placement_for(&panes, "w1", 2),
             Some(Placement::Split { .. })
         ));
     }
 
     #[test]
-    fn a_quiet_tab_splits_right() {
+    fn agents_stack_down_and_leave_the_board_its_column() {
+        let panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
+        assert!(matches!(
+            agent_placement_for(&panes, "w1", 3),
+            Some(Placement::Split { direction, .. }) if direction == "down"
+        ));
+    }
+
+    #[test]
+    fn a_full_tab_overflows_to_a_new_tab() {
+        // Agents stack, but only so far; past the limit the next one gets a tab
+        // rather than shaving another sliver off the stack.
+        let mut panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
+        assert!(matches!(
+            agent_placement_for(&panes, "w1", 2),
+            Some(Placement::Split { .. })
+        ));
+        panes.push(pane("w1:p2", "w1", "w1:t1", false));
+        assert_eq!(agent_placement_for(&panes, "w1", 2), Some(Placement::NewTab));
+    }
+
+    #[test]
+    fn the_board_splits_off_the_tallest_pane_available() {
+        // A split inherits its source pane's height, so in a stacked tab the
+        // focused pane is often the worst choice.
+        let rects = vec![
+            PaneRect { pane_id: "w1:p1".into(), x: 0, height: 16 },
+            PaneRect { pane_id: "w1:p2".into(), x: 0, height: 16 },
+            PaneRect { pane_id: "w1:p3".into(), x: 94, height: 53 },
+        ];
+        assert_eq!(tallest_rightmost(&rects).as_deref(), Some("w1:p3"));
+    }
+
+    #[test]
+    fn equal_heights_break_towards_the_right() {
+        let rects = vec![
+            PaneRect { pane_id: "w1:p1".into(), x: 0, height: 53 },
+            PaneRect { pane_id: "w1:p2".into(), x: 94, height: 53 },
+        ];
+        assert_eq!(tallest_rightmost(&rects).as_deref(), Some("w1:p2"));
+    }
+
+    #[test]
+    fn the_board_always_splits_right_beside_your_work() {
         let panes = vec![pane("w1:p1", "w1", "w1:t1", true)];
         assert_eq!(direction_for(&panes, "w1").unwrap().1, "right");
     }
 
     #[test]
-    fn a_busy_tab_splits_down_instead_of_stacking_columns() {
+    fn the_board_stays_in_the_tab_however_busy_it_is() {
+        // It is the pane you keep an eye on while working; a tab you have to
+        // switch to defeats the point of it.
         let panes = vec![
             pane("w1:p1", "w1", "w1:t1", true),
             pane("w1:p2", "w1", "w1:t1", false),
+            pane("w1:p3", "w1", "w1:t1", false),
         ];
         let (target, direction) = direction_for(&panes, "w1").unwrap();
         assert_eq!(target, "w1:p1", "splits from the focused pane");
-        assert_eq!(direction, "down");
+        assert_eq!(direction, "right");
     }
 
     #[test]
-    fn panes_in_other_tabs_do_not_make_a_tab_look_busy() {
-        // Only the tab being split into counts.
+    fn only_the_tab_being_split_into_counts() {
         let panes = vec![
             pane("w1:p1", "w1", "w1:t1", true),
             pane("w1:p2", "w1", "w1:t2", false),
             pane("w1:p3", "w1", "w1:t2", false),
         ];
-        assert_eq!(direction_for(&panes, "w1").unwrap().1, "right");
+        assert_eq!(
+            agent_placement_for(&panes, "w1", 2),
+            Some(Placement::Split {
+                target: "w1:p1".into(),
+                direction: "down"
+            })
+        );
     }
 
     #[test]

@@ -465,6 +465,38 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Refresh what the board *displays* from herdr, and nothing else.
+    ///
+    /// Deliberately not [`SyncEngine::reconcile`]: that owns lifecycle
+    /// decisions — orphaning a vanished pane, finalizing a finished attempt —
+    /// and running it from two processes would double-count `missing_ticks` and
+    /// orphan a pane that was merely handing over. This only writes the agent
+    /// status a live attempt is showing, so a reader can pick up a `blocked`
+    /// the moment it happens without racing the daemon.
+    pub fn refresh_agent_status(&self, panes: &[PaneInfo]) -> Result<bool> {
+        let by_id: HashMap<&str, &PaneInfo> =
+            panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+        let mut changed = false;
+        for attempt in self.db.live_attempts()? {
+            let Some(pane_id) = attempt.pane_id.as_deref() else {
+                continue;
+            };
+            let Some(pane) = by_id.get(pane_id) else {
+                // Missing panes are the daemon's business, not ours.
+                continue;
+            };
+            let status = pane.agent_status.unwrap_or(AgentStatus::Unknown);
+            if attempt.agent_status != Some(status) {
+                self.db.set_attempt_status(attempt.id, status)?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.rederive_all()?;
+        }
+        Ok(changed)
+    }
+
     /// Recompute and persist every task's derived state, using the agent status
     /// reconciliation last stored on each live attempt.
     pub fn rederive_all(&self) -> Result<()> {
@@ -1020,6 +1052,51 @@ mod tests {
         assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
         // The unrelated task must not pick up the PR.
         assert!(!e.db.get_task("linear:LIN-999").unwrap().unwrap().pr_open);
+    }
+
+    #[test]
+    fn a_reader_picks_up_a_status_change_without_touching_lifecycle() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "w1:p9");
+
+        assert!(
+            e.refresh_agent_status(&[pane("w1:p9", AgentStatus::Blocked)])
+                .unwrap()
+        );
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Blocked
+        );
+        // ...and unblocking is picked up the same way.
+        assert!(
+            e.refresh_agent_status(&[pane("w1:p9", AgentStatus::Working)])
+                .unwrap()
+        );
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Working
+        );
+        // An unchanged status is not a write.
+        assert!(
+            !e.refresh_agent_status(&[pane("w1:p9", AgentStatus::Working)])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_reader_never_orphans_a_missing_pane() {
+        // Orphaning is the daemon's call; a reader running this every two
+        // seconds would race `missing_ticks` and kill a pane mid-handoff.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "w1:p9");
+        for _ in 0..10 {
+            e.refresh_agent_status(&[]).unwrap();
+        }
+        let a = &e.db.attempts_for("linear:LIN-142").unwrap()[0];
+        assert_eq!(a.missing_ticks, 0);
+        assert!(a.outcome.is_none());
     }
 
     #[test]

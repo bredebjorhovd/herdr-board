@@ -76,6 +76,15 @@ command = ["./target/release/herdr-board", "open-link"]
 on = "pane.exited"
 command = ["./target/release/herdr-board", "sync", "--once"]
 
+# An agent becomes blocked when it asks a question and unblocked the moment it
+# is answered — both are input, so both are observable immediately. `reconcile`
+# rather than `sync --once` deliberately: this fires on every status change of
+# every pane, and polling Linear and GitHub each time would be absurd. It reads
+# pane state and rewrites derived states, nothing more.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./target/release/herdr-board", "reconcile"]
+
 [[link_handlers]]
 id = "github-issue"
 title = "Open in board"

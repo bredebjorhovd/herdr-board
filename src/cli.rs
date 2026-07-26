@@ -53,6 +53,22 @@ pub fn sync_once(paths: &Paths, log: Arc<Logger>) -> Result<()> {
     engine.sync_once(Some(&herdr))
 }
 
+/// Reconcile pane state only — no source polling, no network.
+///
+/// A status change is caused by *input*: an agent becomes blocked when it asks
+/// something, and unblocked the moment it is answered. Waiting up to a full
+/// poll interval to notice makes the board lie about the one thing it exists to
+/// show. This is what herdr's `pane.agent_status_changed` event runs, so the
+/// board reflects an answered prompt within a tick rather than within 30s.
+pub fn reconcile_once(paths: &Paths, log: Arc<Logger>) -> Result<()> {
+    let engine = engine_from_paths(paths, log.clone())?;
+    let herdr = Herdr::discover(log.clone());
+    let panes = herdr.pane_list()?;
+    engine.reconcile(&panes)?;
+    engine.rederive_all()?;
+    Ok(())
+}
+
 // ---- syncd -------------------------------------------------------------
 
 /// Start the daemon if it is not already running, then exit immediately.
@@ -538,17 +554,6 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
 /// there is nothing to tidy up afterwards.
 pub const BOARD_PANE_LABEL: &str = "Board";
 
-/// `[defaults] split_direction` when it forces a direction, for the board's own
-/// pane as well as dispatched ones.
-fn engine_split_override(paths: &Paths) -> Option<&'static str> {
-    let cfg = RoutingConfig::load_or_default(&paths.routing());
-    match cfg.defaults.split_direction.as_deref() {
-        Some("right") => Some("right"),
-        Some("down") => Some("down"),
-        _ => None,
-    }
-}
-
 /// Every live board pane, newest last.
 ///
 /// Identity is confirmed against the label herdr sets from the manifest title,
@@ -622,18 +627,20 @@ pub fn toggle_board(paths: &Paths, log: Arc<Logger>) -> Result<()> {
     // Split to the right of whatever is focused, so the board sits next to your
     // work rather than on top of it — and explicitly in the workspace this
     // toggle was fired from, so placement matches the check above.
-    // Same rule as a dispatched agent pane: split right into a quiet tab, down
-    // into one that already holds two panes. Three narrow columns is worse than
-    // a stacked pane, and the board reads fine at reduced height.
-    let (target, direction) = match herdr.split_target_and_direction(&here) {
-        Some((t, d)) => (Some(t), d),
-        None => (None, "right"),
+    // Same rule as a dispatched agent pane: right into a quiet tab, down into a
+    // busier one, and a tab of its own once the tab is full. The board is the
+    // pane most hurt by getting a sliver — clipped to five rows it renders a
+    // section header and no rows at all.
+    // The board always splits into the tab you are in, never into a tab of its
+    // own: seeing what is in flight while you work is the entire point of it.
+    let target = match herdr.board_placement(&here) {
+        Some(crate::herdr::Placement::Split { target, .. }) => Some(target),
+        _ => None,
     };
-    let direction = engine_split_override(paths).unwrap_or(direction);
     let pane = herdr.plugin_pane_open_in(
         "board",
         Some("split"),
-        Some(direction),
+        Some("right"),
         target.as_deref(),
     )?;
     match pane {

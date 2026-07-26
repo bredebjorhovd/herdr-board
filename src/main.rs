@@ -32,6 +32,8 @@ enum Command {
         #[arg(long)]
         ensure: bool,
     },
+    /// Reconcile pane state only — no network. Fired by herdr agent events.
+    Reconcile,
     /// Run one sync cycle.
     Sync {
         #[arg(long, default_value_t = true)]
@@ -115,6 +117,10 @@ fn main() -> Result<()> {
             } else {
                 cli::syncd(&paths, log)
             }
+        }
+        Command::Reconcile => {
+            let log = Arc::new(Logger::new(paths.logfile(), false));
+            cli::reconcile_once(&paths, log)
         }
         Command::Sync { .. } => {
             let log = Arc::new(Logger::new(paths.logfile(), true));

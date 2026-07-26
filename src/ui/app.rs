@@ -460,6 +460,7 @@ fn event_loop(term: &mut Term, board: &mut Board) -> Result<()> {
     let mut last_mtime = mtime(&db_path);
     let mut last_tick = Instant::now();
     let mut last_click: Option<(u16, Instant)> = None;
+    let mut last_status_poll = Instant::now();
     board.reload()?;
 
     // Record which pane we are, so the link handler focuses this board rather
@@ -494,6 +495,21 @@ fn event_loop(term: &mut Term, board: &mut Board) -> Result<()> {
         }
 
         board.app.expire_message();
+
+        // An agent becomes blocked when it asks something and unblocked the
+        // moment it is answered. Waiting for the daemon's 30s cycle to notice
+        // makes the board wrong about the one thing it exists to show, so the
+        // board asks herdr itself — cheaply, and only while something is
+        // actually running.
+        if last_status_poll.elapsed() >= Duration::from_secs(2) {
+            last_status_poll = Instant::now();
+            if board.engine.db.live_attempts().map(|a| !a.is_empty()).unwrap_or(false)
+                && let Ok(panes) = board.herdr.pane_list()
+                && board.engine.refresh_agent_status(&panes).unwrap_or(false)
+            {
+                board.reload()?;
+            }
+        }
 
         // Re-read on the tick, and immediately when the daemon writes.
         let now_mtime = mtime(&db_path);

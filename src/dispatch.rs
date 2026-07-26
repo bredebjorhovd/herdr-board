@@ -239,7 +239,7 @@ pub fn dispatch(
         // visible there and its approval prompts can be answered. A tab per
         // attempt hid the agent until you went looking for it.
         let placement =
-            herdr.tab_placement(&workspace_id, engine.cfg.defaults.max_panes_per_tab);
+            herdr.agent_placement(&workspace_id, engine.cfg.defaults.max_panes_per_tab);
         let pane_id = match placement {
             Some(crate::herdr::Placement::Split { target, direction }) => {
                 let direction = engine
@@ -249,7 +249,7 @@ pub fn dispatch(
                     .as_deref()
                     .filter(|d| *d != "auto")
                     .unwrap_or(direction);
-                log.info(format!("splitting {target} {direction}"));
+                log.info(format!("splitting {target} {direction} for the agent"));
                 herdr.pane_split(&target, &worktree, direction)?
             }
             // The tab is full. A fourth sliver helps nobody; the agent gets a

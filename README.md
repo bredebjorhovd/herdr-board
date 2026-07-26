@@ -68,10 +68,9 @@ If you already use the `gh` CLI, its token works and needs no new secret:
 Note it is tied to your `gh` login, so `gh auth logout` breaks the board; a
 dedicated fine-grained PAT is steadier if this sticks.
 
-`syncd` re-reads this file every cycle, so a key added while it is running takes
-effect on the next poll — no restart. (It picks up keys that were *added*; an
-edited value needs a restart, because the old one is already in the daemon's
-environment.)
+The board pane and `syncd` read this file directly on every reload cycle, so
+adding, editing, or removing a key takes effect without a restart. A key
+exported in the shell still takes precedence over the file.
 
 The GitHub token needs `repo` scope: the board comments on dispatch and outcome
 and closes issues on done. Set `[github] writeback = false` if you would rather

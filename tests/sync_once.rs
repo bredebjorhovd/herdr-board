@@ -102,6 +102,7 @@ impl Harness {
         SyncEngine {
             db: Db::open(&paths.db()).unwrap(),
             cfg,
+            credentials: Default::default(),
             paths,
             log: Arc::new(herdr_board::log::Logger::new("", false)),
             linear: Some(Linear::new(transport)),

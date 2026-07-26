@@ -152,6 +152,16 @@ pub struct Board {
 }
 
 impl Board {
+    /// Rebuild source clients when `.env` credentials are added, edited, or
+    /// removed while the pane is open.
+    fn reload_credentials(&mut self) {
+        if let Some(engine) =
+            crate::cli::reload_if_configuration_changed(&self.paths, &self.engine, &self.log)
+        {
+            self.engine = engine;
+        }
+    }
+
     /// Re-read `routing.toml` when it changes on disk.
     fn reload_routing(&mut self) {
         let path = self.paths.routing();
@@ -193,6 +203,7 @@ impl Board {
         // Routing is edited while the board is open — that is the whole setup
         // loop — so a cached config silently mis-routes every row until the
         // pane is reopened.
+        self.reload_credentials();
         self.reload_routing();
         let tasks = self.engine.db.load_tasks()?;
         let views = build_views(tasks, &self.engine.cfg, &self.paths);

@@ -1,6 +1,8 @@
 //! Subcommand implementations and the shared engine constructor.
 
-use crate::config::{Paths, RoutingConfig, github_token, herdr_kind_for_runtime, linear_api_key};
+use crate::config::{
+    Credentials, Paths, RoutingConfig, github_token, herdr_kind_for_runtime, linear_api_key,
+};
 use crate::db::Db;
 use crate::herdr::Herdr;
 use crate::log::Logger;
@@ -18,20 +20,34 @@ pub fn build_engine(
     paths: Paths,
     log: Arc<Logger>,
 ) -> Result<SyncEngine> {
-    let linear = linear_api_key()
+    let credentials = Credentials::load(&paths);
+    build_engine_with_credentials(db, cfg, paths, log, credentials)
+}
+
+fn build_engine_with_credentials(
+    db: Db,
+    cfg: RoutingConfig,
+    paths: Paths,
+    log: Arc<Logger>,
+    credentials: Credentials,
+) -> Result<SyncEngine> {
+    let linear = credentials
+        .linear_api_key
+        .clone()
         .and_then(|k| HttpTransport::new(k).ok())
         .map(|t| Linear::new(Box::new(t) as Box<dyn GraphQl>));
     // GitHub is optional entirely; without repos configured it is never polled.
     let github = if cfg.github.repos.is_empty() {
         None
     } else {
-        HttpRest::new(github_token())
+        HttpRest::new(credentials.github_token.clone())
             .ok()
             .map(|r| Github::new(Box::new(r) as Box<dyn Rest>))
     };
     Ok(SyncEngine {
         db,
         cfg,
+        credentials,
         paths,
         log,
         linear,
@@ -181,32 +197,42 @@ pub fn syncd(paths: &Paths, log: Arc<Logger>) -> Result<()> {
     }
 }
 
-/// Rebuild the engine when a credential or a repo list has appeared since it
-/// was built. Returns `None` when nothing relevant changed.
-fn reload_if_configuration_changed(
+/// Rebuild the engine when credentials or source configuration change.
+/// Returns `None` when nothing relevant changed.
+pub(crate) fn reload_if_configuration_changed(
     paths: &Paths,
     engine: &SyncEngine,
-    log: &Logger,
+    log: &Arc<Logger>,
 ) -> Option<SyncEngine> {
-    // `dotenvy` does not overwrite variables already set, so this picks up keys
-    // that were added, not ones that were edited — which is the case that
-    // matters during setup.
-    crate::config::load_env(paths);
-
-    let linear_appeared = engine.linear.is_none() && linear_api_key().is_some();
-    let github_appeared = engine.github.is_none() && github_token().is_some();
+    let credentials = Credentials::load(paths);
     let cfg = RoutingConfig::load_or_default(&paths.routing());
+    rebuild_if_configuration_changed(paths, engine, log, credentials, cfg)
+}
+
+fn rebuild_if_configuration_changed(
+    paths: &Paths,
+    engine: &SyncEngine,
+    log: &Arc<Logger>,
+    credentials: Credentials,
+    cfg: RoutingConfig,
+) -> Option<SyncEngine> {
+    let linear_changed = credentials.linear_api_key != engine.credentials.linear_api_key;
+    let github_changed = credentials.github_token != engine.credentials.github_token;
     let repos_changed = cfg.github.repos != engine.cfg.github.repos;
     let routes_changed = cfg.routes.len() != engine.cfg.routes.len();
 
-    if !(linear_appeared || github_appeared || repos_changed || routes_changed) {
+    if !(linear_changed || github_changed || repos_changed || routes_changed) {
         return None;
     }
     log.info(format!(
-        "configuration changed (linear:{linear_appeared} github:{github_appeared} \
+        "configuration changed (linear credential:{linear_changed} \
+         github credential:{github_changed} \
          repos:{repos_changed} routes:{routes_changed}) — rebuilding"
     ));
-    match engine_from_paths(paths, Arc::new(Logger::new(paths.logfile(), false))) {
+    let rebuilt = Db::open(&paths.db()).and_then(|db| {
+        build_engine_with_credentials(db, cfg, paths.clone(), log.clone(), credentials)
+    });
+    match rebuilt {
         Ok(e) => Some(e),
         Err(e) => {
             log.error(format!("could not rebuild after a config change: {e}"));
@@ -267,7 +293,7 @@ pub fn init(paths: &Paths, log: Arc<Logger>, force: bool) -> Result<()> {
     // Linear routes need team keys, which only the API can supply. With a key
     // present there is no reason to make anyone look them up by hand.
     let mut linear_routes = String::new();
-    match linear_api_key() {
+    match linear_api_key(paths) {
         None => {
             linear_routes.push_str(
                 "# No LINEAR_API_KEY when this ran, so Linear teams could not be\n\
@@ -385,10 +411,10 @@ writeback = true
         println!("skipped {s}");
     }
     let mut missing = Vec::new();
-    if linear_api_key().is_none() {
+    if linear_api_key(paths).is_none() {
         missing.push("LINEAR_API_KEY");
     }
-    if !repos.is_empty() && github_token().is_none() {
+    if !repos.is_empty() && github_token(paths).is_none() {
         missing.push("GITHUB_TOKEN");
     }
     if missing.is_empty() {
@@ -764,8 +790,8 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
 
     checks.push(Check {
         name: "LINEAR_API_KEY".into(),
-        ok: linear_api_key().is_some(),
-        detail: match linear_api_key() {
+        ok: linear_api_key(paths).is_some(),
+        detail: match linear_api_key(paths) {
             Some(_) => "present".into(),
             None => format!("missing — add it to {}", paths.env_file().display()),
         },
@@ -810,8 +836,8 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
             let repos = &cfg.github.repos;
             checks.push(Check {
                 name: "GITHUB_TOKEN".into(),
-                ok: repos.is_empty() || github_token().is_some(),
-                detail: match (github_token().is_some(), repos.is_empty()) {
+                ok: repos.is_empty() || github_token(paths).is_some(),
+                detail: match (github_token(paths).is_some(), repos.is_empty()) {
                     (true, _) => "present".into(),
                     (false, true) => "not needed — no repos under [github]".into(),
                     (false, false) => format!(
@@ -824,7 +850,7 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
             });
 
             for repo in repos {
-                let reachable = crate::sources::github::HttpRest::new(github_token())
+                let reachable = crate::sources::github::HttpRest::new(github_token(paths))
                     .ok()
                     .map(|r| {
                         use crate::sources::github::Rest;
@@ -1076,5 +1102,51 @@ mod tests {
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
+    }
+
+    #[test]
+    fn edited_and_removed_credentials_rebuild_source_clients() {
+        let paths = tmp();
+        let cfg = RoutingConfig::load_or_default(&paths.routing());
+        let log = Arc::new(Logger::new("", false));
+        let engine = build_engine_with_credentials(
+            Db::open(&paths.db()).unwrap(),
+            cfg,
+            paths.clone(),
+            log.clone(),
+            Credentials {
+                linear_api_key: Some("first".into()),
+                github_token: None,
+            },
+        )
+        .unwrap();
+
+        let edited = rebuild_if_configuration_changed(
+            &paths,
+            &engine,
+            &log,
+            Credentials {
+                linear_api_key: Some("second".into()),
+                github_token: None,
+            },
+            RoutingConfig::load_or_default(&paths.routing()),
+        )
+        .expect("an edited key should rebuild the engine");
+        assert_eq!(
+            edited.credentials.linear_api_key.as_deref(),
+            Some("second")
+        );
+        assert!(edited.linear.is_some());
+
+        let removed = rebuild_if_configuration_changed(
+            &paths,
+            &edited,
+            &log,
+            Credentials::default(),
+            RoutingConfig::load_or_default(&paths.routing()),
+        )
+        .expect("a removed key should rebuild the engine");
+        assert_eq!(removed.credentials.linear_api_key, None);
+        assert!(removed.linear.is_none());
     }
 }

@@ -476,15 +476,18 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   (default 3, the board excluded) sets how full a tab gets before an agent opens
   a tab of its own — a trade between an unreadable column and an agent in a tab
   you will not notice.
-- **A dispatched agent lands as a split, not a new tab.** A new tab is invisible
-  until you switch to it, so an agent that goes `blocked` waiting for approval
-  would sit unseen. Splitting the routed workspace's active tab puts it beside
-  your work, where you can answer it — and `g` on the board jumps straight to it.
+- **A dispatched agent gets a workspace of its own.** `herdr worktree create`
+  cuts the checkout, opens it as a workspace, and groups it under the parent
+  repo in the spaces sidebar — the same shape as any worktree you open by hand.
+  That is where an agent belongs: not a sliver of the tab you are working in,
+  and not a tab you will not notice. `g` on the board jumps straight to it.
+  Concurrency is still counted against the *routed* workspace from
+  `routing.toml`, which is unaffected by the agent having its own space.
 - **One branch, one worktree, and worktrees are never auto-removed.** git allows
   a branch in only one worktree, so a retry cannot cut a second checkout of the
-  same branch — the cancelled attempt's is still holding it. Dispatch reuses that
-  checkout, which is also the behaviour you want: a retry continues the work
-  rather than starting beside it. Clearing them out is a thing you ask for:
+  same branch — the previous attempt's is still holding it. Dispatch reopens
+  that workspace, which is also the behaviour you want: a retry continues the
+  work rather than starting beside it. Clearing them out is a thing you ask for:
   `herdr-board gc`.
 - **`agent start` races the shell it is given.** `tab create` returns as soon as
   the pane exists, but `agent start` needs the shell at its prompt owning the

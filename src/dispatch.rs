@@ -6,10 +6,9 @@ use crate::herdr::{Herdr, agent_name};
 use crate::log::Logger;
 use crate::model::{AgentStatus, Outcome, Task};
 use crate::sync::{SyncEngine, route_context};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Per-dispatch choices the picker can override.
 #[derive(Debug, Clone, Default)]
@@ -223,58 +222,37 @@ pub fn dispatch(
     })?;
 
     let result = (|| -> Result<String> {
-        // The actual worktree may differ from the planned path: a retry reuses
-        // the one already holding this branch.
-        let worktree = prepare_worktree(&p.repo, &p.worktree, &p.branch, log)?;
-        if worktree != p.worktree {
-            engine
-                .db
-                .conn
-                .execute(
-                    "UPDATE attempts SET worktree = ?2 WHERE id = ?1",
-                    rusqlite::params![attempt_id, worktree.to_string_lossy()],
-                )
-                .ok();
-        }
-
-        let workspace_id = herdr
-            .workspace_id_for_label(&p.workspace)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no herdr workspace labelled `{}` — create it, or fix routing.toml",
-                    p.workspace
-                )
-            })?;
-
-        // Split into the routed workspace's active tab, so the agent is
-        // visible there and its approval prompts can be answered. A tab per
-        // attempt hid the agent until you went looking for it.
-        let placement =
-            herdr.agent_placement(&workspace_id, engine.cfg.defaults.max_panes_per_tab);
-        let pane_id = match placement {
-            Some(crate::herdr::Placement::Split { target, direction }) => {
-                let direction = engine
-                    .cfg
-                    .defaults
-                    .split_direction
-                    .as_deref()
-                    .filter(|d| *d != "auto")
-                    .unwrap_or(direction);
-                log.info(format!("splitting {target} {direction} for the agent"));
-                herdr.pane_split(&target, &worktree, direction)?
+        // herdr cuts the checkout and opens it as its own workspace, grouped
+        // under the parent repo in the spaces sidebar. A dispatched agent
+        // belongs in a space of its own — not a sliver of the tab you happen to
+        // be working in, and not a tab you will not notice.
+        //
+        // A retry reuses the existing checkout, because git allows a branch in
+        // only one worktree.
+        let wt = match herdr.worktree_create(&p.repo, &p.branch, &p.identifier) {
+            Ok(wt) => wt,
+            Err(e) if e.to_string().contains("already") || e.to_string().contains("exists") => {
+                log.info(format!("{} already has a checkout; reopening it", p.branch));
+                herdr.worktree_open(&p.repo, &p.branch)?
             }
-            // The tab is full. A fourth sliver helps nobody; the agent gets a
-            // tab of its own, labelled so the tab bar says which task it is.
-            Some(crate::herdr::Placement::NewTab) | None => {
-                log.info(format!(
-                    "tab is at its pane limit; giving {} a tab of its own",
-                    p.identifier
-                ));
-                let tab = herdr.tab_create(&workspace_id, &worktree, &p.identifier)?;
-                tab.root_pane_id
-            }
+            Err(e) => return Err(e),
         };
-        log.info(format!("agent pane {pane_id} in ws:{}", p.workspace));
+        log.info(format!(
+            "{} → workspace {} at {}",
+            p.identifier,
+            wt.workspace_id,
+            wt.path.display()
+        ));
+        engine
+            .db
+            .conn
+            .execute(
+                "UPDATE attempts SET worktree = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, wt.path.to_string_lossy()],
+            )
+            .ok();
+
+        let pane_id = wt.root_pane_id.clone();
         engine.db.set_attempt_pane(attempt_id, &pane_id)?;
 
         let name = agent_name(&p.identifier, p.attempt_no);
@@ -415,90 +393,6 @@ fn started(herdr: &Herdr, name: &str, ticks: u32) -> bool {
         }
     }
     false
-}
-
-/// Where a branch is already checked out, if anywhere.
-///
-/// git allows one worktree per branch, so a retry cannot cut a second checkout
-/// of the same branch — and worktrees are never removed automatically, so the
-/// previous attempt's is still holding it. Reusing that checkout is also the
-/// behaviour you want: a retry should continue the work, not start beside it.
-fn worktree_holding_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "worktree", "list", "--porcelain"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut current: Option<&str> = None;
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current = Some(path);
-        } else if let Some(head) = line.strip_prefix("branch ")
-            && head.trim_start_matches("refs/heads/") == branch
-        {
-            return current.map(PathBuf::from);
-        }
-    }
-    None
-}
-
-/// Create (or reuse) the git worktree for an attempt. Returns the path used.
-fn prepare_worktree(
-    repo: &Path,
-    worktree: &Path,
-    branch: &str,
-    log: &Logger,
-) -> Result<PathBuf> {
-    if !repo.exists() {
-        bail!("repo path {} does not exist", repo.display());
-    }
-    if worktree.exists() {
-        log.info(format!("reusing worktree {}", worktree.display()));
-        return Ok(worktree.to_path_buf());
-    }
-    if let Some(existing) = worktree_holding_branch(repo, branch) {
-        log.info(format!(
-            "branch {branch} is already checked out at {}; reusing it",
-            existing.display()
-        ));
-        return Ok(existing);
-    }
-    if let Some(parent) = worktree.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Reuse the branch if it already exists (a retry lands on the same branch).
-    let exists = Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "rev-parse", "--verify"])
-        .arg(format!("refs/heads/{branch}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let wt = worktree.to_string_lossy().into_owned();
-    let repo_s = repo.to_string_lossy().into_owned();
-    let mut args: Vec<String> = vec!["-C".into(), repo_s, "worktree".into(), "add".into()];
-    if exists {
-        args.push(wt);
-        args.push(branch.to_string());
-    } else {
-        args.push(wt);
-        args.push("-b".into());
-        args.push(branch.to_string());
-    }
-    log.info(format!("git {}", args.join(" ")));
-
-    let out = Command::new("git")
-        .args(&args)
-        .output()
-        .context("running git worktree add")?;
-    if !out.status.success() {
-        bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(worktree.to_path_buf())
 }
 
 /// Cancel a live attempt: kill the pane, close the attempt, queue the trail.

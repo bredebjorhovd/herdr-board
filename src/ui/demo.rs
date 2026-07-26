@@ -68,15 +68,10 @@ pub fn run(scenario: &str) -> Result<()> {
                             Screen::Prompt
                         }
                     }
-                    Action::Enter => {
-                        if app.rows.iter().any(|(_, r)| *r == super::state::Row::DoneCollapsed)
-                            && app.selected().is_none()
-                        {
-                            app.done_expanded = true;
-                        } else {
-                            app.screen = Screen::Detail;
-                        }
-                    }
+                    Action::Enter => match app.on_section_header() {
+                        Some(state) => app.toggle_collapsed(state),
+                        None => app.screen = Screen::Detail,
+                    },
                     Action::Cancel => {
                         app.confirm = app.selected().map(|v| v.id().to_string());
                     }

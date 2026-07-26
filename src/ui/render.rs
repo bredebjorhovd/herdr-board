@@ -307,16 +307,11 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
         // most of the board.
         let mut lines: Vec<Row> = Vec::new();
         for (state, rows) in sections {
-            if state == BoardState::Done {
-                // One selectable header, whichever way the section is folded.
-                lines.push(Row::DoneCollapsed);
-                if !app.done_expanded {
-                    continue;
-                }
-                lines.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
+            // One selectable header per section, whichever way it is folded.
+            lines.push(Row::Section(state));
+            if app.is_collapsed(state) {
                 continue;
             }
-            lines.push(Row::Section(state));
             lines.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
         }
 
@@ -326,13 +321,19 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
         let mut y = body_top;
         for row in lines.iter().skip(app.scroll).take(height) {
             match row {
-                Row::DoneCollapsed => {
-                    render_done_header(buf, area, y, app.done_expanded);
-                    if app.on_done_header() {
+                Row::Section(state) => {
+                    render_section_header(
+                        buf,
+                        area,
+                        y,
+                        *state,
+                        app.is_collapsed(*state),
+                        app.section_len(*state),
+                    );
+                    if app.on_section_header() == Some(*state) {
                         reverse_row(buf, area, y, COL_GUTTER);
                     }
                 }
-                Row::Section(state) => render_section_header(buf, area, y, *state),
                 Row::Task(id) => {
                     let Some(v) = app.views.iter().find(|v| v.id() == id) else {
                         continue;
@@ -417,39 +418,31 @@ fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
 
 /// A section header must read as a different *shape* from a row, not just a
 /// different color: glyph, bold uppercase label, then a dim rule to the margin.
-/// No count — it competed with the elapsed column and told the operator nothing
-/// they could not see.
-fn render_section_header(buf: &mut Buffer, area: Rect, y: u16, state: BoardState) {
+///
+/// No count when it is open — it competed with the elapsed column and told the
+/// operator nothing they could not see. Folded is the opposite case: the rows
+/// are gone, so the number is the only thing left that says what is in there.
+fn render_section_header(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    state: BoardState,
+    collapsed: bool,
+    len: usize,
+) {
     put(buf, area, COL_GUTTER, y, state.glyph(), theme::state_style(state));
-    let label = format!("{}  ", state.label());
-    let used = put(buf, area, COL_ID, y, &label, theme::bold());
-    rule(
-        buf,
-        area,
-        COL_ID + used,
-        area.width.saturating_sub(2),
-        y,
-        theme::dim(),
-    );
-}
-
-fn render_done_header(buf: &mut Buffer, area: Rect, y: u16, expanded: bool) {
-    put(
-        buf,
-        area,
-        COL_GUTTER,
-        y,
-        BoardState::Done.glyph(),
-        theme::state_style(BoardState::Done),
-    );
-    let label = "DONE today  ";
-    let used = put(buf, area, COL_ID, y, label, theme::bold());
-    let hint = if expanded {
-        "enter to collapse  "
+    let label = if state == BoardState::Done {
+        "DONE today  ".to_string()
     } else {
-        "enter to expand  "
+        format!("{}  ", state.label())
     };
-    let used2 = put(buf, area, COL_ID + used, y, hint, theme::dim());
+    let used = put(buf, area, COL_ID, y, &label, theme::bold());
+    let hint = if collapsed {
+        format!("{len} hidden · enter to expand  ")
+    } else {
+        String::new()
+    };
+    let used2 = put(buf, area, COL_ID + used, y, &hint, theme::dim());
     rule(
         buf,
         area,
@@ -554,15 +547,16 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
             v.push(("?", "help", '?'));
             v
         }
-        Screen::List if app.on_done_header() => vec![
-            (
-                "enter",
-                if app.done_expanded { "collapse" } else { "expand" },
-                '\r',
-            ),
-            ("s", "sync", 's'),
-            ("?", "help", '?'),
-        ],
+        Screen::List if app.on_section_header().is_some() => {
+            let folded = app
+                .on_section_header()
+                .is_some_and(|s| app.is_collapsed(s));
+            vec![
+                ("enter", if folded { "expand" } else { "collapse" }, '\r'),
+                ("s", "sync", 's'),
+                ("?", "help", '?'),
+            ]
+        }
         Screen::List => match app.selected().map(|s| s.state()) {
             // `l detail` is a deliberate addition to the design's footer table.
             // On a ready row `enter` dispatches, so without this there is no
@@ -986,8 +980,7 @@ pub fn clamp_scroll(
     // findable here too or selecting it below the fold scrolls nowhere.
     let Some(ix) = lines.iter().position(|r| match r {
         Row::Task(t) => t == id,
-        Row::DoneCollapsed => id == crate::ui::state::DONE_ROW,
-        Row::Section(_) => false,
+        Row::Section(st) => crate::ui::state::section_row_id(*st) == id,
     }) else {
         return scroll.min(max);
     };
@@ -1121,7 +1114,7 @@ mod tests {
         // Without a viewport the body is just clipped, and every row below the
         // fold is invisible and unreachable.
         let mut app = fixtures::app(fixtures::POPULATED);
-        app.done_expanded = true;
+        app.collapsed.clear();
         let ids = app.visible_task_ids();
         // A pane short enough that most of the board is below the fold.
         for id in &ids {
@@ -1129,9 +1122,7 @@ mod tests {
             let buf = draw(&mut app, 80, 12);
             let on_screen = app.rows.iter().any(|(_, r)| match r {
                 Row::Task(t) => t == id,
-                // The `done` header is selectable but is not a task.
-                Row::DoneCollapsed => id == crate::ui::state::DONE_ROW,
-                Row::Section(_) => false,
+                Row::Section(st) => &crate::ui::state::section_row_id(*st) == id,
             });
             assert!(on_screen, "{id:?} was selected but never drawn");
             let _ = buf;
@@ -1191,6 +1182,7 @@ mod tests {
     #[test]
     fn the_selected_row_is_one_solid_reversed_bar() {
         let mut app = fixtures::app(fixtures::POPULATED);
+        app.selected_id = app.first_task();
         let buf = draw(&mut app, 80, 24);
         let y = app
             .rows
@@ -1551,18 +1543,38 @@ mod tests {
     }
 
     #[test]
-    fn the_done_header_toggles_both_ways() {
+    fn every_section_header_toggles_both_ways() {
         let mut app = fixtures::app(fixtures::POPULATED);
-        app.selected_id = Some(crate::ui::state::DONE_ROW.into());
-        let collapsed = footer_hints(&app);
-        assert!(collapsed.iter().any(|(_, l, _)| *l == "expand"), "{collapsed:?}");
+        for state in BoardState::SECTION_ORDER {
+            if app.section_len(state) == 0 {
+                continue;
+            }
+            let id = crate::ui::state::section_row_id(state);
+            app.selected_id = Some(id.clone());
 
-        app.done_expanded = true;
-        let expanded = footer_hints(&app);
-        assert!(expanded.iter().any(|(_, l, _)| *l == "collapse"), "{expanded:?}");
+            app.collapsed.insert(state);
+            let folded = footer_hints(&app);
+            assert!(folded.iter().any(|(_, l, _)| *l == "expand"), "{state}: {folded:?}");
 
-        // The header survives expansion, or there is no way back.
-        assert!(app.visible_task_ids().contains(&crate::ui::state::DONE_ROW.to_string()));
+            app.collapsed.remove(&state);
+            let open = footer_hints(&app);
+            assert!(open.iter().any(|(_, l, _)| *l == "collapse"), "{state}: {open:?}");
+
+            // The header survives either way, or there is no way back.
+            assert!(app.visible_task_ids().contains(&id), "{state} header vanished");
+        }
+    }
+
+    #[test]
+    fn a_folded_section_says_how_many_it_hides() {
+        // Open, a count competes with the elapsed column for the eye. Folded,
+        // it is the only thing left that says what is in there.
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.collapsed.insert(BoardState::Ready);
+        let n = app.section_len(BoardState::Ready);
+        let buf = draw(&mut app, 80, 24);
+        let all: String = (0..24).map(|y| line(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(all.contains(&format!("{n} hidden")), "{all}");
     }
 
     #[test]

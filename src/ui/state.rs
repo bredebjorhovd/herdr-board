@@ -162,27 +162,34 @@ impl SyncStatus {
     }
 }
 
-/// The collapsed `done` header, as a selectable row.
+/// Selection id for a section header.
 ///
-/// It has to be reachable by keyboard or the section cannot be expanded without
-/// a mouse — `enter` is the only thing that opens it, and the cursor could never
-/// land there.
-pub const DONE_ROW: &str = "\u{0}done";
+/// Headers are rows the cursor can land on, because `enter` on one folds it and
+/// there is otherwise no way to reach them without a mouse. The NUL prefix
+/// keeps them from ever colliding with a real task id.
+pub fn section_row_id(state: BoardState) -> String {
+    format!("\u{0}section:{}", state.as_str())
+}
+
+/// The `done` header, kept as a name because it is the one collapsed by
+/// default.
+pub const DONE_ROW: &str = "\u{0}section:done";
 
 /// A row on screen, for rendering and for mouse hit-testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
+    /// A section header — selectable, and folds its section on `enter`.
     Section(BoardState),
     Task(String),
-    /// The collapsed one-line `done` section.
-    DoneCollapsed,
 }
 
 pub struct App {
     pub views: Vec<TaskView>,
     pub selected_id: Option<String>,
     pub screen: Screen,
-    pub done_expanded: bool,
+    /// Sections the operator has folded away. `done` starts folded: it is
+    /// history, and the rest is the queue.
+    pub collapsed: std::collections::HashSet<BoardState>,
     pub sync: SyncStatus,
     /// Footer flash for `o` / `g` / `s` and post-dispatch acknowledgements.
     pub message: Option<(String, Instant)>,
@@ -212,7 +219,7 @@ impl App {
             views,
             selected_id: None,
             screen: Screen::List,
-            done_expanded: false,
+            collapsed: std::collections::HashSet::from([BoardState::Done]),
             sync,
             message: None,
             confirm: None,
@@ -224,7 +231,7 @@ impl App {
             last_height: 0,
             scroll: 0,
         };
-        app.selected_id = app.visible_task_ids().first().cloned();
+        app.selected_id = app.first_task().or_else(|| app.visible_task_ids().first().cloned());
         app
     }
 
@@ -256,23 +263,50 @@ impl App {
     pub fn visible_task_ids(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (state, rows) in self.sections() {
-            if state == BoardState::Done {
-                // The header is a row either way: collapsed it is the only way
-                // to open the section, expanded it is the only way to close it
-                // again.
-                out.push(DONE_ROW.to_string());
-                if !self.done_expanded {
-                    continue;
-                }
+            // The header is a row either way: folded it is the only way to open
+            // the section, unfolded the only way to close it again.
+            out.push(section_row_id(state));
+            if self.is_collapsed(state) {
+                continue;
             }
             out.extend(rows.iter().map(|v| v.id().to_string()));
         }
         out
     }
 
-    /// Is the cursor on the collapsed `done` header?
-    pub fn on_done_header(&self) -> bool {
-        self.selected_id.as_deref() == Some(DONE_ROW)
+    /// The first row that is an actual task, for landing the cursor somewhere
+    /// useful: a header is selectable, but it is not what you came to act on.
+    pub fn first_task(&self) -> Option<String> {
+        self.visible_task_ids()
+            .into_iter()
+            .find(|id| self.views.iter().any(|v| v.id() == id))
+    }
+
+    /// The section header the cursor is on, if any.
+    pub fn on_section_header(&self) -> Option<BoardState> {
+        let id = self.selected_id.as_deref()?;
+        BoardState::SECTION_ORDER
+            .into_iter()
+            .find(|s| section_row_id(*s) == id)
+    }
+
+    pub fn is_collapsed(&self, state: BoardState) -> bool {
+        self.collapsed.contains(&state)
+    }
+
+    pub fn toggle_collapsed(&mut self, state: BoardState) {
+        if !self.collapsed.remove(&state) {
+            self.collapsed.insert(state);
+        }
+    }
+
+    /// How many rows a section holds, for the count on a folded header.
+    pub fn section_len(&self, state: BoardState) -> usize {
+        self.sections()
+            .into_iter()
+            .find(|(s, _)| *s == state)
+            .map(|(_, rows)| rows.len())
+            .unwrap_or(0)
     }
 
     /// The selected task, or `None` — including when the cursor is on the
@@ -310,9 +344,9 @@ impl App {
             .as_deref()
             .is_some_and(|id| ids.iter().any(|i| i == id));
         if !keep {
-            // The selected task left the board; fall back to the first row
-            // rather than to nothing.
-            self.selected_id = ids.first().cloned();
+            // The selected task left the board; fall back to the first task
+            // rather than to nothing — or to a header, which is not actionable.
+            self.selected_id = self.first_task().or_else(|| ids.first().cloned());
         }
     }
 
@@ -520,34 +554,62 @@ mod tests {
         // `enter` on the header is the only way in and the only way out, so it
         // has to stay selectable in both states.
         let mut a = app();
-        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", DONE_ROW]);
-        a.done_expanded = true;
-        assert_eq!(a.visible_task_ids(), vec!["d", "b", "a", DONE_ROW, "c"]);
+        let hdr = |s: BoardState| section_row_id(s);
+        assert_eq!(
+            a.visible_task_ids(),
+            vec![
+                hdr(BoardState::Blocked), "d".into(),
+                hdr(BoardState::Working), "b".into(),
+                hdr(BoardState::Ready), "a".into(),
+                hdr(BoardState::Done),
+            ]
+        );
+        a.collapsed.remove(&BoardState::Done);
+        assert!(a.visible_task_ids().contains(&"c".to_string()));
     }
 
     #[test]
-    fn the_done_header_is_a_row_but_not_a_task() {
+    fn a_section_header_is_a_row_but_not_a_task() {
         let mut a = app();
         a.selected_id = Some(DONE_ROW.into());
-        assert!(a.on_done_header());
+        assert_eq!(a.on_section_header(), Some(BoardState::Done));
         assert!(a.selected().is_none());
     }
 
     #[test]
-    fn selection_starts_on_the_first_visible_row() {
+    fn every_section_folds_not_just_done() {
+        let mut a = app();
+        // `done` starts folded; the rest start open.
+        assert!(a.is_collapsed(BoardState::Done));
+        assert!(!a.is_collapsed(BoardState::Ready));
+
+        a.toggle_collapsed(BoardState::Ready);
+        assert!(a.is_collapsed(BoardState::Ready));
+        assert!(!a.visible_task_ids().contains(&"a".to_string()));
+        // ...but its header stays, or it could never be reopened.
+        assert!(a.visible_task_ids().contains(&section_row_id(BoardState::Ready)));
+
+        a.toggle_collapsed(BoardState::Ready);
+        assert!(a.visible_task_ids().contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn selection_starts_on_the_first_task_not_a_header() {
+        // Headers are selectable, but they are not what you came to act on.
         assert_eq!(app().selected_id.as_deref(), Some("d"));
     }
 
     #[test]
     fn movement_clamps_at_both_ends() {
         let mut a = app();
-        a.select_delta(-1);
-        assert_eq!(a.selected_id.as_deref(), Some("d"));
-        // The last row is the collapsed `done` header, not a task.
+        a.select_delta(-99);
+        assert_eq!(
+            a.selected_id.as_deref(),
+            Some(section_row_id(BoardState::Blocked).as_str())
+        );
+        // The last row is the folded `done` header, not a task.
         a.select_delta(99);
         assert_eq!(a.selected_id.as_deref(), Some(DONE_ROW));
-        a.select_delta(-1);
-        assert_eq!(a.selected_id.as_deref(), Some("a"));
     }
 
     #[test]

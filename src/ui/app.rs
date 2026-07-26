@@ -132,8 +132,11 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
         return Action::None;
     };
     match row {
-        Row::DoneCollapsed => Action::Enter,
-        Row::Section(_) => Action::None,
+        // Clicking a header folds it, same as enter.
+        Row::Section(state) => {
+            app.selected_id = Some(crate::ui::state::section_row_id(state));
+            Action::Enter
+        }
         Row::Task(id) => {
             let double = last_click
                 .map(|(ly, at)| ly == y && at.elapsed() < Duration::from_millis(400))
@@ -196,7 +199,7 @@ impl Board {
         if !self.app.visible_task_ids().iter().any(|i| i == task_id) {
             // It is in the collapsed `done` section; expand rather than
             // silently doing nothing.
-            self.app.done_expanded = true;
+            self.app.collapsed.remove(&BoardState::Done);
         }
         self.app.selected_id = Some(task_id.to_string());
         self.app.screen = Screen::List;
@@ -271,9 +274,9 @@ impl Board {
 
     fn on_enter(&mut self) -> Result<()> {
         // On the collapsed done header, enter expands it in place.
-        if self.app.on_done_header() {
-            // Toggle: the header is the only way in and the only way out.
-            self.app.done_expanded = !self.app.done_expanded;
+        if let Some(state) = self.app.on_section_header() {
+            // The header is the only way in and the only way out.
+            self.app.toggle_collapsed(state);
             return Ok(());
         }
         let Some(v) = self.app.selected().cloned() else {
@@ -379,12 +382,13 @@ impl Board {
         let Some(task) = self.engine.db.get_task(task_id)? else {
             return Ok(());
         };
+        // Deliberately does not sync inline. A full cycle takes seconds of
+        // network, during which the TUI cannot redraw — the operator presses y,
+        // the screen freezes, and nothing says whether it worked. The merge
+        // updates the database itself; the daemon reconciles upstream later.
         match self.engine.merge_pull_request(&task) {
             Ok(what) => {
                 self.app.flash(format!("merged {what}"));
-                // The row only leaves `review` once the source says the PR is
-                // closed, so ask now rather than waiting for the next poll.
-                let _ = self.engine.sync_once(Some(&self.herdr));
                 self.reload()?;
             }
             Err(e) => self.app.flash(format!("merge failed: {e}")),
@@ -741,18 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_section_header_does_nothing() {
-        let mut app = laid_out();
-        let y = app
-            .rows
-            .iter()
-            .find_map(|(y, r)| matches!(r, Row::Section(_)).then_some(*y))
-            .unwrap();
-        let mut last = None;
-        assert_eq!(mouse_action(&mut app, click(5, y), &mut last), Action::None);
-    }
-
-    #[test]
     fn clicking_a_footer_hint_fires_that_hint() {
         // Keyboard and mouse must produce identical behavior for every action.
         let mut app = laid_out();
@@ -763,14 +755,19 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_collapsed_done_header_expands_it() {
+    fn clicking_a_section_header_folds_it() {
         let mut app = laid_out();
-        let y = app
+        let (y, state) = app
             .rows
             .iter()
-            .find_map(|(y, r)| (*r == Row::DoneCollapsed).then_some(*y))
-            .expect("the fixture has a collapsed done section");
+            .find_map(|(y, r)| match r {
+                Row::Section(s) => Some((*y, *s)),
+                _ => None,
+            })
+            .expect("the fixture has sections");
         let mut last = None;
         assert_eq!(mouse_action(&mut app, click(5, y), &mut last), Action::Enter);
+        // The click moves the cursor onto the header, so enter acts on it.
+        assert_eq!(app.on_section_header(), Some(state));
     }
 }

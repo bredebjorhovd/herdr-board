@@ -818,6 +818,23 @@ impl SyncEngine {
                             }
                         }
                     }
+                    // Merging its pull request finished the work; the ticket is
+                    // what is left.
+                    "close" => {
+                        let team = task.identifier.split('-').next().unwrap_or_default();
+                        match linear.completed_state_id(team) {
+                            Ok(Some(state_id)) => {
+                                linear.set_state(&task.source_id, &state_id)?;
+                                linear.comment(
+                                    &task.source_id,
+                                    "herdr-board: pull request merged",
+                                )?;
+                            }
+                            _ => self.log.warn(format!(
+                                "no completed-type state for team {team}; leaving it open"
+                            )),
+                        }
+                    }
                     other => self.log.warn(format!("unknown writeback kind {other}")),
                 }
             }
@@ -903,6 +920,21 @@ impl SyncEngine {
         gh.merge_pr(&repo, number)?;
         self.log
             .info(format!("merged {repo}#{number} for {}", task.identifier));
+
+        // Reflect it immediately rather than waiting for a poll: the operator
+        // just pressed the key and needs the row to move.
+        self.db.set_pr(&task.id, task.pr_url.as_deref(), Some(number), false)?;
+        // A merged pull request is finished work. For a PR row that is the
+        // whole task; for an issue whose PR this was, the work is done and the
+        // ticket is what remains.
+        self.db.set_local_done(&task.id, true)?;
+        self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "close".into(),
+            payload: json!({ "reason": "merged" }).to_string(),
+            idem_key: format!("{}:close", task.id),
+        })?;
+        self.rederive_all()?;
         Ok(format!("{repo}#{number}"))
     }
 
@@ -1474,6 +1506,45 @@ mod tests {
     fn gh_client() -> Github<Box<dyn Rest>> {
         Github::new(Box::new(crate::sources::github::FixtureRest::new(vec![]))
             as Box<dyn Rest>)
+    }
+
+    #[test]
+    fn merging_moves_the_row_without_waiting_for_a_poll() {
+        // The operator just pressed a key; the row has to move now, not in
+        // thirty seconds.
+        let e = engine_with(None, Some(gh_client()));
+        seed_gh(&e);
+        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
+            .unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("gh:o/r#87").unwrap().unwrap().state,
+            BoardState::Review
+        );
+
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        e.merge_pull_request(&task).unwrap();
+
+        let after = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert!(!after.pr_open, "the PR is no longer open");
+        assert_eq!(after.state, BoardState::Done);
+    }
+
+    #[test]
+    fn merging_queues_the_ticket_to_be_closed() {
+        let e = engine_with(None, Some(gh_client()));
+        seed_gh(&e);
+        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
+            .unwrap();
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        e.merge_pull_request(&task).unwrap();
+        assert!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "close"),
+            "merging finished the work; the ticket is what is left"
+        );
     }
 
     #[test]

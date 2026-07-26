@@ -249,6 +249,10 @@ impl<T: GraphQl> Linear<T> {
     /// The team's first `started`-type workflow state, which is where a
     /// dispatched issue moves. Resolved by **type**, never by name.
     pub fn started_state_id(&self, team_key: &str) -> Result<Option<String>> {
+        self.state_id_of_type(team_key, "started")
+    }
+
+    fn state_id_of_type(&self, team_key: &str, want: &str) -> Result<Option<String>> {
         let data = self.transport.query(&json!({
             "query": r#"query Started($key: String!) {
                 teams(filter: { key: { eq: $key } }, first: 1) {
@@ -272,7 +276,7 @@ impl<T: GraphQl> Linear<T> {
             .unwrap_or_default();
         let mut started: Vec<&Value> = states
             .iter()
-            .filter(|s| s.get("type").and_then(Value::as_str) == Some("started"))
+            .filter(|s| s.get("type").and_then(Value::as_str) == Some(want))
             .collect();
         started.sort_by(|a, b| {
             let pa = a.get("position").and_then(Value::as_f64).unwrap_or(0.0);
@@ -309,6 +313,12 @@ impl<T: GraphQl> Linear<T> {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The team's first `completed`-type state, for closing a finished issue.
+    /// Resolved by type, never by name — teams rename these freely.
+    pub fn completed_state_id(&self, team_key: &str) -> Result<Option<String>> {
+        self.state_id_of_type(team_key, "completed")
     }
 
     pub fn set_state(&self, issue_id: &str, state_id: &str) -> Result<()> {

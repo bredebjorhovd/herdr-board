@@ -156,6 +156,9 @@ pub struct Board {
     pub paths: Paths,
     /// Last seen mtime of routing.toml.
     routing_mtime: Option<std::time::SystemTime>,
+    /// When the board last tried to revive the daemon, so a daemon that will
+    /// not start is not retried every tick.
+    last_revive: Option<Instant>,
 }
 
 impl Board {
@@ -166,6 +169,32 @@ impl Board {
             crate::cli::reload_if_configuration_changed(&self.paths, &self.engine, &self.log)
         {
             self.engine = engine;
+        }
+    }
+
+    /// Restart the daemon if it has died.
+    ///
+    /// The startup hook is one-shot: herdr runs it once and does not supervise
+    /// it, so a daemon that dies mid-session stays dead. The board could see
+    /// that and say so — `syncd not running` — which is worse than useless,
+    /// because it knows exactly how to fix it.
+    fn revive_daemon(&mut self) {
+        if !self.app.sync.syncd_dead() || crate::cli::running_pid(&self.paths).is_some() {
+            return;
+        }
+        // Not every tick: a daemon that refuses to start would be respawned
+        // forever.
+        if self
+            .last_revive
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.last_revive = Some(Instant::now());
+        self.log.warn("syncd is not running; restarting it");
+        match crate::cli::syncd_ensure(&self.paths, self.log.clone()) {
+            Ok(()) => self.app.flash("✓ restarted syncd"),
+            Err(e) => self.app.flash(format!("✕ could not restart syncd: {e}")),
         }
     }
 
@@ -217,6 +246,7 @@ impl Board {
         let sync = read_sync_status(&self.engine)?;
         self.app.refresh(views, sync);
         self.app.setup_hints = setup_hints(&self.engine.cfg, &self.paths);
+        self.revive_daemon();
         Ok(())
     }
 
@@ -630,6 +660,7 @@ pub fn open_board(paths: Paths, log: Arc<Logger>) -> Result<Board> {
         log,
         paths,
         routing_mtime: None,
+        last_revive: None,
     })
 }
 

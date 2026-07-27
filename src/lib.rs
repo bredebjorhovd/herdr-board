@@ -11,5 +11,6 @@ pub mod integration;
 pub mod log;
 pub mod model;
 pub mod sources;
+pub mod stats;
 pub mod sync;
 pub mod ui;

@@ -383,6 +383,7 @@ Two different things are called labels, which is easy to trip on:
 | `sync --once` | one sync cycle |
 | `list [--state S] [--source S] [--json]` | read the board (for agents) |
 | `wait [--task ID] [--state S] [--timeout N]` | block until watched work settles |
+| `stats [--since-days N] [--json]` | throughput, completion rate, retries |
 | `dispatch --task <id>` | dispatch without the picker |
 | `cancel --task <id>` | end the live attempt, keep the issue open |
 | `gc [--older-than 14d] [--dry-run]` | remove the worktrees of finished attempts |
@@ -446,8 +447,9 @@ gone by then, and one keystroke turning into a second agent talking unprompted
 is action at a distance.
 
 So the operator is the one who has to notice, and the board tells them: a herdr
-notification when released work settles, on an attempt ending rather than on
-every state change. `[defaults] notify = false` turns it off. An orchestrator
+notification when released work settles — and when an agent becomes `blocked`,
+which is the more urgent of the two, because a blocked agent is burning
+wall-clock right now. On those transitions only, never on every state change. `[defaults] notify = false` turns it off. An orchestrator
 picking work back up reads `last_outcome` and `last_outcome_at` to see what
 happened while it was away.
 
@@ -697,6 +699,23 @@ sync cycles against recorded Linear responses in `tests/fixtures/`, and
 `tests/gc_worktree.rs` runs `gc` against a real repository — the checkout goes,
 the branch survives, a checkout with uncommitted work is refused, and both
 removal paths are exercised by faking what herdr reports.
+
+### Knowing whether any of this is working
+
+```
+$ herdr-board stats
+all time
+  11 dispatches across 10 task(s), 0 still running
+  finished: 1 cancelled, 10 done
+  91% of finished attempts ended in done
+  17 min median, 43 min longest
+  1 task(s) needed more than one go
+```
+
+Every attempt already records when it started and ended, how it ended, which
+runtime ran it, and whether an agent or the operator released it. Duration is a
+median, not a mean — one agent left running overnight would drag a mean
+anywhere. It reports what happened; it does not grade it.
 
 ### Tasks that vanish upstream
 

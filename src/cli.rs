@@ -184,7 +184,30 @@ pub fn syncd(paths: &Paths, log: Arc<Logger>) -> Result<()> {
         interval.as_secs()
     ));
 
+    let mut last_gc = std::time::Instant::now();
     loop {
+        // gc exists but nothing calls it, so checkouts accumulate one per
+        // attempt forever. Daily is often enough for a 14-day cutoff, and the
+        // cutoff is what actually protects retryable work.
+        if last_gc.elapsed() >= Duration::from_secs(24 * 60 * 60) {
+            last_gc = std::time::Instant::now();
+            let herdr_for_gc = Herdr::discover(log.clone());
+            match crate::gc::run(
+                paths,
+                &engine.cfg,
+                &herdr_for_gc,
+                log.clone(),
+                crate::gc::DEFAULT_OLDER_THAN,
+                false,
+            ) {
+                Ok(r) if !r.collected.is_empty() => {
+                    log.info(format!("gc collected {} checkout(s)", r.collected.len()))
+                }
+                Ok(_) => {}
+                Err(e) => log.warn(format!("gc failed: {e}")),
+            }
+        }
+
         // Credentials and routes are read at startup, but the daemon outlives
         // the setup: adding a key or a repo should take effect on the next
         // cycle rather than requiring a restart nobody would think to do.

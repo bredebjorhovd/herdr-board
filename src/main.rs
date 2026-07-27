@@ -1,7 +1,7 @@
 //! herdr-board — a task board fed by Linear and GitHub, dispatching into herdr
 //! panes and reconciling pane state back to the board.
 
-use herdr_board::{cli, config, dispatch, gc, herdr, integration, log, ui};
+use herdr_board::{cli, config, dispatch, gc, herdr, integration, log, stats, ui};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -98,6 +98,14 @@ enum Command {
         /// Give up after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What the board knows about its own throughput.
+    Stats {
+        /// Only the last N days. Omit for everything.
+        #[arg(long)]
+        since_days: Option<i64>,
         #[arg(long)]
         json: bool,
     },
@@ -265,6 +273,16 @@ fn main() -> Result<()> {
                 timeout.map(std::time::Duration::from_secs),
             )?;
             cli::print_tasks(&rows, json)
+        }
+        Command::Stats { since_days, json } => {
+            let log = Arc::new(Logger::new(paths.logfile(), false));
+            let s = stats::run(&paths, log, since_days)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                stats::print(&s);
+            }
+            Ok(())
         }
         Command::Cancel { task } => {
             let log = Arc::new(Logger::new(paths.logfile(), true));

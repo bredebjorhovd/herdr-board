@@ -563,6 +563,15 @@ impl SyncEngine {
                         self.db.set_missing_ticks(attempt.id, 0)?;
                     }
                     let status = pane.agent_status.unwrap_or(AgentStatus::Unknown);
+                    // An agent that has just started waiting on you is more
+                    // urgent than one that has finished: it is burning
+                    // wall-clock right now, and nothing else on screen says so
+                    // unless you happen to be looking at the board.
+                    if status == AgentStatus::Blocked
+                        && attempt.agent_status != Some(AgentStatus::Blocked)
+                    {
+                        self.notify_settled(herdr, &task, "needs you");
+                    }
                     if status == AgentStatus::Unknown {
                         // Worth a line: `unknown` is not proof of completion,
                         // and the agent name says what herdr actually saw.

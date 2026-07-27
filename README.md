@@ -292,6 +292,20 @@ prefix always reaches herdr.
 and you have not looked yet — is this board's `review`. Same word, different
 scope; the difference is deliberate.
 
+The glyph is the carrier, not the colour. `blocked` and `failed` share red on
+purpose — both mean "needs you" — so `▲` and `✕` are what tell them apart. Set
+[`NO_COLOR`](https://no-color.org) to see the board the way a colourblind
+reader, a screen reader or a piped log does:
+
+```bash
+NO_COLOR=1 herdr-board demo populated
+```
+
+That strips hue only. `DIM`, `BOLD` and `REVERSED` stay, because emphasis is not
+colour and the whole point is to check what survives without hue: selection is
+reverse video, section headers are bold, `done` is dim. Verified cell by cell —
+793 cells, every hue gone, not one cell's emphasis or glyph changed.
+
 State is **derived** on every read from upstream state plus the live attempt, so
 it cannot drift. Cancelling ends the attempt, not the issue: the row returns to
 `ready` with its attempt history intact. A row whose issue was *deleted* upstream

@@ -454,6 +454,18 @@ It assigns to whoever owns the API key, because the board's filter is "assigned
 to me or carrying a routing label" — an unassigned, unlabelled issue would be
 created into invisibility.
 
+**Which tracker it writes to is a setting, not an inference.** A label routes
+work to a *repo* and says nothing about where that project's tickets live: this
+board's own backlog is in Linear while its code is on GitHub, and a repo whose
+issues you already keep on GitHub is the reverse. So `[defaults] new_source`
+sets the habit and `--source` overrides it per ticket:
+
+```bash
+herdr-board new "Retry Altinn on 502" --source github --repo owner/repo --label bug
+```
+
+Reading is symmetric — both sources feed the board. Only authoring has to pick.
+
 **Nothing can wake a conversational orchestrator.** It only gets a turn when
 something prompts it, which is a property of the runtime rather than of the
 board — and pushing a prompt into its pane was considered and rejected (AGE-3):

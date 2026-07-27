@@ -269,6 +269,17 @@ pub struct Defaults {
     /// Off means noticing is entirely on you.
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Which tracker `herdr-board new` writes to: `linear` or `github`.
+    ///
+    /// Not inferable from a label — a label routes work to a repo and says
+    /// nothing about where that project's tickets live. Set the habit here and
+    /// override per ticket with `--source`.
+    #[serde(default = "default_new_source")]
+    pub new_source: String,
+}
+
+fn default_new_source() -> String {
+    "linear".into()
 }
 
 fn default_max_concurrent() -> usize {
@@ -291,6 +302,7 @@ impl Default for Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
             branch_template: default_branch_template(),
             notify: true,
+            new_source: default_new_source(),
             split_direction: None,
             max_panes_per_tab: default_max_panes_per_tab(),
         }

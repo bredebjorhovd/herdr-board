@@ -230,6 +230,30 @@ impl<T: Rest> Github<T> {
         Ok(())
     }
 
+    /// Open an issue.
+    pub fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: Option<&str>,
+        labels: &[String],
+    ) -> Result<(i64, String)> {
+        let r = self.rest.post(
+            &format!("/repos/{repo}/issues"),
+            &serde_json::json!({ "title": title, "body": body, "labels": labels }),
+        )?;
+        let number = r
+            .get("number")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("github issueCreate returned no number"))?;
+        let url = r
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok((number, url))
+    }
+
     /// Whether a pull request can merge as it stands.
     ///
     /// The list endpoint does not carry this, so it is one call per open PR —

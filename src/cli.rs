@@ -636,19 +636,74 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
 /// review, closure. Work that does not is a wall of commits somebody has to
 /// reconstruct later. The difference in practice is almost entirely friction,
 /// so this exists to remove it.
+/// Where a new ticket should be written.
+///
+/// There is no inferring this. A label maps to a *route* — which repo the work
+/// happens in — and says nothing about which tracker the project's tickets live
+/// in. herdr-board's own backlog is in Linear while its code is on GitHub, and
+/// Tally is the other way round, so the same label would justify either answer.
+/// `[defaults] new_source` sets the habit; `--source` overrides it.
+#[derive(Debug, Default)]
+pub struct NewTask<'a> {
+    pub title: &'a str,
+    pub body: Option<&'a str>,
+    /// Linear team key. Only needed with more than one team.
+    pub team: Option<&'a str>,
+    pub labels: &'a [String],
+    /// `linear` or `github`; falls back to `[defaults] new_source`.
+    pub source: Option<&'a str>,
+    /// `owner/repo`, for GitHub with several repos configured.
+    pub repo: Option<&'a str>,
+}
+
 pub fn new_task(
     paths: &Paths,
     log: Arc<Logger>,
-    title: &str,
-    body: Option<&str>,
-    team: Option<&str>,
-    labels: &[String],
+    spec: &NewTask<'_>,
 ) -> Result<(String, String)> {
-    let engine = engine_from_paths(paths, log)?;
+    let NewTask {
+        title,
+        body,
+        team,
+        labels,
+        source,
+        repo,
+    } = *spec;
+    let engine = engine_from_paths(paths, log.clone())?;
+    let source = source
+        .map(str::to_string)
+        .unwrap_or_else(|| engine.cfg.defaults.new_source.clone());
+
+    if source == "github" {
+        let repo = repo
+            .map(str::to_string)
+            .or_else(|| {
+                // One configured repo is not a choice; several are.
+                (engine.cfg.github.repos.len() == 1)
+                    .then(|| engine.cfg.github.repos[0].clone())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "name the repo with --repo; configured: {}",
+                    engine.cfg.github.repos.join(", ")
+                )
+            })?;
+        let gh = engine
+            .github
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no GitHub client; see `herdr-board doctor`"))?;
+        let (number, url) = gh.create_issue(&repo, title, body, labels)?;
+        return Ok((format!("{repo}#{number}"), url));
+    }
+    if source != "linear" {
+        bail!("unknown source `{source}`; expected linear or github");
+    }
+
     let linear = engine
         .linear
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no LINEAR_API_KEY; see `herdr-board doctor`"))?;
+
 
     let teams = linear.team_ids()?;
     let team_id = match team {

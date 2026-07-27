@@ -113,6 +113,13 @@ enum Command {
         /// Labels to apply — this is what routes it.
         #[arg(long)]
         label: Vec<String>,
+        /// Which tracker to write to: linear or github. Defaults to
+        /// `[defaults] new_source`.
+        #[arg(long)]
+        source: Option<String>,
+        /// `owner/repo` when writing to GitHub and more than one is configured.
+        #[arg(long)]
+        repo: Option<String>,
         /// Dispatch it as soon as it exists.
         #[arg(long)]
         dispatch: bool,
@@ -295,6 +302,8 @@ fn main() -> Result<()> {
             body,
             team,
             label,
+            source,
+            repo,
             dispatch: and_dispatch,
         } => {
             let log = Arc::new(Logger::new(paths.logfile(), true));
@@ -306,15 +315,30 @@ fn main() -> Result<()> {
                 }
                 other => other.map(str::to_string),
             };
-            let (identifier, url) =
-                cli::new_task(&paths, log.clone(), &title, body.as_deref(), team.as_deref(), &label)?;
+            let (identifier, url) = cli::new_task(
+                &paths,
+                log.clone(),
+                &cli::NewTask {
+                    title: &title,
+                    body: body.as_deref(),
+                    team: team.as_deref(),
+                    labels: &label,
+                    source: source.as_deref(),
+                    repo: repo.as_deref(),
+                },
+            )?;
             println!("{identifier}  {url}");
 
             if and_dispatch {
                 // It has to be on the board before it can be dispatched.
                 cli::sync_once(&paths, log.clone())?;
                 let engine = cli::engine_from_paths(&paths, log.clone())?;
-                let id = format!("linear:{identifier}");
+                // `AGE-14` is Linear; `owner/repo#87` is GitHub.
+                let id = if identifier.contains('/') {
+                    format!("gh:{identifier}")
+                } else {
+                    format!("linear:{identifier}")
+                };
                 let t = engine
                     .db
                     .get_task(&id)?

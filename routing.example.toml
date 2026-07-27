@@ -46,6 +46,11 @@ branch_template = "board/{identifier_lower}"
 # orchestrator cannot be woken, so somebody has to notice — this is how you do,
 # without watching the board.
 # notify = true
+# Which tracker `herdr-board new` writes to: "linear" or "github". This is not
+# inferable — a label routes work to a repo and says nothing about where that
+# project's tickets live. herdr-board's own backlog is in Linear while its code
+# is on GitHub; a repo whose issues you already keep on GitHub is the reverse.
+# new_source = "linear"
 
 # GitHub is entirely optional. With no repos listed it is never polled, the
 # header omits it, and GITHUB_TOKEN is not needed at all.

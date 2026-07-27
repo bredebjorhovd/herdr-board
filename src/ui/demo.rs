@@ -104,6 +104,8 @@ fn apply(app: &mut App, action: Action) -> bool {
         Action::Quit => return true,
         Action::Move(d) => app.select_delta(d),
         Action::Help => app.screen = Screen::Help,
+        // Fixtures have no attempt history, so the screen shows its empty state.
+        Action::Stats => app.screen = Screen::Stats,
         Action::Back => app.screen = Screen::List,
         Action::Detail => {
             if app.selected().is_some() {

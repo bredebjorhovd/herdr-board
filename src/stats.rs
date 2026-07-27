@@ -17,7 +17,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     /// The window these numbers cover, in days. `None` means everything.
     pub since_days: Option<i64>,

@@ -573,7 +573,7 @@ fn render_task_row(buf: &mut Buffer, area: Rect, y: u16, v: &TaskView, selected:
 /// Keys relevant to *the current selection*, not the full map.
 pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     match app.screen {
-        Screen::Help => vec![("esc", "back to the board", '\u{1b}')],
+        Screen::Help | Screen::Stats => vec![("esc", "back to the board", '\u{1b}')],
         Screen::Detail => {
             let mut v = vec![
                 ("h", "back", 'h'),
@@ -994,6 +994,7 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("g", "focus the bound herdr pane"),
             ("o", "open the source in a browser"),
             ("s", "force a sync now"),
+            ("t", "throughput — is any of this working"),
             ("?", "this help"),
         ],
     ),
@@ -1109,7 +1110,123 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) {
         Screen::Detail => render_detail(buf, area, app),
         Screen::Prompt => render_prompt(buf, area, app),
         Screen::Help => render_help(buf, area, app),
+        Screen::Stats => render_stats(buf, area, app),
     }
+}
+
+/// Throughput, in the same plain language as everything else. No charts: the
+/// design forbids them, and six numbers do not need one.
+pub fn render_stats(buf: &mut Buffer, area: Rect, app: &mut App) {
+    app.footer_hits.clear();
+    let last = area.height.saturating_sub(1);
+    let mut x = 1;
+    x += put(buf, area, x, 0, "board ", theme::dim());
+    put(buf, area, x, 0, "▸ stats", theme::fg_default());
+
+    let Some(s) = app.stats.clone() else {
+        put(buf, area, 1, 3, "no dispatches yet", theme::dim());
+        rule(buf, area, 1, area.width.saturating_sub(2), 1, theme::dim());
+        rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
+        render_footer(buf, area, last, app);
+        return;
+    };
+    let window = match s.since_days {
+        Some(d) => format!("last {d} days"),
+        None => "all time".to_string(),
+    };
+    put_right(buf, area, area.width.saturating_sub(2), 0, &window, theme::dim());
+    rule(buf, area, 1, area.width.saturating_sub(2), 1, theme::dim());
+
+    if s.attempts == 0 {
+        put(buf, area, 1, 3, "no dispatches yet", theme::dim());
+        rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
+        render_footer(buf, area, last, app);
+        return;
+    }
+
+    put(
+        buf,
+        area,
+        1,
+        3,
+        &format!(
+            "{} dispatches across {} task{}",
+            s.attempts,
+            s.tasks_touched,
+            if s.tasks_touched == 1 { "" } else { "s" }
+        ),
+        theme::fg_default(),
+    );
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if s.live > 0 {
+        rows.push(("running".into(), format!("{}", s.live)));
+    }
+    let outcomes: Vec<String> = s.outcomes.iter().map(|(k, v)| format!("{v} {k}")).collect();
+    if !outcomes.is_empty() {
+        rows.push(("finished".into(), outcomes.join(" · ")));
+    }
+    if let Some(rate) = s.completion_rate {
+        rows.push(("completed".into(), format!("{:.0}%", rate * 100.0)));
+    }
+    if let (Some(med), Some(max)) = (s.median_minutes, s.longest_minutes) {
+        rows.push((
+            "duration".into(),
+            format!("{med}m median · {max}m longest"),
+        ));
+    }
+    if s.retried_tasks > 0 {
+        rows.push((
+            "retried".into(),
+            format!(
+                "{} task{} needed more than one go",
+                s.retried_tasks,
+                if s.retried_tasks == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    // The number that says whether the herd is releasing its own work.
+    rows.push((
+        "released".into(),
+        if s.agent_dispatched > 0 {
+            format!("{} by an agent, the rest by you", s.agent_dispatched)
+        } else {
+            "all by you".to_string()
+        },
+    ));
+
+    let tally = |m: &std::collections::BTreeMap<String, usize>| {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        v.iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    if !s.by_workspace.is_empty() {
+        rows.push(("workspace".into(), tally(&s.by_workspace)));
+    }
+    if !s.by_runtime.is_empty() {
+        rows.push(("runtime".into(), tally(&s.by_runtime)));
+    }
+
+    for (y, (label, value)) in (5..).zip(rows) {
+        if y >= last - 1 {
+            break;
+        }
+        put(buf, area, 1, y, &label, theme::dim());
+        put(
+            buf,
+            area,
+            15,
+            y,
+            &truncate(&value, area.width.saturating_sub(16) as usize),
+            theme::fg_default(),
+        );
+    }
+
+    rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
+    render_footer(buf, area, last, app);
 }
 
 #[cfg(test)]
@@ -1889,6 +2006,48 @@ mod tests {
             .map(|v| v.id().to_string());
         let buf = draw(&mut app, 80, 24);
         assert!(line(&buf, 3).contains("cannot be dispatched"));
+    }
+
+    #[test]
+    fn the_stats_screen_reports_what_happened() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.screen = Screen::Stats;
+        app.stats = Some(crate::stats::Stats {
+            since_days: None,
+            attempts: 11,
+            tasks_touched: 10,
+            outcomes: [("done".to_string(), 10), ("cancelled".to_string(), 1)]
+                .into_iter()
+                .collect(),
+            live: 0,
+            median_minutes: Some(17),
+            longest_minutes: Some(43),
+            completion_rate: Some(10.0 / 11.0),
+            retried_tasks: 1,
+            agent_dispatched: 2,
+            by_workspace: [("herdr-board".to_string(), 6)].into_iter().collect(),
+            by_runtime: [("claude-code".to_string(), 9)].into_iter().collect(),
+        });
+        let buf = draw(&mut app, 80, 24);
+        let all: String = (0..24).map(|y| line(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("board ▸ stats"), "{all}");
+        assert!(all.contains("11 dispatches across 10 tasks"), "{all}");
+        assert!(all.contains("17m median"), "{all}");
+        assert!(all.contains("91%"), "{all}");
+        // The number that says whether the herd releases its own work.
+        assert!(all.contains("2 by an agent"), "{all}");
+        // No charts: the design forbids them.
+        assert!(!all.contains('█') && !all.contains('▇'), "{all}");
+    }
+
+    #[test]
+    fn the_stats_screen_says_so_when_nothing_has_run() {
+        let mut app = fixtures::app(fixtures::EMPTY);
+        app.screen = Screen::Stats;
+        app.stats = None;
+        let buf = draw(&mut app, 80, 24);
+        let all: String = (0..24).map(|y| line(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("no dispatches yet"), "{all}");
     }
 
     #[test]

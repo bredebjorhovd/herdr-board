@@ -14,6 +14,8 @@ pub enum Screen {
     Detail,
     Prompt,
     Help,
+    /// Throughput: whether the delegating is actually working.
+    Stats,
 }
 
 /// One task, plus everything the renderer needs that is not on the row.
@@ -219,6 +221,9 @@ pub struct App {
     pub setup_hints: Vec<String>,
     /// Height of the last render, so a click can tell the footer row apart.
     pub last_height: u16,
+    /// Recomputed when the stats screen is opened, not every tick — it reads
+    /// every attempt and nothing on it changes second to second.
+    pub stats: Option<crate::stats::Stats>,
     /// First body line on screen. Rows below the fold are otherwise
     /// unreachable, which on a short pane is most of the board.
     pub scroll: usize,
@@ -242,6 +247,7 @@ impl App {
             config_path,
             setup_hints: Vec::new(),
             last_height: 0,
+            stats: None,
             scroll: 0,
         };
         app.selected_id = app.first_task().or_else(|| app.visible_task_ids().first().cloned());

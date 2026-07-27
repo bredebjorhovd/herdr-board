@@ -268,6 +268,7 @@ waiting: telling you to go poke a finished agent would be worse than silence.
 | `m` | review with a PR | merge the pull request — confirms first |
 | `x` | working, blocked | cancel — confirms, then kills the pane |
 | `s` | anywhere | sync now |
+| `t` | anywhere | throughput — is any of this working |
 | `?` | anywhere | help |
 
 Mouse works everywhere: click selects, double-click is `enter`, and every footer
@@ -701,6 +702,8 @@ the branch survives, a checkout with uncommitted work is refused, and both
 removal paths are exercised by faking what herdr reports.
 
 ### Knowing whether any of this is working
+
+Press `t` on the board for the same thing, or from a shell:
 
 ```
 $ herdr-board stats

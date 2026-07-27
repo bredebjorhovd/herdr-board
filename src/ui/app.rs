@@ -48,6 +48,8 @@ pub enum Action {
     /// Merge the pull request on a `review` row.
     Merge,
     Sync,
+    /// Throughput.
+    Stats,
     Help,
     ConfirmYes,
     ConfirmNo,
@@ -92,6 +94,7 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('x') => Action::Cancel,
         KeyCode::Char('m') => Action::Merge,
         KeyCode::Char('s') => Action::Sync,
+        KeyCode::Char('t') => Action::Stats,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
         _ => Action::None,
@@ -179,7 +182,10 @@ impl Board {
     /// that and say so — `syncd not running` — which is worse than useless,
     /// because it knows exactly how to fix it.
     fn revive_daemon(&mut self) {
-        if !self.app.sync.syncd_dead() || crate::cli::running_pid(&self.paths).is_some() {
+        // A missing pid is definitive; waiting for the header to go stale as
+        // well would leave the board idle for another minute and a half over a
+        // question it can already answer.
+        if crate::cli::running_pid(&self.paths).is_some() {
             return;
         }
         // Not every tick: a daemon that refuses to start would be respawned
@@ -256,6 +262,12 @@ impl Board {
             Action::Quit => self.app.should_quit = true,
             Action::Move(d) => self.app.select_delta(d),
             Action::Help => self.app.screen = Screen::Help,
+            Action::Stats => {
+                // Reads every attempt, and nothing on it moves second to
+                // second, so it is computed on opening rather than on the tick.
+                self.app.stats = crate::stats::run(&self.paths, self.log.clone(), None).ok();
+                self.app.screen = Screen::Stats;
+            }
             Action::Back => {
                 self.app.screen = Screen::List;
             }

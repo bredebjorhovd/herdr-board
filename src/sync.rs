@@ -101,7 +101,7 @@ impl SyncEngine {
             None => None,
         };
         if let Some(panes) = &panes {
-            self.reconcile(panes)?;
+            self.reconcile_with(panes, herdr)?;
         }
 
         self.rederive_all()?;
@@ -500,7 +500,29 @@ impl SyncEngine {
     }
 
     /// Map live attempts onto herdr's current pane reality (impl spec §6).
+    /// Tell the operator that released work has settled.
+    ///
+    /// Only when an attempt *ends* — not on every state change — because a
+    /// notification that fires constantly is one nobody reads. The operator is
+    /// the only actor that can usefully be interrupted: a conversational
+    /// orchestrator cannot be woken, so somebody has to notice, and it should
+    /// not have to be by watching the board.
+    fn notify_settled(&self, herdr: Option<&Herdr>, task: &Task, what: &str) {
+        if !self.cfg.defaults.notify {
+            return;
+        }
+        let Some(h) = herdr else { return };
+        h.notify(
+            &format!("{} {what}", task.identifier),
+            &truncate_for_toast(&task.title),
+        );
+    }
+
     pub fn reconcile(&self, panes: &[PaneInfo]) -> Result<()> {
+        self.reconcile_with(panes, None)
+    }
+
+    pub fn reconcile_with(&self, panes: &[PaneInfo], herdr: Option<&Herdr>) -> Result<()> {
         let by_id: HashMap<&str, &PaneInfo> =
             panes.iter().map(|p| (p.pane_id.as_str(), p)).collect();
 
@@ -524,6 +546,7 @@ impl SyncEngine {
                             "{} pane {} gone for {} ticks — orphaned",
                             task.identifier, pane_id, ticks
                         ));
+                        self.notify_settled(herdr, &task, "failed — its pane exited");
                         self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
                         self.enqueue_outcome(&task, Outcome::Orphaned, None)?;
                     } else {
@@ -576,6 +599,7 @@ impl SyncEngine {
                                 task.identifier,
                                 status.as_str()
                             ));
+                            self.notify_settled(herdr, &task, "finished");
                             self.db.close_attempt(attempt.id, Outcome::Done)?;
                             self.enqueue_outcome(
                                 &task,
@@ -1068,6 +1092,11 @@ pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus
     }
 }
 
+/// herdr caps notification text at 80 characters.
+fn truncate_for_toast(s: &str) -> String {
+    crate::ui::render::truncate(s, 78)
+}
+
 /// `gh:owner/repo#87` → (`owner/repo`, 87). Also accepts the pull-request form
 /// `gh:owner/repo!508` — GitHub's issues endpoints serve pull requests too, so
 /// comments and closing work the same for both.
@@ -1256,6 +1285,18 @@ mod tests {
                 .outcome
                 .is_none()
         );
+    }
+
+    #[test]
+    fn notifications_are_opt_out_and_only_fire_when_work_ends() {
+        // A toast on every state change is one nobody reads.
+        let mut e = engine(None);
+        assert!(e.cfg.defaults.notify, "on by default: somebody has to notice");
+        e.cfg.defaults.notify = false;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let t = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        // With no herdr and notify off, this is a no-op rather than a panic.
+        e.notify_settled(None, &t, "finished");
     }
 
     #[test]

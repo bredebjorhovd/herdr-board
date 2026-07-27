@@ -438,6 +438,19 @@ as soon as any of it reaches `review`, `failed` or `done`. It reconciles as it
 goes rather than trusting the daemon's cycle, so it answers as soon as the
 answer is true.
 
+**Nothing can wake a conversational orchestrator.** It only gets a turn when
+something prompts it, which is a property of the runtime rather than of the
+board — and pushing a prompt into its pane was considered and rejected (AGE-3):
+delivery into a running agent is unreliable by construction, the pane is often
+gone by then, and one keystroke turning into a second agent talking unprompted
+is action at a distance.
+
+So the operator is the one who has to notice, and the board tells them: a herdr
+notification when released work settles, on an attempt ending rather than on
+every state change. `[defaults] notify = false` turns it off. An orchestrator
+picking work back up reads `last_outcome` and `last_outcome_at` to see what
+happened while it was away.
+
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,
 `pr_number`, `branch`, `dispatched_by`, `last_outcome`, `last_outcome_at`,

@@ -683,6 +683,12 @@ impl Herdr {
         Ok(())
     }
 
+    /// Raise a herdr notification. Best-effort: a missed toast must never
+    /// break a sync cycle.
+    pub fn notify(&self, title: &str, body: &str) {
+        let _ = self.run_quiet(&["notification", "show", title, "--body", body, "--sound", "done"]);
+    }
+
     /// Focus the pane bound to an attempt (`g` on the board). Falls back to the
     /// tab when the pane no longer hosts a recognized agent.
     pub fn focus_pane(&self, pane_id: &str) -> Result<()> {

@@ -42,6 +42,10 @@ branch_template = "board/{identifier_lower}"
 # high and the column is unreadable slivers; too low and agents land in tabs,
 # which are easy to miss. The default of 3 is your own pane plus two agents.
 # max_panes_per_tab = 3
+# Raise a herdr notification when released work settles. A conversational
+# orchestrator cannot be woken, so somebody has to notice — this is how you do,
+# without watching the board.
+# notify = true
 
 # GitHub is entirely optional. With no repos listed it is never polled, the
 # header omits it, and GITHUB_TOKEN is not needed at all.

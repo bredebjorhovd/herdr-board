@@ -262,6 +262,13 @@ pub struct Defaults {
     /// compromise: your own pane plus two agents beside the board.
     #[serde(default = "default_max_panes_per_tab")]
     pub max_panes_per_tab: usize,
+    /// Raise a herdr notification when released work settles.
+    ///
+    /// A conversational orchestrator cannot be woken — it only gets a turn when
+    /// something prompts it — so the operator is the one who has to notice.
+    /// Off means noticing is entirely on you.
+    #[serde(default = "default_true")]
+    pub notify: bool,
 }
 
 fn default_max_concurrent() -> usize {
@@ -283,6 +290,7 @@ impl Default for Defaults {
         Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
             branch_template: default_branch_template(),
+            notify: true,
             split_direction: None,
             max_panes_per_tab: default_max_panes_per_tab(),
         }

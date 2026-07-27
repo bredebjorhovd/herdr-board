@@ -385,6 +385,7 @@ Two different things are called labels, which is easy to trip on:
 | `list [--state S] [--source S] [--json]` | read the board (for agents) |
 | `wait [--task ID] [--state S] [--timeout N]` | block until watched work settles |
 | `stats [--since-days N] [--json]` | throughput, completion rate, retries |
+| `new <title> [--label L] [--dispatch]` | write a ticket, optionally releasing it at once |
 | `dispatch --task <id>` | dispatch without the picker |
 | `cancel --task <id>` | end the live attempt, keep the issue open |
 | `gc [--older-than 14d] [--dry-run]` | remove the worktrees of finished attempts |
@@ -439,6 +440,19 @@ With no `--task` it watches whatever is in flight when it is called and returns
 as soon as any of it reaches `review`, `failed` or `done`. It reconciles as it
 goes rather than trusting the daemon's cycle, so it answers as soon as the
 answer is true.
+
+Work that goes through a ticket is traceable — reasoning, branch, PR, review,
+closure. Work that does not is a wall of commits somebody reconstructs later,
+and the difference in practice is almost entirely friction:
+
+```bash
+herdr-board new "Retry Altinn on 502" --label tally
+herdr-board new "Flaky RLS test" --label tally --dispatch   # and release it now
+```
+
+It assigns to whoever owns the API key, because the board's filter is "assigned
+to me or carrying a routing label" — an unassigned, unlabelled issue would be
+created into invisibility.
 
 **Nothing can wake a conversational orchestrator.** It only gets a turn when
 something prompts it, which is a property of the runtime rather than of the

@@ -315,6 +315,101 @@ impl<T: GraphQl> Linear<T> {
             .unwrap_or_default())
     }
 
+    /// Team ids by key, for creating an issue against one.
+    pub fn team_ids(&self) -> Result<Vec<(String, String)>> {
+        let data = self.transport.query(&json!({
+            "query": "{ teams(first: 50) { nodes { id key } } }",
+        }))?;
+        Ok(data
+            .get("teams")
+            .and_then(|t| t.get("nodes"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        Some((
+                            t.get("key")?.as_str()?.to_string(),
+                            t.get("id")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Label ids by name, so a new issue can be routed the moment it exists.
+    pub fn label_ids(&self) -> Result<Vec<(String, String)>> {
+        let data = self.transport.query(&json!({
+            "query": "{ issueLabels(first: 100) { nodes { id name } } }",
+        }))?;
+        Ok(data
+            .get("issueLabels")
+            .and_then(|t| t.get("nodes"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| {
+                        Some((
+                            l.get("name")?.as_str()?.to_string(),
+                            l.get("id")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Create an issue, assigned to whoever owns the API key.
+    ///
+    /// Assigned deliberately: the board's filter is "assigned to me or carrying
+    /// a routing label", and an unassigned, unlabelled issue would be created
+    /// into invisibility.
+    pub fn create_issue(
+        &self,
+        team_id: &str,
+        title: &str,
+        body: Option<&str>,
+        label_ids: &[String],
+    ) -> Result<(String, String)> {
+        let viewer = self
+            .transport
+            .query(&json!({ "query": "{ viewer { id } }" }))?
+            .get("viewer")
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let data = self.transport.query(&json!({
+            "query": r#"mutation New($i: IssueCreateInput!) {
+                issueCreate(input: $i) { success issue { identifier url } }
+              }"#,
+            "variables": { "i": {
+                "teamId": team_id,
+                "title": title,
+                "description": body,
+                "labelIds": label_ids,
+                "assigneeId": viewer,
+            }},
+        }))?;
+        check_success(&data, "issueCreate")?;
+        let issue = data
+            .get("issueCreate")
+            .and_then(|c| c.get("issue"))
+            .ok_or_else(|| anyhow!("issueCreate returned no issue"))?;
+        Ok((
+            issue
+                .get("identifier")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            issue
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    }
+
     /// The team's first `completed`-type state, for closing a finished issue.
     /// Resolved by type, never by name — teams rename these freely.
     pub fn completed_state_id(&self, team_key: &str) -> Result<Option<String>> {

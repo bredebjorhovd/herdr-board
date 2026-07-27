@@ -101,6 +101,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write a ticket. Cheaper than not writing one.
+    New {
+        title: String,
+        /// Description. `-` reads it from stdin.
+        #[arg(long)]
+        body: Option<String>,
+        /// Linear team key. Only needed when you have more than one.
+        #[arg(long)]
+        team: Option<String>,
+        /// Labels to apply — this is what routes it.
+        #[arg(long)]
+        label: Vec<String>,
+        /// Dispatch it as soon as it exists.
+        #[arg(long)]
+        dispatch: bool,
+    },
     /// What the board knows about its own throughput.
     Stats {
         /// Only the last N days. Omit for everything.
@@ -273,6 +289,41 @@ fn main() -> Result<()> {
                 timeout.map(std::time::Duration::from_secs),
             )?;
             cli::print_tasks(&rows, json)
+        }
+        Command::New {
+            title,
+            body,
+            team,
+            label,
+            dispatch: and_dispatch,
+        } => {
+            let log = Arc::new(Logger::new(paths.logfile(), true));
+            let body = match body.as_deref() {
+                Some("-") => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    Some(buf)
+                }
+                other => other.map(str::to_string),
+            };
+            let (identifier, url) =
+                cli::new_task(&paths, log.clone(), &title, body.as_deref(), team.as_deref(), &label)?;
+            println!("{identifier}  {url}");
+
+            if and_dispatch {
+                // It has to be on the board before it can be dispatched.
+                cli::sync_once(&paths, log.clone())?;
+                let engine = cli::engine_from_paths(&paths, log.clone())?;
+                let id = format!("linear:{identifier}");
+                let t = engine
+                    .db
+                    .get_task(&id)?
+                    .ok_or_else(|| anyhow::anyhow!("{identifier} did not reach the board"))?;
+                let h = herdr::Herdr::discover(log.clone());
+                let plan = dispatch::dispatch(&engine, &h, &log, &t, &dispatch::Overrides::default())?;
+                println!("dispatched to ws:{} ({})", plan.workspace, plan.runtime);
+            }
+            Ok(())
         }
         Command::Stats { since_days, json } => {
             let log = Arc::new(Logger::new(paths.logfile(), false));

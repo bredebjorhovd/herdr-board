@@ -628,6 +628,79 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
     Ok(())
 }
 
+// ---- creating work -----------------------------------------------------
+
+/// Write a ticket, so recording the work is cheaper than not recording it.
+///
+/// Work that goes through a ticket is traceable — reasoning, branch, PR,
+/// review, closure. Work that does not is a wall of commits somebody has to
+/// reconstruct later. The difference in practice is almost entirely friction,
+/// so this exists to remove it.
+pub fn new_task(
+    paths: &Paths,
+    log: Arc<Logger>,
+    title: &str,
+    body: Option<&str>,
+    team: Option<&str>,
+    labels: &[String],
+) -> Result<(String, String)> {
+    let engine = engine_from_paths(paths, log)?;
+    let linear = engine
+        .linear
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no LINEAR_API_KEY; see `herdr-board doctor`"))?;
+
+    let teams = linear.team_ids()?;
+    let team_id = match team {
+        Some(k) => teams
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(k))
+            .map(|(_, id)| id.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Linear team `{k}`; known: {}",
+                    teams
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?,
+        // With one team there is nothing to choose; with several, say so rather
+        // than filing into whichever came back first.
+        None if teams.len() == 1 => teams[0].1.clone(),
+        None => bail!(
+            "several Linear teams exist; name one with --team: {}",
+            teams
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+
+    let known = linear.label_ids().unwrap_or_default();
+    let mut ids = Vec::new();
+    for want in labels {
+        match known
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(want))
+        {
+            Some((_, id)) => ids.push(id.clone()),
+            None => bail!(
+                "no Linear label `{want}`; known: {}",
+                known
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    linear.create_issue(&team_id, title, body, &ids)
+}
+
 // ---- waiting -----------------------------------------------------------
 
 /// Block until a watched task settles.

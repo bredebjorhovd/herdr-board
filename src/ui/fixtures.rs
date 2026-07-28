@@ -15,6 +15,13 @@ pub const STALE_BINDING: &str = "stale-binding";
 /// AGE-18 exists for, and the one where the empty copy and the UNADOPTED
 /// section have to share a body.
 pub const UNADOPTED: &str = "unadopted";
+/// The board at the size that stopped being scannable: 109 rows that are not
+/// done, across five routes, 83 of them from the one repo whose roadmap lives
+/// as open issues.
+///
+/// `f` and `/` exist for this board and not for the ten-row one, so reviewing
+/// them against `populated` would be reviewing them where they are not needed.
+pub const CROWDED: &str = "crowded";
 
 /// Every scenario, for `demo --list` and for the render tests.
 pub const ALL: &[&str] = &[
@@ -24,6 +31,7 @@ pub const ALL: &[&str] = &[
     SYNCD_DEAD,
     STALE_BINDING,
     UNADOPTED,
+    CROWDED,
 ];
 
 const CONFIG_PATH: &str = "~/.config/herdr/plugins/config/board/routing.toml";
@@ -209,6 +217,141 @@ fn populated_views() -> Vec<TaskView> {
     out
 }
 
+/// A GitHub issue row. `gh#507` says nothing about which repo it came from, so
+/// the view carries the repo the way [`build_views`](super::state::build_views)
+/// derives it.
+fn gh_task(repo: &str, number: u32, title: &str, state: BoardState) -> Task {
+    Task {
+        id: format!("gh:{repo}#{number}"),
+        source: Source::Github,
+        source_id: number.to_string(),
+        identifier: format!("gh#{number}"),
+        title: title.into(),
+        body: None,
+        url: format!("https://github.com/{repo}/issues/{number}"),
+        labels: vec!["release-a".into()],
+        state,
+        source_state: None,
+        linear_team: None,
+        linear_project: None,
+        upstream: UpstreamState::Unstarted,
+        local_done: false,
+        pr_url: None,
+        pr_number: None,
+        pr_open: false,
+        pr_merged: false,
+        pr_mergeable: None,
+        updated_at: crate::db::now(),
+        synced_at: crate::db::now(),
+        attempts: vec![],
+    }
+}
+
+/// The same task, routed somewhere other than the one workspace `view` assumes.
+fn routed(task: Task, route: &str, elapsed: Option<i64>) -> TaskView {
+    let repo = task
+        .id
+        .strip_prefix("gh:")
+        .and_then(|r| r.split(['#', '!']).next())
+        .and_then(|r| r.rsplit('/').next())
+        .map(str::to_string);
+    TaskView {
+        route_name: Some(route.into()),
+        workspace: Some(route.into()),
+        repo,
+        ..view(task, elapsed)
+    }
+}
+
+/// Enough distinct titles to fill a repo's whole open backlog without any two
+/// rows reading alike — 83 identical lines would be a fixture nobody believes.
+const CROWD_VERBS: &[&str] = &[
+    "Retry", "Cache", "Split", "Backfill", "Rewrite", "Tidy", "Guard", "Bound",
+    "Log", "Migrate",
+];
+const CROWD_SUBJECTS: &[&str] = &[
+    "the Altinn receipt poller",
+    "the BRREG orgnr lookup",
+    "the MVA term split",
+    "the Maskinporten token refresh",
+    "the Tripletex page size",
+    "the Signicat callback state",
+    "the client picker query",
+    "the nightly reconciliation job",
+    "the ledger export writer",
+    "the duplicate-invoice guard",
+    "the SAF-T column mapping",
+];
+
+/// Distinct for every `i` below `verbs × subjects`, which is what the callers
+/// below stay inside by taking disjoint ranges.
+fn crowd_title(i: usize) -> String {
+    format!(
+        "{} {}",
+        CROWD_VERBS[i % CROWD_VERBS.len()],
+        CROWD_SUBJECTS[(i / CROWD_VERBS.len()) % CROWD_SUBJECTS.len()]
+    )
+}
+
+/// 109 rows that are not done, across five routes.
+///
+/// The shape AGE-27 is about: one repo contributing 83 of them because
+/// `[github] labels = []` polls every open issue, and four other routes whose
+/// handful of rows are the ones you actually came to look at.
+fn crowded_views() -> Vec<TaskView> {
+    // The ordinary board, all on one route, still on it underneath the flood.
+    let mut out = populated_views();
+
+    // The repo that arrived in a single poll.
+    for i in 0..83 {
+        let state = match i {
+            0..=2 => BoardState::Working,
+            3..=4 => BoardState::Review,
+            5 => BoardState::Blocked,
+            _ => BoardState::Ready,
+        };
+        let mut t = gh_task("Florin-AS/itsm-agent", 400 + i as u32, &crowd_title(i), state);
+        if state == BoardState::Working || state == BoardState::Blocked {
+            t.attempts = vec![attempt(100 + i as i64, "codex", None, 60 + i as i64 * 37)];
+        }
+        if state == BoardState::Review {
+            t.pr_url = Some(format!("https://github.com/Florin-AS/itsm-agent/pull/{}", 400 + i));
+            t.pr_number = Some(400 + i as i64);
+            t.pr_open = true;
+        }
+        let elapsed = t.attempts.first().map(|_| 60 + i as i64 * 37);
+        out.push(routed(t, "itsm-agent", elapsed));
+    }
+
+    // Three repos with the backlog a curated tracker actually has. Their title
+    // ranges start past the flood's, so no two rows on the board read alike.
+    for (route, repo, n, first, titles) in [
+        ("tally", "Florin-AS/tally", 9usize, 500u32, 83usize),
+        ("altinn-forms", "Florin-AS/altinn-forms", 5, 600, 92),
+        ("brreg-client", "Florin-AS/brreg-client", 2, 700, 97),
+    ] {
+        for i in 0..n {
+            let state = if i == 0 { BoardState::Working } else { BoardState::Ready };
+            let mut t = gh_task(repo, first + i as u32, &crowd_title(titles + i), state);
+            if state == BoardState::Working {
+                t.attempts = vec![attempt(200 + i as i64, "claude-code", None, 240)];
+            }
+            let elapsed = t.attempts.first().map(|_| 240);
+            out.push(routed(t, route, elapsed));
+        }
+    }
+
+    // History, which the filter has to scope like everything else.
+    for i in 0..4 {
+        out.push(routed(
+            gh_task("Florin-AS/itsm-agent", 300 + i, &crowd_title(99 + i as usize), BoardState::Done),
+            "itsm-agent",
+            None,
+        ));
+    }
+    out
+}
+
 fn sync_ok() -> SyncStatus {
     SyncStatus {
         linear: SourceHealth::Ok,
@@ -275,6 +418,7 @@ pub fn app(scenario: &str) -> App {
     }
     let (views, sync) = match scenario {
         EMPTY => (Vec::new(), sync_ok()),
+        CROWDED => (crowded_views(), sync_ok()),
         LINEAR_DOWN => (
             populated_views(),
             SyncStatus {
@@ -373,6 +517,31 @@ mod tests {
         // And the cursor lands on a repo, not on the header: `a` is the whole
         // point of the screen.
         assert_eq!(a.selected_id, a.unadopted.first().map(|u| u.row_id()));
+    }
+
+    #[test]
+    fn the_crowded_scenario_is_the_board_that_stopped_being_scannable() {
+        // The shape AGE-27 is about, and the size the filter has to work at:
+        // 109 rows that are not done, across five routes, 83 of them from the
+        // one repo that polls every open issue it has.
+        let a = app(CROWDED);
+        let live = a.views.iter().filter(|v| v.state() != BoardState::Done).count();
+        assert_eq!(live, 109, "the fixture is no longer the size of the problem");
+        assert_eq!(
+            a.routes_present(),
+            vec!["altinn-forms", "brreg-client", "itsm-agent", "offhand", "tally"]
+        );
+        let itsm = a
+            .views
+            .iter()
+            .filter(|v| v.route_name.as_deref() == Some("itsm-agent"))
+            .filter(|v| v.state() != BoardState::Done)
+            .count();
+        assert_eq!(itsm, 83);
+        // No two rows read alike, or the fixture is not a board anyone believes.
+        let titles: std::collections::HashSet<&str> =
+            a.views.iter().map(|v| v.task.title.as_str()).collect();
+        assert_eq!(titles.len(), a.views.len());
     }
 
     #[test]

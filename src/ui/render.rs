@@ -174,22 +174,46 @@ pub fn header_style(sync: &SyncStatus) -> Style {
 /// something unreadable.
 const MIN_STATUS: u16 = 10;
 
-fn render_header(buf: &mut Buffer, area: Rect, left: &str, sync: Option<&SyncStatus>) {
+/// The header, with the sync status and the active filter sharing the corner.
+///
+/// The filter takes the corner outright and the status gives way to it as the
+/// pane narrows. That order is deliberate: the status is a fact about the world
+/// that will still be true in a minute, and the filter is a thing the operator
+/// just did to the board in front of them. A board hiding most of its rows and
+/// not saying why looks broken.
+fn render_header(
+    buf: &mut Buffer,
+    area: Rect,
+    left: &str,
+    sync: Option<&SyncStatus>,
+    filter: Option<&str>,
+) {
     let used = put(buf, area, 1, 0, left, theme::fg_default());
-    if let Some(s) = sync {
-        // A split can make the board much narrower than 80 cells. The status is
-        // right-aligned, so without a clamp it writes straight over the title —
-        // and a header that reads `herdr-bgh ✗ retrying 20s` is worse than one
-        // with no status at all.
-        let room = area
-            .width
-            .saturating_sub(2)
-            .saturating_sub(1 + used)
-            .saturating_sub(2);
-        if room >= MIN_STATUS {
-            let status = truncate(&header_status(s), room as usize);
-            put_right(buf, area, area.width.saturating_sub(2), 0, &status, header_style(s));
+    // A split can make the board much narrower than 80 cells. Both of these are
+    // right-aligned, so without a clamp they write straight over the title —
+    // and a header that reads `herdr-bgh ✗ retrying 20s` is worse than one with
+    // no status at all.
+    let mut right = area.width.saturating_sub(2);
+    let mut room = right.saturating_sub(1 + used).saturating_sub(2);
+
+    if let Some(f) = filter {
+        let f = truncate(f, room as usize);
+        let w = f.chars().count() as u16;
+        if w > 0 {
+            // Default fg, not dim: every other thing up here is chrome, and
+            // this one is state the operator can change with a keypress.
+            put_right(buf, area, right, 0, &f, theme::fg_default());
+            // Three cells, the gap the status already uses between its parts.
+            right = right.saturating_sub(w + 3);
+            room = room.saturating_sub(w + 3);
         }
+    }
+
+    if let Some(s) = sync
+        && room >= MIN_STATUS
+    {
+        let status = truncate(&header_status(s), room as usize);
+        put_right(buf, area, right, 0, &status, header_style(s));
     }
     rule(
         buf,
@@ -349,7 +373,8 @@ fn available_metadata_width(width: u16) -> u16 {
 pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
     app.rows.clear();
     app.footer_hits.clear();
-    render_header(buf, area, "herdr-board", Some(&app.sync));
+    let filter = app.header_filter();
+    render_header(buf, area, "herdr-board", Some(&app.sync), filter.as_deref());
 
     let last = area.height.saturating_sub(1);
     let body_bottom = last.saturating_sub(2); // rule sits at last-1
@@ -368,6 +393,18 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
     // of it. Without this the body is simply clipped: a selection below the fold
     // is invisible and unreachable, which on a short pane is most of the board.
     let lines: Vec<Row> = app.rows();
+
+    // A board with rows on it, showing none of them, has to say which of the
+    // operator's own keypresses did that — the header names the filter, and
+    // this names the way out. A board with no rows at all is a different
+    // sentence, already written above.
+    if lines.is_empty()
+        && !app.is_empty()
+        && let Some(note) = app.filter.empty_note()
+        && body_top <= body_bottom
+    {
+        put(buf, area, 1, body_top, &note, theme::fg_default());
+    }
 
     if body_top <= body_bottom {
         let height = (body_bottom + 1).saturating_sub(body_top) as usize;
@@ -397,14 +434,17 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
                     render_task_row(buf, area, y, v, selected);
                 }
                 Row::UnadoptedSection => {
+                    // What is shown, not what exists: the count on a folded
+                    // header has to agree with the rows unfolding it produces.
+                    let shown = app.unadopted_shown();
                     let missing: Vec<crate::adopt::Missing> =
-                        app.unadopted.iter().map(|u| u.missing).collect();
+                        shown.iter().map(|u| u.missing).collect();
                     render_unadopted_header(
                         buf,
                         area,
                         y,
                         app.collapsed_unadopted,
-                        app.unadopted.len(),
+                        shown.len(),
                         &missing,
                     );
                     if selected {
@@ -424,16 +464,7 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
 
         // A scrollable list has to say so, or a short pane looks like the whole
         // board. Drawn after the rule below, which would otherwise paint over it.
-        if lines.len() > height {
-            let more = lines.len() - app.scroll - height.min(lines.len() - app.scroll);
-            more_marker = Some(if app.scroll > 0 && more > 0 {
-                format!(" ↑{} ↓{more} ", app.scroll)
-            } else if app.scroll > 0 {
-                format!(" ↑{} ", app.scroll)
-            } else {
-                format!(" ↓{more} ")
-            });
-        }
+        more_marker = scroll_marker(lines.len(), app.scroll, height);
     }
 
     rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
@@ -668,8 +699,27 @@ fn render_task_row(buf: &mut Buffer, area: Rect, y: u16, v: &TaskView, selected:
 // ---- footer ------------------------------------------------------------
 
 /// Keys relevant to *the current selection*, not the full map.
+///
+/// Plus the way out of a filter whenever one is on, which is not about the
+/// selection at all: `f` and `/` are learned from the help screen, but a board
+/// showing a fraction of its rows has to offer the key that undoes that without
+/// making you go and look it up.
 pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
+    let mut hints = selection_hints(app);
+    if app.screen == Screen::List && app.filter.active() && !app.typing {
+        hints.push(("F", "clear the filter", 'F'));
+    }
+    hints
+}
+
+fn selection_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     match app.screen {
+        // The reference is longer than a 24-row pane, so say how to see the
+        // rest of it rather than letting the last groups look absent.
+        Screen::Help if help_lines().len() > help_body_height(app.last_height) => vec![
+            ("j k", "more keys", 'j'),
+            ("esc", "back to the board", '\u{1b}'),
+        ],
         Screen::Help | Screen::Stats => vec![("esc", "back to the board", '\u{1b}')],
         // How many rows `enter` would produce is on the body's right edge,
         // where it moves as you pick; the footer only has to offer the keys.
@@ -813,7 +863,45 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     }
 }
 
+/// The `/` field: **a line, not a box**.
+///
+/// It replaces the footer the way the cancel confirmation does — the board has
+/// one place where it talks to you, and a floating input would be the first
+/// bordered thing on screen.
+fn render_find_field(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
+    let q = match &app.filter {
+        Filter::Text(q) => q.as_str(),
+        _ => "",
+    };
+    let mut x = 1;
+    x += put(buf, area, x, y, "/", theme::dim());
+    x += put(buf, area, x, y, q, theme::fg_default());
+    // The caret is one reversed cell — the same emphasis the selected row uses,
+    // so it survives colour being stripped.
+    put(
+        buf,
+        area,
+        x,
+        y,
+        " ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    );
+
+    // What the query has found so far, so you can stop typing when it is down
+    // to one row rather than typing the whole identifier every time.
+    let n = app.shown_tasks();
+    let count = format!("{n} row{} · esc clears", if n == 1 { "" } else { "s" });
+    if area.width.saturating_sub(2) > x + count.chars().count() as u16 + 2 {
+        put_right(buf, area, area.width.saturating_sub(2), y, &count, theme::dim());
+    }
+}
+
 fn render_footer(buf: &mut Buffer, area: Rect, y: u16, app: &mut App) {
+    // Typing outranks both: the field is where the keys are going.
+    if app.typing {
+        render_find_field(buf, area, y, app);
+        return;
+    }
     // A transient message and the cancel confirmation both replace the footer
     // inline rather than opening a second modal.
     if let Some(id) = &app.confirm {
@@ -1119,6 +1207,14 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "filter",
+        &[
+            ("f", "show one route, then the next, then all of them"),
+            ("/", "find — matches identifier, title and route as you type"),
+            ("F", "clear the filter"),
+        ],
+    ),
+    (
         "unadopted",
         &[
             ("a", "adopt — asks what the repo would put on the board"),
@@ -1139,6 +1235,31 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+/// One drawn line of the key reference: a key and what it does, a group
+/// heading (no key), or the blank between groups (neither).
+type HelpLine = (&'static str, &'static str);
+
+/// [`HELP_GROUPS`] flattened to the lines it draws, so the screen can be
+/// windowed rather than cut off at whatever height the pane happens to be.
+pub fn help_lines() -> Vec<HelpLine> {
+    let mut out: Vec<HelpLine> = Vec::new();
+    for (group, keys) in HELP_GROUPS {
+        if !out.is_empty() {
+            out.push(("", ""));
+        }
+        out.push(("", group));
+        out.extend(keys.iter().map(|(k, d)| (*k, *d)));
+    }
+    out
+}
+
+/// How many lines of the reference a pane this tall can show.
+pub fn help_body_height(height: u16) -> usize {
+    // Rows 3..=last-3: the title and its rule above, the `ctrl+b` line, the
+    // rule and the footer below.
+    height.saturating_sub(1).saturating_sub(5) as usize
+}
+
 pub fn render_help(buf: &mut Buffer, area: Rect, app: &mut App) {
     app.footer_hits.clear();
     let last = area.height.saturating_sub(1);
@@ -1147,29 +1268,31 @@ pub fn render_help(buf: &mut Buffer, area: Rect, app: &mut App) {
     put(buf, area, x, 0, "▸ keys", theme::fg_default());
     rule(buf, area, 1, area.width.saturating_sub(2), 1, theme::dim());
 
-    let mut y = 3;
-    for (group, keys) in HELP_GROUPS {
-        if y >= last - 2 {
-            break;
-        }
-        put(
-            buf,
-            area,
-            1,
-            y,
-            group,
-            theme::dim().add_modifier(Modifier::BOLD),
-        );
-        y += 1;
-        for (key, desc) in *keys {
-            if y >= last - 2 {
-                break;
+    // The board binds more keys than a 24-row pane has lines for, and a
+    // reference that silently stops halfway is how `m` stayed undocumented: it
+    // scrolls, and says that it does.
+    let lines = help_lines();
+    let height = help_body_height(area.height);
+    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(height));
+
+    for (y, (key, desc)) in (3..).zip(lines.iter().skip(app.help_scroll).take(height)) {
+        match (key.is_empty(), desc.is_empty()) {
+            (true, true) => {}
+            (true, false) => {
+                put(
+                    buf,
+                    area,
+                    1,
+                    y,
+                    desc,
+                    theme::dim().add_modifier(Modifier::BOLD),
+                );
             }
-            put(buf, area, COL_ID, y, &fixed(key, 9), theme::fg_default());
-            put(buf, area, COL_TITLE, y, desc, theme::dim());
-            y += 1;
+            _ => {
+                put(buf, area, COL_ID, y, &fixed(key, 9), theme::fg_default());
+                put(buf, area, COL_TITLE, y, desc, theme::dim());
+            }
         }
-        y += 1;
     }
 
     put(
@@ -1181,7 +1304,29 @@ pub fn render_help(buf: &mut Buffer, area: Rect, app: &mut App) {
         theme::dim(),
     );
     rule(buf, area, 1, area.width.saturating_sub(2), last - 1, theme::dim());
+    // The same marker the list uses, in the same place, for the same reason.
+    if let Some(marker) = scroll_marker(lines.len(), app.help_scroll, height) {
+        put_right(buf, area, area.width.saturating_sub(2), last - 1, &marker, theme::dim());
+    }
     render_footer(buf, area, last, app);
+}
+
+/// `↑3 ↓12` for a window onto a longer list, or `None` when it all fits.
+///
+/// A screen that scrolls has to say so, or a short pane looks like the whole of
+/// what there is.
+pub fn scroll_marker(len: usize, scroll: usize, height: usize) -> Option<String> {
+    if len <= height {
+        return None;
+    }
+    let more = len - scroll - height.min(len - scroll);
+    Some(if scroll > 0 && more > 0 {
+        format!(" ↑{scroll} ↓{more} ")
+    } else if scroll > 0 {
+        format!(" ↑{scroll} ")
+    } else {
+        format!(" ↓{more} ")
+    })
 }
 
 /// Keep the selected row inside the window, scrolling as little as possible.
@@ -1241,6 +1386,10 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) {
+    // Recorded here rather than only by the event loop, so anything that draws
+    // a frame gets the footer's click row and the height-dependent hints right
+    // without having to remember to set it.
+    app.last_height = area.height;
     match app.screen {
         Screen::List => render_list(buf, area, app),
         Screen::Detail => render_detail(buf, area, app),
@@ -2719,6 +2868,170 @@ mod tests {
             }
         }
     }
+
+    // ---- AGE-27: filtering ---------------------------------------------
+
+    fn body(app: &mut App, w: u16, h: u16) -> String {
+        let buf = draw(app, w, h);
+        (0..h).map(|y| line(&buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_header_says_which_filter_is_on_where_the_sync_status_sits() {
+        // A filtered board that does not say so is a board that looks broken.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.cycle_route();
+        let head = line(&draw(&mut app, 100, 30), 0);
+        assert!(head.contains("filter: altinn-forms"), "{head:?}");
+        // ...and the status it shares the corner with is still there.
+        assert!(head.contains("synced 12s"), "{head:?}");
+        assert!(
+            head.find("synced").unwrap() < head.find("filter:").unwrap(),
+            "the filter has to hold the corner: {head:?}"
+        );
+
+        // A typed query says itself, `/` and all.
+        app.clear_filter();
+        app.open_find();
+        for c in "altinn".chars() {
+            app.filter_type(c);
+        }
+        app.accept_filter();
+        assert!(line(&draw(&mut app, 100, 30), 0).contains("/altinn"));
+    }
+
+    #[test]
+    fn the_filter_keeps_the_corner_when_the_pane_is_too_narrow_for_both() {
+        // The status is a fact about the world that will still be true in a
+        // minute; the filter is what the operator just did to this board.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.cycle_route();
+        let head = line(&draw(&mut app, 44, 24), 0);
+        assert!(head.contains("filter: altinn-forms"), "{head:?}");
+        assert!(!head.contains("synced"), "{head:?}");
+        // ...and it never writes over the title.
+        assert!(head.starts_with(" herdr-board"), "{head:?}");
+    }
+
+    #[test]
+    fn the_field_is_a_line_on_the_footer_and_counts_as_you_type() {
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.open_find();
+        for c in "signicat".chars() {
+            app.filter_type(c);
+        }
+        let buf = draw(&mut app, 80, 24);
+        let footer = line(&buf, 23);
+        assert!(footer.starts_with(" /signicat"), "{footer:?}");
+        assert!(footer.contains("esc clears"), "{footer:?}");
+        assert!(
+            footer.contains(&format!("{} rows", app.shown_tasks())),
+            "the count that tells you when to stop typing: {footer:?}"
+        );
+        // The caret is emphasis, not a box or a background.
+        let caret = &buf[(10, 23)];
+        assert!(caret.modifier.contains(Modifier::REVERSED));
+        assert_eq!(caret.bg, Color::Reset);
+        // And the hints are gone: the keys are going into the field.
+        assert!(!footer.contains("dispatch"), "{footer:?}");
+    }
+
+    #[test]
+    fn the_key_reference_is_reachable_rather_than_cut_off() {
+        // It binds more keys than a 24-row pane has lines. Stopping halfway
+        // with nothing said is how a documented key goes missing — the same
+        // failure as `m`, one screen further on.
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.screen = Screen::Help;
+
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&body(&mut app, 80, 24));
+            app.scroll_help(1);
+        }
+        for (key, desc) in help_lines() {
+            if desc.is_empty() {
+                continue;
+            }
+            assert!(seen.contains(desc), "`{key}` never comes into view: {desc:?}");
+        }
+
+        // ...and it says there is more, in the marker and in the footer, so
+        // nobody has to guess that scrolling is a thing here.
+        // The marker rides the rule, as it does on the list — `↓ ↑` also
+        // appear as key names in the body, so that line is what to read.
+        app.help_scroll = 0;
+        let short = draw(&mut app, 80, 24);
+        assert!(line(&short, 22).contains('↓'), "{:?}", line(&short, 22));
+        assert!(line(&short, 23).contains("j k more keys"), "{:?}", line(&short, 23));
+
+        // A pane tall enough for all of it says neither.
+        let tall = draw(&mut app, 80, 40);
+        assert!(!line(&tall, 38).contains('↓'), "{:?}", line(&tall, 38));
+        assert!(!line(&tall, 39).contains("more keys"), "{:?}", line(&tall, 39));
+    }
+
+    #[test]
+    fn an_open_field_with_nothing_typed_accuses_nobody() {
+        // `/` on a board that was never set up must not overwrite the copy
+        // saying so with a complaint about a query nobody has typed.
+        let mut app = fixtures::app(fixtures::EMPTY);
+        app.setup_hints = vec!["No routing.toml yet — run  herdr-board init".into()];
+        app.open_find();
+        let all = body(&mut app, 80, 24);
+        assert!(all.contains("not set up yet"), "{all}");
+        assert!(!all.contains("matches"), "{all}");
+    }
+
+    #[test]
+    fn a_filter_that_hides_everything_says_which_keypress_did_that() {
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.unadopted.clear();
+        app.open_find();
+        for c in "zzzz".chars() {
+            app.filter_type(c);
+        }
+        app.accept_filter();
+        let all = body(&mut app, 80, 24);
+        assert!(all.contains("No identifier, title or route matches"), "{all}");
+        assert!(all.contains("F clears the filter"), "{all}");
+    }
+
+    #[test]
+    fn filtering_to_one_route_leaves_only_that_routes_rows_and_sections() {
+        // The board this exists for: 109 rows over five routes, down to one
+        // project you can read at a glance.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.filter = Filter::Route("tally".into());
+        let all = body(&mut app, 100, 40);
+        assert!(all.contains("WORKING"), "{all}");
+        assert!(
+            !all.contains("BLOCKED"),
+            "a section with no rows left drew an empty header:\n{all}"
+        );
+        // Nothing from another route is on screen.
+        for l in all.lines() {
+            assert!(!l.contains("ws:itsm-agent"), "{l:?}");
+        }
+        // ...and the folded DONE header counts what is shown, not the board.
+        assert!(
+            !all.contains("DONE today"),
+            "the done section is all itsm-agent rows:\n{all}"
+        );
+    }
+
+    #[test]
+    fn an_unadopted_repo_stays_visible_under_a_route_filter() {
+        // It has no route by definition — that is the thing worth noticing.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.filter = Filter::Route("tally".into());
+        let all = body(&mut app, 100, 40);
+        assert!(all.contains("UNADOPTED"), "{all}");
+        assert!(all.contains("tripletex-mcp"), "{all}");
+    }
+
+
+
 
     #[test]
     fn wrapping_respects_width_and_hard_breaks() {

@@ -59,6 +59,19 @@ pub enum Action {
     Help,
     ConfirmYes,
     ConfirmNo,
+    /// `f` — show the next route on the board, then everything again.
+    CycleRoute,
+    /// `F` — clear whichever filter is active.
+    ClearFilter,
+    /// `/` — open the text field.
+    Find,
+    /// A character typed into that field.
+    FindChar(char),
+    FindBackspace,
+    /// `enter` — keep the query and hand the keys back to the board.
+    FindAccept,
+    /// `esc` — close the field and show everything again.
+    FindCancel,
 }
 
 /// The key map (design spec: Interactions).
@@ -75,6 +88,23 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         || key.modifiers.contains(KeyModifiers::SUPER)
     {
         return Action::None;
+    }
+
+    // The `/` field takes every printable key, or it could not type `d`, `x` or
+    // `q`. The control guard above still runs first, so `ctrl+b` reaches herdr
+    // from inside the field like everywhere else.
+    if app.typing {
+        return match key.code {
+            KeyCode::Esc => Action::FindCancel,
+            KeyCode::Enter => Action::FindAccept,
+            KeyCode::Backspace => Action::FindBackspace,
+            // Arrows are not text, so they still move — the point of typing is
+            // to reach a row, and stopping to close the field first is a step.
+            KeyCode::Down => Action::Move(1),
+            KeyCode::Up => Action::Move(-1),
+            KeyCode::Char(c) => Action::FindChar(c),
+            _ => Action::None,
+        };
     }
 
     // An inline confirmation takes only y/n/esc.
@@ -100,6 +130,19 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
             KeyCode::Char('?') => Action::Help,
             _ => Action::None,
         };
+    }
+
+    // Filtering is a property of the list, and only the list draws the header
+    // and the field that say a filter is on — filtering from behind the help
+    // screen would be a board changing under an operator who cannot see it.
+    // `F` clears, which leaves `x` (cancel) and `X` (ignore) untouched.
+    if app.screen == Screen::List {
+        match key.code {
+            KeyCode::Char('f') => return Action::CycleRoute,
+            KeyCode::Char('F') => return Action::ClearFilter,
+            KeyCode::Char('/') => return Action::Find,
+            _ => {}
+        }
     }
 
     match key.code {
@@ -149,6 +192,9 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
                 'a' => Action::Adopt,
                 ' ' => Action::Toggle,
                 'X' => Action::Ignore,
+                'F' => Action::ClearFilter,
+                // Scrolling the key reference, which is longer than the pane.
+                'j' => Action::Move(1),
                 'r' => Action::Retry,
                 'd' => Action::MarkDone,
                 's' => Action::Sync,
@@ -285,12 +331,9 @@ impl Board {
                 .flash(format!("{task_id} is not on the board"));
             return;
         }
-        if !self.app.visible_task_ids().iter().any(|i| i == task_id) {
-            // It is in the collapsed `done` section; expand rather than
-            // silently doing nothing.
-            self.app.collapsed.remove(&BoardState::Done);
-        }
-        self.app.selected_id = Some(task_id.to_string());
+        // It may be in the collapsed `done` section, or behind a filter;
+        // either way, reveal it rather than silently doing nothing.
+        self.app.reveal(task_id);
         self.app.screen = Screen::List;
     }
 
@@ -320,8 +363,15 @@ impl Board {
             Action::Quit => self.app.should_quit = true,
             Action::Move(d) => match &mut self.app.adopt {
                 Some(view) if self.app.screen == Screen::Adopt => view.move_cursor(d),
+                // On the key reference, moving scrolls it: there is no cursor
+                // there, and moving the one behind it would be invisible.
+                _ if self.app.screen == Screen::Help => self.app.scroll_help(d),
                 _ => self.app.select_delta(d),
             },
+            Action::Help => {
+                self.app.help_scroll = 0;
+                self.app.screen = Screen::Help;
+            }
             Action::Toggle => {
                 if let Some(view) = &mut self.app.adopt
                     && self.app.screen == Screen::Adopt
@@ -329,7 +379,6 @@ impl Board {
                     view.toggle();
                 }
             }
-            Action::Help => self.app.screen = Screen::Help,
             Action::Stats => {
                 // Reads every attempt, and nothing on it moves second to
                 // second, so it is computed on opening rather than on the tick.
@@ -384,6 +433,16 @@ impl Board {
             Action::MarkDone => self.mark_done()?,
             Action::Adopt => self.adopt()?,
             Action::Ignore => self.ignore()?,
+            // Filtering touches the view and nothing else: no sync, no
+            // dispatch, no database write. A hidden row is still a live
+            // attempt, still counted against the workspace cap, still synced.
+            Action::CycleRoute => self.app.cycle_route(),
+            Action::ClearFilter => self.app.clear_filter(),
+            Action::Find => self.app.open_find(),
+            Action::FindChar(c) => self.app.filter_type(c),
+            Action::FindBackspace => self.app.filter_backspace(),
+            Action::FindAccept => self.app.accept_filter(),
+            Action::FindCancel => self.app.clear_filter(),
         }
         Ok(())
     }
@@ -1167,6 +1226,106 @@ mod tests {
         // Everything else is inert while the question is on screen.
         assert_eq!(key_action(&app, key('j')), Action::None);
         assert_eq!(key_action(&app, key('x')), Action::None);
+    }
+
+    // ---- AGE-27: filtering ---------------------------------------------
+
+    #[test]
+    fn the_filter_keys_are_bound_and_collide_with_nothing() {
+        let app = fixtures::app(fixtures::CROWDED);
+        assert_eq!(key_action(&app, key('f')), Action::CycleRoute);
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            Action::ClearFilter
+        );
+        assert_eq!(key_action(&app, key('/')), Action::Find);
+        // `X` is ignore and `x` is cancel; `F` must not have taken either.
+        assert_eq!(key_action(&app, key('x')), Action::Cancel);
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Action::Ignore
+        );
+    }
+
+    #[test]
+    fn the_field_takes_every_printable_key_including_the_ones_that_act() {
+        // `d`, `x` and `q` all do something on the board. Inside the field they
+        // are letters, or half the identifiers on it could not be typed.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.open_find();
+        for c in ['d', 'x', 'q', 'f', 'a', '/', '-', '7'] {
+            assert_eq!(key_action(&app, key(c)), Action::FindChar(c), "key {c}");
+        }
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::FindAccept
+        );
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::FindCancel
+        );
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Action::FindBackspace
+        );
+        // Arrows are not text, so they still move: the point of typing is to
+        // reach a row.
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::Move(1)
+        );
+    }
+
+    #[test]
+    fn the_field_never_swallows_the_prefix_either() {
+        // The hardest rule on the board holds inside an input mode too.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.open_find();
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(key_action(&app, ctrl_b), Action::None);
+    }
+
+    #[test]
+    fn filtering_is_a_list_key_and_does_nothing_from_another_screen() {
+        // Only the list draws the header and the field that say a filter is
+        // on; filtering from behind the help screen would be invisible.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        for screen in [Screen::Detail, Screen::Prompt, Screen::Help, Screen::Stats] {
+            app.screen = screen;
+            assert_eq!(key_action(&app, key('/')), Action::None, "{screen:?}");
+            assert_eq!(key_action(&app, key('f')), Action::None, "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn the_way_out_of_a_filter_is_on_screen_while_one_is_on() {
+        let mut app = fixtures::app(fixtures::CROWDED);
+        assert!(
+            !render::footer_hints(&app).iter().any(|(_, _, c)| *c == 'F'),
+            "an unfiltered board offers a key that would do nothing"
+        );
+        app.cycle_route();
+        assert_eq!(
+            render::footer_hints(&app).last(),
+            Some(&("F", "clear the filter", 'F'))
+        );
+
+        // ...and it is a click target like every other hint, because herdr is
+        // mouse-first and a filter you can only leave by keyboard is a trap.
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.last_height = 24;
+        render::render(&mut buf, area, &mut app);
+        let (x, _, _) = *app
+            .footer_hits
+            .iter()
+            .find(|(_, _, c)| *c == 'F')
+            .expect("the hint drew nothing clickable");
+        let mut last = None;
+        assert_eq!(
+            mouse_action(&mut app, click(x, 23), &mut last),
+            Action::ClearFilter
+        );
     }
 
     #[test]

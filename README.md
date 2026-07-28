@@ -293,9 +293,13 @@ waiting: telling you to go poke a finished agent would be worse than silence.
 | `space` | adoption screen | pick a label to poll that repo for |
 | `enter` | adoption screen | adopt, with whatever is picked |
 | `X` | unadopted repo | ignore — stop offering it |
+| `f` | list | show one route, then the next, then all of them |
+| `/` | list | find — matches identifier, title and route as you type |
+| `F` | list | clear whichever filter is on |
 | `s` | anywhere | sync now |
 | `t` | anywhere | throughput — is any of this working |
 | `?` | anywhere | help |
+| `j` `k` | help | scroll it — it binds more keys than a 24-row pane has lines |
 
 Mouse works everywhere: click selects, double-click is `enter`, and every footer
 hint is a click target.
@@ -338,6 +342,52 @@ it cannot drift. Cancelling ends the attempt, not the issue: the row returns to
 also lands in `done` — see "Tasks that vanish upstream" — and says `gone
 upstream` where the others show a workspace, so the two reasons for being there
 stay distinguishable.
+
+### Showing less than everything
+
+A board is a queue you scan at a glance. At 109 rows that are not done — 83 of
+them from one repo whose roadmap lives as open issues — it stopped being one.
+
+Two controls, because they answer different questions:
+
+* **`f`** cycles the routes that actually have a row on the board, then back to
+  all of them. *Show me one project.* No input mode, no cursor, nothing to
+  escape: one more press always gets you further out.
+* **`/`** opens a text field that matches identifier, title and route as you
+  type. *Where was that ticket.* Finds a word across every repo at once. `enter`
+  keeps the query and hands the keys back to the board; `esc` clears it.
+* **`F`** clears whichever is on.
+
+The header says which, in the corner where the sync status sits — `filter:
+itsm-agent`, or `/altinn`. A filtered board that does not say so is a board that
+looks broken, so the filter holds that corner and the status gives way to it as
+the pane narrows.
+
+**A filter is a view, and it changes nothing else.** Not what syncs, not what is
+dispatchable, not what counts against `max_concurrent_per_workspace`. A hidden
+row is still a live attempt with an agent in a pane. What follows from that:
+
+* The cursor never rests on a hidden row, and no key acts on one. Filtering out
+  the selected row moves the cursor to the first row still on screen.
+* A section whose rows are all filtered away disappears rather than drawing an
+  empty header, and the counts on the folded ones — including `DONE today`,
+  which was already narrowed once — count what is shown.
+* Folding is independent: a filter never folds or unfolds anything, and clearing
+  it gives back exactly the board that was folded.
+* UNADOPTED survives the route filter. A repo with no board config has no route
+  *by definition*, and that section is how you notice it — hiding it while you
+  look project by project would hide it exactly when it is the answer. A typed
+  query does search it, by workspace name and slug.
+* Arriving from a link clears a filter that would hide the row, the same way it
+  expands a folded `done`.
+
+**It does not persist across a pane restart.** Coming back to a board that
+silently hides most of its rows, for a reason given in a session that ended, is
+a worse failure than retyping four characters.
+
+Filtering hides rows; it does not stop them arriving. `[github] labels = []`
+polls every open issue in every repo, which is why 83 turned up at once — see
+"What each repo contributes" for narrowing that at the source.
 
 ### Repos the board is not watching
 
@@ -1011,16 +1061,19 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 358 tests (339 unit, 19 integration)
+cargo test                 # 441 tests (420 unit, 21 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
 ```
 
-The demo covers: populated, empty, source-down, syncd-dead, stale-binding and
-unadopted, including the `no route` row, the idle working row, both
+The demo covers: populated, empty, source-down, syncd-dead, stale-binding,
+unadopted and crowded, including the `no route` row, the idle working row, both
 confirmations and the outcome lines that follow them, the UNADOPTED section in
-all three shapes of missing config, and all four screens. `n` cycles scenarios, and
+all three shapes of missing config, and all four screens. `crowded` is the board
+filtering exists for — 109 rows that are not done over five routes, 83 of them
+from one repo — because reviewing `f` and `/` against ten rows reviews them
+where they are not needed. `n` cycles scenarios, and
 the mouse works exactly as it does on the real board — a demo that ignores
 clicks cannot be used to review the mouse.
 

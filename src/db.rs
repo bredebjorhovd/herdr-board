@@ -147,6 +147,14 @@ impl Db {
                 ("missing_ticks", "INTEGER NOT NULL DEFAULT 0"),
                 ("agent_status", "TEXT"),
                 ("dispatched_by", "TEXT"),
+                // The commit the attempt branched from. Without it, "did the
+                // agent produce anything" has to be measured against
+                // origin/HEAD, which counts the operator's own unpushed work
+                // as the agent's — see AGE-19.
+                ("base_sha", "TEXT"),
+                // Has this attempt ever been observed working? An agent that
+                // was never seen working cannot have finished.
+                ("saw_working", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )?;
         self.add_missing_columns(
@@ -415,7 +423,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by
+                    dispatched_by, base_sha, saw_working
              FROM attempts WHERE task_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -437,6 +445,8 @@ impl Db {
                     .get::<_, Option<String>>(11)?
                     .map(|s| AgentStatus::parse(&s)),
                 dispatched_by: r.get(12)?,
+                base_sha: r.get(13)?,
+                saw_working: r.get::<_, i64>(14)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -449,8 +459,8 @@ impl Db {
         let res = self.conn.execute(
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
-                dispatched_by, started_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                dispatched_by, started_at, base_sha)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -459,7 +469,8 @@ impl Db {
                 a.worktree,
                 a.branch,
                 a.dispatched_by,
-                now()
+                now(),
+                a.base_sha
             ],
         );
         match res {
@@ -497,6 +508,16 @@ impl Db {
         Ok(())
     }
 
+    /// Latch that this attempt has been seen working. Never cleared: it records
+    /// that the agent got going at all, not what it is doing now.
+    pub fn set_saw_working(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET saw_working = 1 WHERE id = ?1",
+            params![attempt_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_missing_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE attempts SET missing_ticks = ?2 WHERE id = ?1",
@@ -510,7 +531,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by
+                    dispatched_by, base_sha, saw_working
              FROM attempts WHERE outcome IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -530,6 +551,8 @@ impl Db {
                     .get::<_, Option<String>>(11)?
                     .map(|s| AgentStatus::parse(&s)),
                 dispatched_by: r.get(12)?,
+                base_sha: r.get(13)?,
+                saw_working: r.get::<_, i64>(14)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -674,6 +697,10 @@ pub struct NewAttempt {
     /// Parent task id when an agent released this task; `None` means the
     /// operator did.
     pub dispatched_by: Option<String>,
+    /// The commit the attempt's branch was cut from, so "what did the agent
+    /// produce" can be measured against the attempt's own starting point
+    /// rather than against the remote.
+    pub base_sha: Option<String>,
 }
 
 pub struct NewWriteback {
@@ -738,6 +765,7 @@ mod tests {
             worktree: None,
             branch: Some("board/lin-142".into()),
             dispatched_by: None,
+            base_sha: None,
         }
     }
 

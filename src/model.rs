@@ -423,6 +423,15 @@ pub struct Attempt {
     /// so rows appear in `working` that the operator never released — the board
     /// has to say who did.
     pub dispatched_by: Option<String>,
+    /// The commit this attempt's branch was cut from. Commits *after* it are
+    /// the agent's output; commits before it are the operator's own unpushed
+    /// work, which must not be mistaken for the agent having finished.
+    pub base_sha: Option<String>,
+    /// Whether herdr has ever reported this attempt's pane as `working`. An
+    /// agent that was never seen working cannot have finished, which is what
+    /// stops a freshly-started `idle` agent from being reaped before its
+    /// prompt has even been delivered.
+    pub saw_working: bool,
 }
 
 #[cfg(test)]

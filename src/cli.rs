@@ -1305,6 +1305,7 @@ mod tests {
                 worktree: None,
                 branch: None,
                 dispatched_by: by.map(str::to_string),
+            base_sha: None,
             })
             .unwrap();
         db.close_attempt(a, outcome).unwrap();
@@ -1364,6 +1365,7 @@ mod tests {
             worktree: None,
             branch: None,
             dispatched_by: None,
+            base_sha: None,
         })
         .unwrap();
 

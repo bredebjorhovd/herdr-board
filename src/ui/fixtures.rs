@@ -74,6 +74,9 @@ fn attempt_by(
         missing_ticks: 0,
         agent_status: None,
         dispatched_by: dispatched_by.map(str::to_string),
+        base_sha: Some("0000000000000000000000000000000000000000".into()),
+        // Fixtures depict agents that have been running, not just-started ones.
+        saw_working: true,
     }
 }
 

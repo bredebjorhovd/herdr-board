@@ -400,10 +400,17 @@ impl SyncEngine {
                 .iter()
                 .filter_map(|a| a.branch.clone())
                 .collect();
-            let Some(pr) = pulls
-                .iter()
-                .find(|p| branches.iter().any(|b| pr_matches_branch(p, b)))
-            else {
+            // A GitHub task owns a repo, and only that repo's pull requests can
+            // be its own. Branch names are not unique across repos — `gh#2` in
+            // two repos both branch to `board/gh-2` — so matching on the branch
+            // alone attached another repo's merged PR to this task and derived
+            // it straight to review (AGE-20). Linear identifiers are globally
+            // unique, so Linear rows need no such scoping.
+            let own_repo = split_gh_task_id(&task.id).map(|(repo, _)| repo);
+            let Some(pr) = pulls.iter().find(|p| {
+                own_repo.as_ref().is_none_or(|r| &p.repo == r)
+                    && branches.iter().any(|b| pr_matches_branch(p, b))
+            }) else {
                 continue;
             };
             self.db
@@ -459,15 +466,40 @@ impl SyncEngine {
     /// coming leaves the row `working` forever. Counting commits against the
     /// repo's default branch is the local equivalent of "explicit done
     /// detection".
-    fn attempt_has_commits(&self, worktree: Option<&str>) -> bool {
+    pub(crate) fn attempt_has_commits(
+        &self,
+        worktree: Option<&str>,
+        base_sha: Option<&str>,
+    ) -> bool {
         let Some(worktree) = worktree else {
             return false;
         };
         if !std::path::Path::new(worktree).exists() {
             return false;
         }
-        // `@{-1}` and friends are unreliable here; ask git for the branch the
-        // worktree was cut from via its merge base with the default branch.
+        // The attempt's own starting commit is the only correct base. Anything
+        // else measures the operator's unpushed work as the agent's: a repo
+        // whose default branch is one commit ahead of its remote made every
+        // dispatch look finished the instant it started (AGE-19).
+        if let Some(sha) = base_sha {
+            let out = Command::new("git")
+                .args(["-C", worktree, "rev-list", "--count", &format!("{sha}..HEAD")])
+                .output();
+            if let Ok(o) = out
+                && o.status.success()
+                && let Ok(n) = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+            {
+                return n > 0;
+            }
+            // The recorded base is gone (worktree rebuilt, history rewritten).
+            // Fall through rather than guess — but the fallback below is the
+            // very thing that was wrong, so say so.
+            self.log.info(format!(
+                "base {sha} unusable in {worktree}; falling back to remote-relative count"
+            ));
+        }
+        // Attempts dispatched before base_sha existed have no starting point
+        // recorded, so they keep the old, weaker measurement.
         let base = Command::new("git")
             .args(["-C", worktree, "rev-parse", "--abbrev-ref", "origin/HEAD"])
             .output()
@@ -583,6 +615,11 @@ impl SyncEngine {
                     // Persist it so the TUI can render the dim `idle` marker
                     // without shelling out to herdr on its own tick.
                     self.db.set_attempt_status(attempt.id, status)?;
+                    // Latch that the agent actually got going, so a settled
+                    // status can be told apart from one that never started.
+                    if status == AgentStatus::Working && !attempt.saw_working {
+                        self.db.set_saw_working(attempt.id)?;
+                    }
                     // An agent that has settled *and* produced a PR is the only
                     // explicit done detection we have. Without a PR the attempt
                     // stays live and the row renders a dim `idle` marker.
@@ -595,9 +632,24 @@ impl SyncEngine {
                         // commits on the attempt branch are evidence too — and
                         // an agent that commits locally and stops would
                         // otherwise sit `working` forever.
+                        //
+                        // Commits alone only count once the agent has been seen
+                        // working. A just-started Claude reports `idle` because
+                        // it has not been handed its prompt yet — several
+                        // seconds pass between `agent start` and `agent prompt`
+                        // — and reaping it there ends the attempt before it
+                        // begins. A PR needs no such guard: it cannot exist
+                        // unless something ran.
                         let why = if task.pr_open {
                             Some("PR")
-                        } else if self.attempt_has_commits(attempt.worktree.as_deref()) {
+                        } else if !attempt.saw_working {
+                            None
+                        } else if self
+                            .attempt_has_commits(
+                                attempt.worktree.as_deref(),
+                                attempt.base_sha.as_deref(),
+                            )
+                        {
                             Some("commits")
                         } else {
                             None
@@ -1234,6 +1286,7 @@ mod tests {
                 worktree: None,
                 branch: Some("board/lin-142".into()),
                 dispatched_by: None,
+                base_sha: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, pane_id).unwrap();
@@ -1364,6 +1417,35 @@ mod tests {
         assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
         // The unrelated task must not pick up the PR.
         assert!(!e.db.get_task("linear:LIN-999").unwrap().unwrap().pr_open);
+    }
+
+    #[test]
+    fn a_pull_request_never_crosses_into_another_repo() {
+        // AGE-20, seen live: gh#2 exists in two repos, both branch to
+        // `board/gh-2`, and OIOS's *merged* PR attached itself to tripletex's
+        // task — deriving it to review with no work done and sending `o` to the
+        // wrong repo entirely.
+        let e = engine(None);
+        seed(&e, "gh:Florin-AS/tripletex-mcp#2", "gh#2", UpstreamState::Started);
+        dispatch(&e, "gh:Florin-AS/tripletex-mcp#2", "w1:p9");
+
+        e.link_pull_requests(&[PullRequest {
+            repo: "bredebjorhovd/OIOS".into(),
+            number: 10,
+            title: "Row-capture sweeps".into(),
+            body: None,
+            url: "https://github.com/bredebjorhovd/OIOS/pull/10".into(),
+            head_ref: "board/gh-2".into(),
+            open: false,
+            merged: true,
+            draft: false,
+            updated_at: crate::db::now(),
+        }])
+        .unwrap();
+
+        let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
+        assert_eq!(t.pr_url, None, "another repo's PR is not this task's PR");
+        assert!(!t.pr_merged, "and must not mark it finished");
     }
 
     #[test]
@@ -1932,5 +2014,103 @@ mod tests {
         .unwrap();
         let t = e.db.get_task("gh:owner/repo#87").unwrap().unwrap();
         assert_eq!(route_context(&t).gh_repo.as_deref(), Some("owner/repo"));
+    }
+
+    /// A repo whose default branch is ahead of its remote, which is what made
+    /// every dispatch into tripletex-mcp complete instantly (AGE-19).
+    ///
+    /// Builds a real repo with an "origin" it is one commit ahead of, then asks
+    /// the same question two ways: against the remote, and against the commit
+    /// the attempt actually started from.
+    fn repo_ahead_of_its_remote() -> std::path::PathBuf {
+        use std::process::Command;
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hb-ahead-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let remote = root.join("remote.git");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("a"), "1").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(&work, &["push", "-u", "origin", "main"]);
+        // The operator's own unpushed commit — the whole point.
+        std::fs::write(work.join("b"), "2").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "operator's unpushed work"]);
+        work
+    }
+
+    #[test]
+    fn an_operators_unpushed_commit_is_not_the_agents_output() {
+        let work = repo_ahead_of_its_remote();
+        let e = engine(None);
+        let wt = work.to_string_lossy().into_owned();
+
+        // Where a dispatch would start from: the repo's HEAD right now.
+        let base = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &wt, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        assert!(
+            !e.attempt_has_commits(Some(&wt), Some(&base)),
+            "an agent that has committed nothing since it started must not look finished"
+        );
+
+        // And it still notices real work.
+        std::fs::write(work.join("c"), "3").unwrap();
+        for args in [
+            ["-C", &wt, "add", "."].as_slice(),
+            ["-C", &wt, "commit", "-m", "the agent's work"].as_slice(),
+        ] {
+            std::process::Command::new("git").args(args).output().unwrap();
+        }
+        assert!(
+            e.attempt_has_commits(Some(&wt), Some(&base)),
+            "a commit made after the attempt started is the agent's output"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn without_a_base_the_old_remote_relative_count_is_what_misfires() {
+        // Pins the reason base_sha exists: the fallback path reports "the agent
+        // produced something" for a repo where nothing has been dispatched at
+        // all. Attempts predating the column keep this weaker behaviour, so it
+        // is documented rather than fixed.
+        let work = repo_ahead_of_its_remote();
+        let e = engine(None);
+        assert!(
+            e.attempt_has_commits(Some(&work.to_string_lossy()), None),
+            "the remote-relative count is fooled by unpushed work — this is the bug"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 }

@@ -282,6 +282,7 @@ fn a_full_lifecycle_runs_through_the_cycle() {
             worktree: None,
             branch: Some("board/off-145".into()),
             dispatched_by: None,
+            base_sha: None,
         })
         .unwrap();
     e.db.set_attempt_pane(attempt, "w1:p7").unwrap();
@@ -350,6 +351,7 @@ fn an_orphaned_pane_needs_two_ticks_and_then_reads_as_failed() {
             worktree: None,
             branch: Some("board/off-145".into()),
             dispatched_by: None,
+            base_sha: None,
         })
         .unwrap();
     e.db.set_attempt_pane(a, "w1:p7").unwrap();
@@ -392,6 +394,7 @@ fn a_cancelled_attempt_returns_the_row_to_ready() {
             worktree: None,
             branch: Some("board/off-138".into()),
             dispatched_by: None,
+            base_sha: None,
         })
         .unwrap();
     e.db.close_attempt(a, Outcome::Cancelled).unwrap();

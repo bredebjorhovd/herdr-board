@@ -10,6 +10,16 @@ use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// The repo's current HEAD, which is what a new worktree branches from.
+fn head_sha(repo: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !sha.is_empty()).then_some(sha)
+}
+
 /// Per-dispatch choices the picker can override.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
@@ -209,6 +219,21 @@ pub fn dispatch(
         );
     }
 
+    // Where the agent starts from. herdr cuts the worktree from the repo's
+    // current HEAD, so reading it here — before the branch exists — records the
+    // attempt's true starting point. Without this, "has the agent produced
+    // anything" gets measured against the remote, and a repo sitting one commit
+    // ahead of its origin looks finished before the prompt is even sent.
+    let base_sha = head_sha(&p.repo);
+    if base_sha.is_none() {
+        log.info(format!(
+            "{}: could not read HEAD of {} — completion will fall back to a \
+             remote-relative commit count",
+            p.identifier,
+            p.repo.display()
+        ));
+    }
+
     // The duplicate-dispatch guard. A second concurrent dispatch fails here,
     // before a worktree or pane exists.
     let attempt_id = engine.db.insert_attempt(&NewAttempt {
@@ -219,6 +244,7 @@ pub fn dispatch(
         worktree: Some(p.worktree.to_string_lossy().into_owned()),
         branch: Some(p.branch.clone()),
         dispatched_by: p.dispatched_by.clone(),
+        base_sha,
     })?;
 
     let result = (|| -> Result<String> {
@@ -569,6 +595,7 @@ branch_template = "board/{identifier_lower}"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                base_sha: None,
             })
             .unwrap();
         db.set_attempt_pane(a, pane).unwrap();
@@ -603,6 +630,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-138".into()),
+            base_sha: None,
         })
         .unwrap();
         let engine = engine_with(db);
@@ -635,6 +663,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-138".into()),
+            base_sha: None,
         })
         .unwrap();
         let engine = engine_with(db);
@@ -656,6 +685,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: None,
+            base_sha: None,
         })
         .unwrap();
         let engine = engine_with(db);
@@ -678,6 +708,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-999".into()),
+            base_sha: None,
         })
         .unwrap();
         let engine = engine_with(db);
@@ -888,6 +919,7 @@ runtime = "claude-code"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                base_sha: None,
             })
             .unwrap();
         }
@@ -910,6 +942,7 @@ runtime = "claude-code"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                base_sha: None,
             })
             .unwrap();
         db.close_attempt(a, Outcome::Cancelled).unwrap();

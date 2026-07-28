@@ -230,6 +230,8 @@ mod tests {
             missing_ticks: 0,
             agent_status: None,
             dispatched_by: by.map(str::to_string),
+            base_sha: None,
+            saw_working: true,
         }
     }
 

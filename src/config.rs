@@ -180,7 +180,7 @@ pub fn github_token(paths: &Paths) -> Option<String> {
     Credentials::load(paths).github_token
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -190,6 +190,28 @@ pub struct RoutingConfig {
     pub defaults: Defaults,
     #[serde(default)]
     pub github: GithubConfig,
+    #[serde(default)]
+    pub adopt: AdoptConfig,
+}
+
+/// What the board offers to adopt, and what it has been told to stop offering.
+///
+/// Only an exclusion list: adoption itself writes ordinary `[[route]]` and
+/// `[github] repos` entries, because those are the config that already exists.
+/// Ignoring has nowhere else to live — "I am only reading this repo" is not a
+/// fact any other key can carry.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdoptConfig {
+    /// `owner/repo` entries the board will never offer again. Delete a line to
+    /// be offered it once more.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl AdoptConfig {
+    pub fn ignores(&self, slug: &str) -> bool {
+        self.ignore.iter().any(|i| i.eq_ignore_ascii_case(slug))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -390,7 +412,10 @@ pub struct RouteMatch {
 }
 
 impl RouteMatch {
-    fn is_empty(&self) -> bool {
+    /// A route with no `match` matches everything, so it must come last —
+    /// [`RoutingConfig::validate`] refuses a config where one does not, and the
+    /// adoption writer inserts ahead of it rather than after.
+    pub fn is_empty(&self) -> bool {
         self.linear_team.is_none()
             && self.linear_project.is_none()
             && self.gh_repo.is_none()
@@ -454,12 +479,7 @@ impl RoutingConfig {
     /// Load if present; an absent file is not an error (the board renders with
     /// every row marked `no route`, which is the honest empty state).
     pub fn load_or_default(path: &Path) -> RoutingConfig {
-        RoutingConfig::load(path).unwrap_or_else(|_| RoutingConfig {
-            sync: SyncConfig::default(),
-            routes: Vec::new(),
-            defaults: Defaults::default(),
-            github: GithubConfig::default(),
-        })
+        RoutingConfig::load(path).unwrap_or_default()
     }
 
     fn validate(&self) -> Result<()> {

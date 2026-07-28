@@ -76,6 +76,15 @@ command = ["./target/release/herdr-board", "open-link"]
 on = "pane.exited"
 command = ["./target/release/herdr-board", "sync", "--once"]
 
+# Opening a pane in a repo the board has never seen is the moment its issues
+# should start being polled — but nothing here depends on the event arriving:
+# the sync loop enumerates workspaces on every cycle and finds the same repos on
+# its own. `reconcile` rather than `sync --once` because this fires on every
+# split, and polling Linear and GitHub each time would be absurd.
+[[events]]
+on = "pane.created"
+command = ["./target/release/herdr-board", "reconcile"]
+
 # An agent becomes blocked when it asks a question and unblocked the moment it
 # is answered — both are input, so both are observable immediately. `reconcile`
 # rather than `sync --once` deliberately: this fires on every status change of

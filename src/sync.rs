@@ -113,8 +113,23 @@ impl SyncEngine {
             self.log.warn(format!("disposing finished panes: {e}"));
         }
         self.drain_writebacks();
+        // A repo with a herdr workspace and no board config is silent — its
+        // issues are never polled, and until this ran nothing said so. Detection
+        // is automatic; adoption is not (AGE-18).
+        if let Some(h) = herdr {
+            self.detect_unadopted(h);
+        }
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(())
+    }
+
+    /// Refresh the UNADOPTED section's contents.
+    ///
+    /// One `workspace list` plus a `git remote` per checkout — cheap enough to
+    /// ride every cycle, and the reason the `pane.created` hook can be an
+    /// optimization rather than a dependency.
+    pub fn detect_unadopted(&self, herdr: &Herdr) -> Vec<crate::adopt::Unadopted> {
+        crate::adopt::refresh(&self.db, &self.cfg, herdr, &self.log)
     }
 
     // ---- polling --------------------------------------------------------
@@ -1174,10 +1189,8 @@ mod tests {
         SyncEngine {
             db: Db::open_in_memory().unwrap(),
             cfg: RoutingConfig {
-                sync: Default::default(),
-                routes: vec![],
                 defaults: Defaults::default(),
-                github: Default::default(),
+                ..Default::default()
             },
             credentials: Default::default(),
             paths: Paths {

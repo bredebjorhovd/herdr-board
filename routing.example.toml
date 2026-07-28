@@ -65,3 +65,11 @@ pull_requests = true
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
 writeback = false
+
+# The board lists git repos that have a herdr workspace but no config here, in
+# an UNADOPTED section: `a` writes the route and the [github] repos entry, `X`
+# adds the repo below. Ignoring is needed because you open a pane in plenty of
+# repos you are only reading — another org's, a dependency, something you
+# cloned to look at. Delete a line to be offered that repo again.
+[adopt]
+ignore = []

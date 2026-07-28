@@ -110,6 +110,9 @@ workspace **label** — check yours with `herdr workspace list`.
 A task with no matching route still appears on the board, marked `no route`, and
 `enter` refuses it rather than guessing.
 
+You do not have to re-run `init` when you start work in a new repo — the board
+notices by itself. See "Repos the board is not watching".
+
 ### 4. Check it
 
 ```bash
@@ -267,6 +270,8 @@ waiting: telling you to go poke a finished agent would be worse than silence.
 | `d` | failed row | mark done on the board |
 | `m` | review with a PR | merge the pull request — confirms first |
 | `x` | working, blocked | cancel — confirms, then kills the pane |
+| `a` | unadopted repo | adopt — write its route and start polling it |
+| `X` | unadopted repo | ignore — stop offering it |
 | `s` | anywhere | sync now |
 | `t` | anywhere | throughput — is any of this working |
 | `?` | anywhere | help |
@@ -312,6 +317,95 @@ it cannot drift. Cancelling ends the attempt, not the issue: the row returns to
 also lands in `done` — see "Tasks that vanish upstream" — and says `gone
 upstream` where the others show a workspace, so the two reasons for being there
 stay distinguishable.
+
+### Repos the board is not watching
+
+Starting work in a new repo used to leave the board silent: its issues were not
+polled, and nothing said so. An open bug in `Florin-AS/tripletex-mcp` sat
+invisible for exactly this reason — the repo was in neither `[github] repos` nor
+any `[[route]]`.
+
+Those two are independent, which is what makes it easy to half-fix.
+`[github] repos` controls **visibility**; the route controls
+**dispatchability**. Miss the route and the row appears but `enter` refuses it;
+miss the repos entry and the issue never arrives at all.
+
+So the board detects automatically and adopts explicitly. Every git repo that
+has a herdr workspace but no board config gets a row in an `UNADOPTED` section,
+below the queue:
+
+```
+⌾ UNADOPTED  not polled, not dispatchable  ─────────────────────────────
+⌾ tripletex-mcp                              Florin-AS/tripletex-mcp
+⌾ brreg-client                    Florin-AS/brreg-client · no route
+```
+
+- `a` writes what is missing: a `[[route]]` matching the repo, and the
+  `[github] repos` entry.
+- `X` adds it to `[adopt] ignore`, so it stops being offered. You need this —
+  you open a pane in plenty of repos you are only reading. Delete the line to be
+  offered it again.
+
+Adoption is **not** silent, and that is deliberate: `routing.toml` is
+hand-edited and documented as a starting point rather than managed config, and a
+pane gets opened in a great many repos that do not belong on the board.
+
+Two things about `a` worth knowing:
+
+**Order is load-bearing.** A catch-all must come last, or it shadows everything
+after it. A naive append would land *after* it, never fire, and say nothing —
+which is the failure mode this feature exists to remove. So the writer inserts
+ahead of whatever route is currently last, and `doctor` still refuses a config
+where a `match`-less catch-all precedes a route.
+
+Ahead of the *last route* rather than ahead of the empty `match` specifically,
+because the catch-alls people actually write are usually a team-wide
+`match = { linear_team = "AGE" }` — which validation cannot recognise as one,
+and which the section above tells you to keep last. Going in one place earlier
+respects both, and costs nothing where routes are disjoint: order only matters
+where matches overlap, and a route naming one repo is the more specific of any
+pair it overlaps with.
+
+Everything written is re-parsed and re-validated before it replaces the file; if
+it would not have validated, `routing.toml` is left untouched and the footer
+says so. The previous contents are kept as `routing.toml.bak` either way.
+
+**One thing cannot be derived.** `[sync] labels` wants a Linear label, and a git
+remote cannot tell you one. So adoption writes the label route *commented out*,
+suggesting the repo name and saying it is a guess, rather than inventing config
+that looks decided:
+
+```toml
+# Adopted from the board's UNADOPTED section.
+#
+# A Linear issue carries no repo, so nothing below routes one here.
+# `tripletex-mcp` is a *guess* at the label you would use — a git remote cannot
+# name one. Uncomment and edit to use it. Issues assigned to you arrive
+# whatever their labels, so the gap is only unassigned ones.
+#
+# [[route]]
+# match = { label = "tripletex-mcp" }
+# ...
+[[route]]
+match = { gh_repo = "Florin-AS/tripletex-mcp" }
+workspace = "tripletex-mcp"
+repo = "~/code/tripletex-mcp"
+runtime = "claude-code"
+```
+
+A repo covered only by a catch-all still counts as unadopted. `enter` would
+work, and would start an agent in the catch-all's checkout rather than this
+repo's — dispatching into the wrong workspace is a worse silence than the one
+being fixed.
+
+Detection rides the sync cycle: one `herdr workspace list` plus a `git remote`
+per checkout. The `pane.created` hook makes it immediate, and is an
+optimization, never a dependency — the poll loop finds the same repos on its own
+if the event never arrives. `doctor` reports the same list.
+
+```bash
+herdr-board demo unadopted    # what the section looks like
+```
 
 ## How it fits together
 
@@ -695,6 +789,15 @@ resolved here rather than guessed at repeatedly.
   the daemon keeps cycling on time while the sources go stale, so the header
   shows a live daemon and `last synced 4m`. Conflating them would report a dead
   daemon every time Linear hiccuped.
+- **Unadopted repos are detected automatically and adopted explicitly.** A repo
+  with a herdr workspace and no board config is silent, and a board that cannot
+  say "this repo is not being watched" is wrong about the one thing it exists
+  for. But `routing.toml` is hand-edited and documented as a starting point, and
+  a pane gets opened in a great many repos that do not belong on the board —
+  another org's, a dependency, something cloned to read — so writing to it on
+  detection would be worse than the silence. Hence a section and two keys. The
+  ignore list exists for the same reason: without it the section never empties
+  and stops being read.
 - **The board draws no vertical rules at all.** The design handoff flagged
   unbroken vertical rules as an open risk that the HTML prototype could not
   settle. The preferred resolution there was to draw none — herdr already owns
@@ -705,15 +808,16 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 272 tests (258 unit, 14 integration)
+cargo test                 # 339 tests (321 unit, 18 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
 ```
 
-The demo covers: populated, empty, source-down, syncd-dead and stale-binding,
-including the `no route` row, the idle working row, both confirmations and the
-outcome lines that follow them, and all four screens. `n` cycles scenarios, and
+The demo covers: populated, empty, source-down, syncd-dead, stale-binding and
+unadopted, including the `no route` row, the idle working row, both
+confirmations and the outcome lines that follow them, the UNADOPTED section in
+all three shapes of missing config, and all four screens. `n` cycles scenarios, and
 the mouse works exactly as it does on the real board — a demo that ignores
 clicks cannot be used to review the mouse.
 

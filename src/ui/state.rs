@@ -190,21 +190,47 @@ pub fn section_row_id(state: BoardState) -> String {
 /// default.
 pub const DONE_ROW: &str = "\u{0}section:done";
 
+/// Selection id for the UNADOPTED header. Not a [`BoardState`]: a repo the
+/// board is not watching is not a state a task can be in.
+pub const UNADOPTED_ROW: &str = "\u{0}section:unadopted";
+
 /// A row on screen, for rendering and for mouse hit-testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
     /// A section header — selectable, and folds its section on `enter`.
     Section(BoardState),
     Task(String),
+    /// The UNADOPTED header, which folds like any other.
+    UnadoptedSection,
+    /// One repo with a herdr workspace and no board config, by slug.
+    Unadopted(String),
+}
+
+impl Row {
+    /// The selection id this row answers to.
+    pub fn id(&self) -> String {
+        match self {
+            Row::Section(s) => section_row_id(*s),
+            Row::Task(id) => id.clone(),
+            Row::UnadoptedSection => UNADOPTED_ROW.to_string(),
+            Row::Unadopted(slug) => crate::adopt::row_id(slug),
+        }
+    }
 }
 
 pub struct App {
     pub views: Vec<TaskView>,
+    /// Repos with a herdr workspace and no board config. Not tasks: they are
+    /// the reason there are no tasks for those repos.
+    pub unadopted: Vec<crate::adopt::Unadopted>,
     pub selected_id: Option<String>,
     pub screen: Screen,
     /// Sections the operator has folded away. `done` starts folded: it is
     /// history, and the rest is the queue.
     pub collapsed: std::collections::HashSet<BoardState>,
+    /// UNADOPTED starts **open**. It is a notice, and the whole point of it is
+    /// that a silent repo stops being silent.
+    pub collapsed_unadopted: bool,
     pub sync: SyncStatus,
     /// Footer flash for `o` / `g` / `s` and post-dispatch acknowledgements.
     pub message: Option<(String, Instant)>,
@@ -235,9 +261,11 @@ impl App {
     pub fn new(views: Vec<TaskView>, sync: SyncStatus, config_path: String) -> App {
         let mut app = App {
             views,
+            unadopted: Vec::new(),
             selected_id: None,
             screen: Screen::List,
             collapsed: std::collections::HashSet::from([BoardState::Done]),
+            collapsed_unadopted: false,
             sync,
             message: None,
             confirm: None,
@@ -250,7 +278,9 @@ impl App {
             stats: None,
             scroll: 0,
         };
-        app.selected_id = app.first_task().or_else(|| app.visible_task_ids().first().cloned());
+        app.selected_id = app
+            .first_actionable()
+            .or_else(|| app.visible_task_ids().first().cloned());
         app
     }
 
@@ -278,19 +308,45 @@ impl App {
             .collect()
     }
 
-    /// The rows a cursor can land on, in display order.
-    pub fn visible_task_ids(&self) -> Vec<String> {
+    /// Every row the body draws, in display order.
+    ///
+    /// UNADOPTED comes last, below `done`. It is setup, not queue: a blocked
+    /// agent is burning wall-clock right now and a repo that is not being polled
+    /// has been quietly not being polled for days, so pushing the queue down for
+    /// it would be the wrong trade every time.
+    pub fn rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for (state, rows) in self.sections() {
             // The header is a row either way: folded it is the only way to open
             // the section, unfolded the only way to close it again.
-            out.push(section_row_id(state));
+            out.push(Row::Section(state));
             if self.is_collapsed(state) {
                 continue;
             }
-            out.extend(rows.iter().map(|v| v.id().to_string()));
+            out.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
+        }
+        if !self.unadopted.is_empty() {
+            out.push(Row::UnadoptedSection);
+            if !self.collapsed_unadopted {
+                out.extend(self.unadopted.iter().map(|u| Row::Unadopted(u.slug.clone())));
+            }
         }
         out
+    }
+
+    /// The rows a cursor can land on, in display order.
+    pub fn visible_task_ids(&self) -> Vec<String> {
+        self.rows().iter().map(Row::id).collect()
+    }
+
+    /// The unadopted repo the cursor is on, if any.
+    pub fn unadopted_selected(&self) -> Option<&crate::adopt::Unadopted> {
+        let id = self.selected_id.as_deref()?;
+        self.unadopted.iter().find(|u| u.row_id() == id)
+    }
+
+    pub fn on_unadopted_header(&self) -> bool {
+        self.selected_id.as_deref() == Some(UNADOPTED_ROW)
     }
 
     /// The first row that is an actual task, for landing the cursor somewhere
@@ -299,6 +355,18 @@ impl App {
         self.visible_task_ids()
             .into_iter()
             .find(|id| self.views.iter().any(|v| v.id() == id))
+    }
+
+    /// The first row worth landing on. A board with no tasks and an unadopted
+    /// repo on it is the exact case this feature exists for, and leaving the
+    /// cursor on a header there would put `a` one keypress further away.
+    pub fn first_actionable(&self) -> Option<String> {
+        self.first_task().or_else(|| {
+            self.rows().into_iter().find_map(|r| match r {
+                Row::Unadopted(slug) => Some(crate::adopt::row_id(&slug)),
+                _ => None,
+            })
+        })
     }
 
     /// The section header the cursor is on, if any.
@@ -354,8 +422,14 @@ impl App {
     ///
     /// Selection persists **by task id, not row index** — a poll landing while
     /// the operator is on a row must not move them.
-    pub fn refresh(&mut self, views: Vec<TaskView>, sync: SyncStatus) {
+    pub fn refresh(
+        &mut self,
+        views: Vec<TaskView>,
+        sync: SyncStatus,
+        unadopted: Vec<crate::adopt::Unadopted>,
+    ) {
         self.views = views;
+        self.unadopted = unadopted;
         self.sync = sync;
         let ids = self.visible_task_ids();
         let keep = self
@@ -365,7 +439,7 @@ impl App {
         if !keep {
             // The selected task left the board; fall back to the first task
             // rather than to nothing — or to a header, which is not actionable.
-            self.selected_id = self.first_task().or_else(|| ids.first().cloned());
+            self.selected_id = self.first_actionable().or_else(|| ids.first().cloned());
         }
     }
 
@@ -647,6 +721,7 @@ mod tests {
                 view("a", BoardState::Ready),
             ],
             sync(),
+            Vec::new(),
         );
         assert_eq!(a.selected_id.as_deref(), Some("a"));
     }
@@ -655,8 +730,96 @@ mod tests {
     fn selection_falls_back_when_its_task_leaves_the_board() {
         let mut a = app();
         a.selected_id = Some("a".into());
-        a.refresh(vec![view("b", BoardState::Working)], sync());
+        a.refresh(vec![view("b", BoardState::Working)], sync(), Vec::new());
         assert_eq!(a.selected_id.as_deref(), Some("b"));
+    }
+
+    fn unadopted(slug: &str) -> crate::adopt::Unadopted {
+        crate::adopt::Unadopted {
+            label: slug.rsplit('/').next().unwrap().into(),
+            slug: slug.into(),
+            repo_root: format!("/code/{slug}"),
+            missing: crate::adopt::Missing::Both,
+        }
+    }
+
+    #[test]
+    fn unadopted_repos_sit_below_the_queue_not_above_it() {
+        // A blocked agent is burning wall-clock right now; a repo that is not
+        // being polled has been quietly not being polled for days. Pushing the
+        // queue down for it would be the wrong trade every time.
+        let mut a = app();
+        a.unadopted = vec![unadopted("o/thing")];
+        let rows = a.rows();
+        assert_eq!(rows[0], Row::Section(BoardState::Blocked));
+        assert_eq!(
+            &rows[rows.len() - 2..],
+            &[Row::UnadoptedSection, Row::Unadopted("o/thing".into())]
+        );
+    }
+
+    #[test]
+    fn the_section_is_absent_entirely_when_there_is_nothing_to_adopt() {
+        let a = app();
+        assert!(!a.rows().contains(&Row::UnadoptedSection));
+        assert!(!a.visible_task_ids().iter().any(|i| i == UNADOPTED_ROW));
+    }
+
+    #[test]
+    fn an_unadopted_row_is_selectable_but_is_not_a_task() {
+        let mut a = app();
+        a.unadopted = vec![unadopted("o/thing")];
+        a.selected_id = Some(crate::adopt::row_id("o/thing"));
+        assert_eq!(a.unadopted_selected().map(|u| u.slug.as_str()), Some("o/thing"));
+        // ...and every key that acts on a task finds nothing here.
+        assert!(a.selected().is_none());
+        assert!(a.on_section_header().is_none());
+        assert!(!a.on_unadopted_header());
+    }
+
+    #[test]
+    fn row_ids_can_never_collide_with_a_task_id() {
+        // Both headers and repo rows live in the same selection space as tasks.
+        let ids = [
+            section_row_id(BoardState::Ready),
+            UNADOPTED_ROW.to_string(),
+            crate::adopt::row_id("o/thing"),
+        ];
+        for id in &ids {
+            assert!(id.starts_with('\u{0}'), "{id:?} could collide with a task");
+        }
+    }
+
+    #[test]
+    fn the_section_folds_and_its_header_survives_folding() {
+        let mut a = app();
+        a.unadopted = vec![unadopted("o/a"), unadopted("o/b")];
+        // Open by default: the whole point is that a silent repo stops being
+        // silent, and a folded notice is one nobody reads.
+        assert!(!a.collapsed_unadopted);
+        assert_eq!(a.rows().iter().filter(|r| matches!(r, Row::Unadopted(_))).count(), 2);
+
+        a.collapsed_unadopted = true;
+        assert_eq!(a.rows().iter().filter(|r| matches!(r, Row::Unadopted(_))).count(), 0);
+        assert!(a.rows().contains(&Row::UnadoptedSection), "no way back in");
+    }
+
+    #[test]
+    fn a_board_with_nothing_but_unadopted_repos_lands_the_cursor_on_one() {
+        // This is the state AGE-18 exists for. Landing on the header would put
+        // `a` one keypress further away for no reason.
+        let mut a = App::new(Vec::new(), sync(), "/cfg".into());
+        a.refresh(Vec::new(), sync(), vec![unadopted("o/thing")]);
+        assert_eq!(a.selected_id, Some(crate::adopt::row_id("o/thing")));
+    }
+
+    #[test]
+    fn adopting_the_last_repo_moves_the_cursor_off_a_row_that_no_longer_exists() {
+        let mut a = app();
+        a.unadopted = vec![unadopted("o/thing")];
+        a.selected_id = Some(crate::adopt::row_id("o/thing"));
+        a.refresh(a.views.clone(), sync(), Vec::new());
+        assert_eq!(a.selected_id.as_deref(), Some("d"), "back onto a task");
     }
 
     #[test]

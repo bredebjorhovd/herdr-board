@@ -11,9 +11,20 @@ pub const EMPTY: &str = "empty";
 pub const LINEAR_DOWN: &str = "linear-down";
 pub const SYNCD_DEAD: &str = "syncd-dead";
 pub const STALE_BINDING: &str = "stale-binding";
+/// A board with nothing on it *because* nobody adopted the repo — the state
+/// AGE-18 exists for, and the one where the empty copy and the UNADOPTED
+/// section have to share a body.
+pub const UNADOPTED: &str = "unadopted";
 
 /// Every scenario, for `demo --list` and for the render tests.
-pub const ALL: &[&str] = &[POPULATED, EMPTY, LINEAR_DOWN, SYNCD_DEAD, STALE_BINDING];
+pub const ALL: &[&str] = &[
+    POPULATED,
+    EMPTY,
+    LINEAR_DOWN,
+    SYNCD_DEAD,
+    STALE_BINDING,
+    UNADOPTED,
+];
 
 const CONFIG_PATH: &str = "~/.config/herdr/plugins/config/board/routing.toml";
 
@@ -191,7 +202,40 @@ fn sync_ok() -> SyncStatus {
     }
 }
 
+/// Repos with a herdr workspace and no board config, in all three shapes:
+/// nothing written at all, and each half of the half-fix.
+fn unadopted_repos() -> Vec<crate::adopt::Unadopted> {
+    use crate::adopt::{Missing, Unadopted};
+    vec![
+        Unadopted {
+            label: "tripletex-mcp".into(),
+            slug: "Florin-AS/tripletex-mcp".into(),
+            repo_root: "/Users/b/code/tripletex-mcp".into(),
+            missing: Missing::Both,
+        },
+        Unadopted {
+            label: "brreg-client".into(),
+            slug: "Florin-AS/brreg-client".into(),
+            repo_root: "/Users/b/code/brreg-client".into(),
+            missing: Missing::Route,
+        },
+        Unadopted {
+            label: "altinn-forms".into(),
+            slug: "Florin-AS/altinn-forms".into(),
+            repo_root: "/Users/b/code/altinn-forms".into(),
+            missing: Missing::Polling,
+        },
+    ]
+}
+
 pub fn app(scenario: &str) -> App {
+    if scenario == UNADOPTED {
+        // No tasks at all: nothing is polling these repos, which is the point.
+        let mut app = App::new(Vec::new(), sync_ok(), CONFIG_PATH.to_string());
+        app.unadopted = unadopted_repos();
+        app.selected_id = app.first_actionable();
+        return app;
+    }
     let (views, sync) = match scenario {
         EMPTY => (Vec::new(), sync_ok()),
         LINEAR_DOWN => (
@@ -225,7 +269,13 @@ pub fn app(scenario: &str) -> App {
         }
         _ => (populated_views(), sync_ok()),
     };
-    App::new(views, sync, CONFIG_PATH.to_string())
+    let mut app = App::new(views, sync, CONFIG_PATH.to_string());
+    // The populated board carries one too: a repo going unnoticed while other
+    // work is in flight is how it actually happens.
+    if scenario != EMPTY {
+        app.unadopted = unadopted_repos()[..1].to_vec();
+    }
+    app
 }
 
 #[cfg(test)]
@@ -259,10 +309,33 @@ mod tests {
         for s in ALL {
             let a = app(s);
             assert_eq!(a.screen, Screen::List);
-            if *s != EMPTY {
+            // `empty` has nothing at all by design, and `unadopted` has no
+            // tasks precisely because nothing is polling the repo yet.
+            if !matches!(*s, EMPTY | UNADOPTED) {
                 assert!(!a.views.is_empty(), "{s} has no rows");
             }
+            assert!(
+                !a.rows().is_empty() || *s == EMPTY,
+                "{s} draws no body at all"
+            );
         }
+    }
+
+    #[test]
+    fn the_unadopted_scenario_shows_all_three_shapes_of_missing_config() {
+        // The two keys are independent, so a fixture that only ever shows
+        // "neither is written" would never render the half-fixes.
+        use crate::adopt::Missing;
+        let a = app(UNADOPTED);
+        for m in [Missing::Both, Missing::Route, Missing::Polling] {
+            assert!(
+                a.unadopted.iter().any(|u| u.missing == m),
+                "no {m:?} row to look at"
+            );
+        }
+        // And the cursor lands on a repo, not on the header: `a` is the whole
+        // point of the screen.
+        assert_eq!(a.selected_id, a.unadopted.first().map(|u| u.row_id()));
     }
 
     #[test]

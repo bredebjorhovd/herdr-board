@@ -221,6 +221,7 @@ impl Fixture {
                 worktree: Some(worktree.to_string_lossy().into_owned()),
                 branch: Some(branch.into()),
                 dispatched_by: None,
+                dispatched_by_pane: None,
             base_sha: None,
             })
             .unwrap();

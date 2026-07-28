@@ -37,7 +37,14 @@ pub fn run(paths: Paths, log: Arc<Logger>) -> Result<()> {
         .get_task(&task_id)?
         .ok_or_else(|| anyhow!("no task {task_id}"))?;
 
-    let plan = dispatch::plan(&engine.db, &engine.cfg, &engine.paths, &task, &Overrides::default())?;
+    let plan = dispatch::plan(
+        &engine.db,
+        &herdr,
+        &engine.cfg,
+        &engine.paths,
+        &task,
+        &Overrides::default(),
+    )?;
 
     // Workspace choices: every workspace herdr knows about, with the routed one
     // first so `enter` without cycling does what the route says.
@@ -82,7 +89,7 @@ pub fn run(paths: Paths, log: Arc<Logger>) -> Result<()> {
     execute!(out, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = event_loop(&mut term, &mut st, &engine, &log, &task);
+    let result = event_loop(&mut term, &mut st, &engine, &herdr, &log, &task);
 
     disable_raw_mode()?;
     execute!(
@@ -97,6 +104,7 @@ fn event_loop(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     st: &mut PickerState,
     engine: &crate::sync::SyncEngine,
+    herdr: &Herdr,
     log: &Logger,
     task: &crate::model::Task,
 ) -> Result<()> {
@@ -119,8 +127,8 @@ fn event_loop(
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Tab | KeyCode::Down => st.next_field(),
                     KeyCode::BackTab | KeyCode::Up => st.prev_field(),
-                    KeyCode::Left if st.cycle(-1) => replan(st, engine, task),
-                    KeyCode::Right if st.cycle(1) => replan(st, engine, task),
+                    KeyCode::Left if st.cycle(-1) => replan(st, engine, herdr, task),
+                    KeyCode::Right if st.cycle(1) => replan(st, engine, herdr, task),
                     KeyCode::Backspace => st.backspace(),
                     KeyCode::Char(c) if st.focused() == Field::Branch => st.type_char(c),
                     KeyCode::Char('j') => st.next_field(),
@@ -220,9 +228,15 @@ fn spawn_dispatch(
 
 /// The worktree path and the concurrency count both depend on the chosen
 /// workspace, so re-plan whenever it changes.
-fn replan(st: &mut PickerState, engine: &crate::sync::SyncEngine, task: &crate::model::Task) {
+fn replan(
+    st: &mut PickerState,
+    engine: &crate::sync::SyncEngine,
+    herdr: &Herdr,
+    task: &crate::model::Task,
+) {
     if let Ok(p) = dispatch::plan(
         &engine.db,
+        herdr,
         &engine.cfg,
         &engine.paths,
         task,

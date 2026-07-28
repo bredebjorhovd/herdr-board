@@ -418,11 +418,15 @@ pub struct Attempt {
     pub missing_ticks: i64,
     /// Live agent status, filled in by reconciliation; not a stored column.
     pub agent_status: Option<AgentStatus>,
-    /// Task id of the parent that released this one. `None` means the operator
-    /// did it. Agent-initiated dispatch is a primary path, not an escape hatch,
-    /// so rows appear in `working` that the operator never released — the board
-    /// has to say who did.
+    /// Task id of the parent that released this one, when the board dispatched
+    /// that parent too. `None` on its own does **not** mean the operator: most
+    /// dispatching agents sit in a pane the board never dispatched and so have
+    /// no task id at all — see `dispatched_by_pane` and [`Dispatcher`].
     pub dispatched_by: Option<String>,
+    /// The pane the dispatch ran from, when an agent was in it. This is the
+    /// column that answers "released by" for the common case: every command
+    /// carries `HERDR_PANE_ID`, whether or not the board started the pane.
+    pub dispatched_by_pane: Option<String>,
     /// The commit this attempt's branch was cut from. Commits *after* it are
     /// the agent's output; commits before it are the operator's own unpushed
     /// work, which must not be mistaken for the agent having finished.
@@ -432,6 +436,74 @@ pub struct Attempt {
     /// stops a freshly-started `idle` agent from being reaped before its
     /// prompt has even been delivered.
     pub saw_working: bool,
+}
+
+impl Attempt {
+    /// Who released this attempt, as recorded at dispatch.
+    pub fn dispatcher(&self) -> Dispatcher {
+        Dispatcher::agent(self.dispatched_by.clone(), self.dispatched_by_pane.clone())
+    }
+}
+
+/// Who released a task.
+///
+/// The board dispatches *into* fresh panes, but the pane that does the
+/// dispatching is usually not one of them: the common topology is one
+/// long-lived orchestrator pane the operator started and keeps around, which
+/// releases many children. That pane is a session, not an attempt — so asking
+/// "does a live attempt own this pane" answers `None` for exactly the case
+/// provenance most needs to see, and every dispatch gets recorded as the
+/// operator's.
+///
+/// So an agent is identified by its **pane**, which every command carries in
+/// `HERDR_PANE_ID` whether or not the board started it, and named by its
+/// **task** as well when the board did dispatch it — a board-dispatched chain
+/// keeps the richer `via LIN-138` label rather than dropping to a pane id.
+///
+/// `Operator` is the narrow case it sounds like: a keypress on the board, or a
+/// CLI run from a pane with no agent in it. Not merely "not an attempt".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dispatcher {
+    Operator,
+    Agent {
+        /// The agent's own task, when the board dispatched it. Absent for an
+        /// orchestrator pane, which is the usual case.
+        task: Option<String>,
+        /// The pane it ran from — a delivery address, and the only identifier
+        /// that is always available.
+        pane: Option<String>,
+    },
+}
+
+impl Dispatcher {
+    /// An agent known by a task, a pane, or both. Knowing neither is the
+    /// operator, so that case cannot be constructed by accident.
+    pub fn agent(task: Option<String>, pane: Option<String>) -> Dispatcher {
+        match (task, pane) {
+            (None, None) => Dispatcher::Operator,
+            (task, pane) => Dispatcher::Agent { task, pane },
+        }
+    }
+
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Dispatcher::Agent { .. })
+    }
+
+    /// The parent's task id, when the board dispatched the parent too.
+    pub fn task(&self) -> Option<&str> {
+        match self {
+            Dispatcher::Agent { task, .. } => task.as_deref(),
+            Dispatcher::Operator => None,
+        }
+    }
+
+    /// The pane the dispatch came from — where to reach the dispatcher.
+    pub fn pane(&self) -> Option<&str> {
+        match self {
+            Dispatcher::Agent { pane, .. } => pane.as_deref(),
+            Dispatcher::Operator => None,
+        }
+    }
 }
 
 #[cfg(test)]

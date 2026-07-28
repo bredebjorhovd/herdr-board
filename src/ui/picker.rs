@@ -272,7 +272,7 @@ mod tests {
             attempt_no: 1,
             live_in_workspace: live,
             max_concurrent: max,
-            dispatched_by: None,
+            dispatcher: crate::model::Dispatcher::Operator,
         }
     }
 

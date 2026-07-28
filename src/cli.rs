@@ -489,8 +489,14 @@ pub struct TaskRow {
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
     pub branch: Option<String>,
-    /// Parent task id when an agent released this one; null means the operator.
+    /// Parent task id when the board dispatched the releasing agent too. Null
+    /// on its own does **not** mean the operator: an orchestrator pane has no
+    /// attempt and so no task id — read `dispatched_by_pane` as well.
     pub dispatched_by: Option<String>,
+    /// The pane the dispatch ran from, when an agent was in it. Set for every
+    /// agent-released row, and the address a parent can be reached at. Both
+    /// this and `dispatched_by` null means the operator released it.
+    pub dispatched_by_pane: Option<String>,
     /// How the most recent *ended* attempt ended: `done`, `failed`, `cancelled`
     /// or `orphaned`. Null means no attempt has ever ended.
     ///
@@ -541,6 +547,7 @@ fn task_row(task: &crate::model::Task, route: Option<&crate::config::Route>) -> 
         pr_number: task.pr_number,
         branch: live.or(last).and_then(|a| a.branch.clone()),
         dispatched_by: live.or(last).and_then(|a| a.dispatched_by.clone()),
+        dispatched_by_pane: live.or(last).and_then(|a| a.dispatched_by_pane.clone()),
         last_outcome: closed.and_then(|a| a.outcome).map(|o| o.as_str().to_string()),
         last_outcome_at: closed.and_then(|a| a.ended_at.clone()),
         attempts: task.attempts.len(),
@@ -1413,6 +1420,17 @@ mod tests {
 
     /// Add an attempt to a seeded task and close it.
     fn closed_attempt(db: &Db, task_id: &str, outcome: crate::model::Outcome, by: Option<&str>) {
+        closed_attempt_by(db, task_id, outcome, by, None)
+    }
+
+    /// The same, saying which pane released it as well as which task.
+    fn closed_attempt_by(
+        db: &Db,
+        task_id: &str,
+        outcome: crate::model::Outcome,
+        by: Option<&str>,
+        pane: Option<&str>,
+    ) {
         let a = db
             .insert_attempt(&crate::db::NewAttempt {
                 task_id: task_id.into(),
@@ -1422,7 +1440,8 @@ mod tests {
                 worktree: None,
                 branch: None,
                 dispatched_by: by.map(str::to_string),
-            base_sha: None,
+                dispatched_by_pane: pane.map(str::to_string),
+                base_sha: None,
             })
             .unwrap();
         db.close_attempt(a, outcome).unwrap();
@@ -1462,6 +1481,31 @@ mod tests {
         assert_eq!(cancelled.dispatched_by.as_deref(), Some("linear:LIN-138"));
     }
 
+    /// An orchestrator has no task on the board to be named by, so a poller
+    /// matching `dispatched_by` alone would never recognise its own children.
+    /// The pane it dispatched from is what it can match on — and the address it
+    /// can be reached at.
+    #[test]
+    fn a_child_released_from_a_pane_says_which_pane() {
+        let db = seeded_db();
+        closed_attempt_by(
+            &db,
+            "linear:LIN-142",
+            crate::model::Outcome::Cancelled,
+            None,
+            Some("w1:p3"),
+        );
+        let r = row(&db, "linear:LIN-142");
+        assert_eq!(r.dispatched_by, None);
+        assert_eq!(r.dispatched_by_pane.as_deref(), Some("w1:p3"));
+
+        // Both null is the operator, and only that.
+        closed_attempt(&db, "gh:offhand/tally#87", crate::model::Outcome::Done, None);
+        let mine = row(&db, "gh:offhand/tally#87");
+        assert_eq!(mine.dispatched_by, None);
+        assert_eq!(mine.dispatched_by_pane, None);
+    }
+
     /// A retry must not erase how the previous attempt ended: a parent that
     /// polls between the cancel and the re-dispatch would otherwise see the
     /// cancellation appear and vanish.
@@ -1482,6 +1526,7 @@ mod tests {
             worktree: None,
             branch: None,
             dispatched_by: None,
+            dispatched_by_pane: None,
             base_sha: None,
         })
         .unwrap();

@@ -77,7 +77,11 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         }
         *by_workspace.entry(a.workspace.clone()).or_default() += 1;
         *by_runtime.entry(a.runtime.clone()).or_default() += 1;
-        if a.dispatched_by.is_some() {
+        // An agent, by either name it can be known under. Counting only
+        // `dispatched_by` counted only agents the board itself dispatched,
+        // which is the one kind that almost never does the dispatching — so
+        // this was structurally always 0 (AGE-24).
+        if a.dispatcher().is_agent() {
             agent_dispatched += 1;
         }
         if let Some(m) = minutes(a) {
@@ -214,6 +218,19 @@ mod tests {
     }
 
     fn attempt(minutes_ago: i64, ran_for: i64, outcome: Option<Outcome>, by: Option<&str>) -> Attempt {
+        attempt_by(minutes_ago, ran_for, outcome, by, None)
+    }
+
+    /// `by` is a parent task id, `pane` the pane the dispatch came from —
+    /// either one makes it an agent's, and an orchestrator only ever has the
+    /// second.
+    fn attempt_by(
+        minutes_ago: i64,
+        ran_for: i64,
+        outcome: Option<Outcome>,
+        by: Option<&str>,
+        pane: Option<&str>,
+    ) -> Attempt {
         let start = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
         Attempt {
             id: 0,
@@ -230,6 +247,7 @@ mod tests {
             missing_ticks: 0,
             agent_status: None,
             dispatched_by: by.map(str::to_string),
+            dispatched_by_pane: pane.map(str::to_string),
             base_sha: None,
             saw_working: true,
         }
@@ -299,6 +317,22 @@ mod tests {
             ],
         );
         assert_eq!(gather(&[t], None).agent_dispatched, 1);
+    }
+
+    /// The number used to be structurally 0: it counted only agents the board
+    /// had dispatched, and those are not the ones that dispatch. An
+    /// orchestrator has a pane and no task, and it still counts (AGE-24).
+    #[test]
+    fn an_orchestrators_releases_are_counted_too() {
+        let t = task(
+            "a",
+            vec![
+                attempt_by(60, 5, Some(Outcome::Done), None, Some("w1:p3")),
+                attempt_by(55, 5, Some(Outcome::Done), Some("linear:LIN-1"), Some("w2:p1")),
+                attempt_by(50, 5, Some(Outcome::Done), None, None),
+            ],
+        );
+        assert_eq!(gather(&[t], None).agent_dispatched, 2);
     }
 
     #[test]

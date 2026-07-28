@@ -176,19 +176,33 @@ herdr-board dispatch --task linear:LIN-145
 ```
 
 and the row lands on the board within a tick. No flag is needed to say who did
-it: the command inherits `HERDR_PANE_ID` from the pane it ran in, and if a live
-attempt owns that pane, the agent in it is recorded as the parent. The board pane
-and the picker popup own no attempt — a popup gets no pane id at all — so an
-operator dispatch resolves to "you" on its own. Pass `--via <task-id>` to state
-it explicitly.
+it: the command inherits `HERDR_PANE_ID` from the pane it ran in, and **the pane
+is the identity**. That is available whether or not the board started the pane —
+which is the whole point, because the usual dispatcher is not something the board
+started.
 
-Because rows now appear in `working` that you never released, routinely, the
-board says who released them:
+**The agent that dispatches is usually an orchestrator**: one long-lived pane you
+opened yourself and keep around, releasing many children. That pane is a session,
+not an attempt, so it owns no attempt and has no issue on the board. Provenance
+used to be resolved by asking "does a live *attempt* own this pane" — which
+answered "no" for exactly that pane, and recorded every one of its dispatches as
+yours. A task id is still resolved *in addition* when there is one, so a chain the
+board dispatched end to end keeps the richer label; everything else falls back to
+the pane. `--via <task-id>` names a parent issue explicitly.
 
-- **List, from 80 columns**: `via LIN-138` takes the **runtime column** on
-  agent-dispatched rows. When an agent chose the runtime, which one it picked is
-  the least interesting fact on the row and the parent is the most — so this
-  costs zero title width, and the runtime is still in detail.
+**You** means a keypress on the board, the picker popup, or a CLI run from a pane
+with no agent in it — not merely "no attempt owns this pane". The board dispatches
+from its own pane and the popup gets no pane id at all, so both resolve to you on
+their own; for anything else herdr is asked what is in the pane, and a pane it has
+no agent for is not claimed as one.
+
+Because rows appear in `working` that you never released, routinely, the board
+says who released them — by issue identifier when it has one, by pane otherwise:
+
+- **List, from 80 columns**: `via LIN-138` (or `via w1:p3`) takes the **runtime
+  column** on agent-dispatched rows. When an agent chose the runtime, which one it
+  picked is the least interesting fact on the row and the parent is the most — so
+  this costs zero title width, and the runtime is still in detail.
 - **List, from 100 columns**: both — runtime, workspace, `via LIN-138`, elapsed.
 - **Detail**, always: a `dispatched by` row — dim `you`, or default fg
   `LIN-138  ·  agent, not you`, because that is the case worth noticing.
@@ -196,9 +210,11 @@ board says who released them:
   `as sent, attempt 1 · codex · dispatched by LIN-138`.
 - **Upstream**: the dispatch comment names the parent too, so reading the Linear
   issue tells you an agent released it.
+- **`stats`**: `released` counts every agent-released attempt, by either name.
 
-Provenance names the parent **task**, not the pane: the pane is transient, the
-task is what you can navigate to.
+Provenance prefers the parent **task** where there is one, because a task is what
+you can navigate to. But the **pane** is what is always there, and it is also an
+address: it is how a dispatcher could be woken when what it released settles.
 
 **Deliberately not built:** any tree or indent showing dispatch chains. Children
 and parents routinely sit in different sections — a child in `ready` under a
@@ -221,10 +237,12 @@ been dispatched. So the fix is a field, not a protocol:
 ```json
 { "identifier": "LIN-145", "state": "ready",
   "last_outcome": "cancelled", "last_outcome_at": "2026-07-26T20:41:07Z",
-  "dispatched_by": "linear:LIN-138" }
+  "dispatched_by": "linear:LIN-138", "dispatched_by_pane": "w1:p3" }
 ```
 
 A parent polling its child sees `ready` + `cancelled` and knows to stop waiting.
+An orchestrator has no `dispatched_by` to match on — it has no issue on the board
+— so it matches its own pane: `dispatched_by_pane` is its own `HERDR_PANE_ID`.
 
 **The contract for a parent agent:** if you dispatch, you poll. Do not block
 indefinitely on a child — it can be cancelled out from under you at any moment
@@ -235,10 +253,11 @@ by an operator who owes you nothing. Poll `list --json`, and treat
 `agent prompt` is right there, and dispatch already uses it — but delivery into a
 running agent is unreliable by construction (see `deliver_prompt`, which exists
 entirely to fight this: agents swallow pastes mid-turn, and the only evidence of
-arrival is the screen changing). Beyond that, `dispatched_by` names a *task*, and
-the parent's own pane is frequently gone by the time you cancel; and one operator
-keystroke turning into a second agent talking unprompted is action at a distance
-in a tool whose whole premise is that you can see what is running.
+arrival is the screen changing). The parent's own pane is frequently gone by the
+time you cancel; and one operator keystroke turning into a second agent talking
+unprompted is action at a distance in a tool whose whole premise is that you can
+see what is running. (Provenance now records *which* pane, so the address exists
+— what is missing is a reason to trust delivery, not a way to address it.)
 
 **What the operator is told instead.** Cancelling is the one board action with a
 consequence off the board, and the operator is the only one who can act on it —
@@ -625,8 +644,11 @@ happened while it was away.
 
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,
-`pr_number`, `branch`, `dispatched_by`, `last_outcome`, `last_outcome_at`,
-`attempts`, `dispatchable`, and `gone`.
+`pr_number`, `branch`, `dispatched_by`, `dispatched_by_pane`, `last_outcome`,
+`last_outcome_at`, `attempts`, `dispatchable`, and `gone`.
+`dispatched_by` is set only when the board dispatched the releasing agent too, so
+null there does **not** mean you released it — read `dispatched_by_pane`, which is
+set for every agent-released row. Both null is the operator.
 `dispatchable` is false when no route matches *or* the row is `gone`, in which
 case `dispatch` will refuse it; `gone` tells the two apart, since only one of
 them is fixed by editing `routing.toml`. Rows come back in board order, so the

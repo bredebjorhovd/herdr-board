@@ -450,6 +450,16 @@ impl SyncEngine {
             };
             self.db
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), pr.open)?;
+            // Observing the merge is the same fact as performing it. Only `m`
+            // used to say so, so a PR merged with `gh pr merge` or on the web
+            // left its ticket in review forever — and not merely unadvanced:
+            // nothing but a finished task ends `review`, so the state kept
+            // standing and the review writeback kept asserting it, which is
+            // what pulled a hand-closed AGE-17 back again (also AGE-18,
+            // AGE-21). The idempotency key stops the next poll re-sending it.
+            if pr.merged && !task.pr_merged && !task.state.is_terminal() {
+                self.finish_on_merge(&task, &pr.repo, pr.number)?;
+            }
             self.db.set_pr_merged(&task.id, pr.merged)?;
             if check_mergeable
                 && pr.open
@@ -1215,18 +1225,33 @@ impl SyncEngine {
         // just pressed the key and needs the row to move.
         self.db.set_pr(&task.id, task.pr_url.as_deref(), Some(number), false)?;
         self.db.set_pr_merged(&task.id, true)?;
-        // A merged pull request is finished work. For a PR row that is the
-        // whole task; for an issue whose PR this was, the work is done and the
-        // ticket is what remains.
+        self.finish_on_merge(task, &repo, number)?;
+        self.rederive_all()?;
+        Ok(format!("{repo}#{number}"))
+    }
+
+    /// What a merged pull request means for the task that owns it.
+    ///
+    /// A merged PR is finished work. For a PR row that is the whole task; for
+    /// an issue whose PR this was, the work is done and the ticket is what
+    /// remains. Shared by `m` and by the poll that notices someone merged
+    /// elsewhere, because otherwise the row's state depends on which route the
+    /// merge took — which is the whole of AGE-22.
+    fn finish_on_merge(&self, task: &Task, repo: &str, number: i64) -> Result<()> {
         self.db.set_local_done(&task.id, true)?;
-        self.db.enqueue_writeback(&NewWriteback {
+        let queued = self.db.enqueue_writeback(&NewWriteback {
             task_id: task.id.clone(),
             kind: "close".into(),
             payload: json!({ "reason": "merged" }).to_string(),
             idem_key: format!("{}:close", task.id),
         })?;
-        self.rederive_all()?;
-        Ok(format!("{repo}#{number}"))
+        if queued {
+            self.log.info(format!(
+                "{}: {repo}#{number} merged; queued a close",
+                task.identifier
+            ));
+        }
+        Ok(())
     }
 
     // ---- health for the header -----------------------------------------
@@ -1589,6 +1614,121 @@ mod tests {
         let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
         assert_eq!(t.pr_url, None, "another repo's PR is not this task's PR");
         assert!(!t.pr_merged, "and must not mark it finished");
+    }
+
+    /// A merged pull request that the board is only told about by a poll.
+    fn merged_pr() -> PullRequest {
+        PullRequest {
+            repo: "o/r".into(),
+            number: 291,
+            title: "Add retry".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/291".into(),
+            head_ref: "board/lin-142".into(),
+            open: false,
+            merged: true,
+            draft: false,
+            updated_at: crate::db::now(),
+        }
+    }
+
+    #[test]
+    fn a_pull_request_merged_outside_the_board_still_closes_the_ticket() {
+        // AGE-22, seen live on AGE-17/18/21: `gh pr merge` and the web UI go
+        // nowhere near `m`, so nothing told the tracker and all three sat at
+        // In Review until someone closed them by hand.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "w1:p9");
+
+        e.link_pull_requests(&[merged_pr()]).unwrap();
+
+        let t = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert!(t.pr_merged);
+        // Same row state as `m` produces — the route the merge took must not
+        // decide where the row ends up.
+        assert!(t.local_done, "observing a merge finishes the work");
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Done
+        );
+        assert!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "close"),
+            "and the ticket is queued to be closed"
+        );
+    }
+
+    #[test]
+    fn a_merge_seen_by_the_poll_lets_the_row_leave_review() {
+        // The half that made this more than a missed advance. The attempt
+        // settled, so derivation reaches `review` off its outcome and keeps
+        // reaching it — the ticket is held in the wrong state rather than
+        // merely not advanced, which is why closing AGE-17 by hand did not
+        // stick. Only something that finishes the task can end that.
+        let mut e = engine(None);
+        e.cfg.linear.review_state = Some("In Review".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "w1:p9");
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Review
+        );
+
+        e.link_pull_requests(&[merged_pr()]).unwrap();
+        for _ in 0..3 {
+            e.rederive_all().unwrap();
+        }
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Done,
+            "and it stays out — no tick puts it back in review"
+        );
+    }
+
+    #[test]
+    fn a_merge_observed_on_every_poll_only_closes_the_ticket_once() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "w1:p9");
+        for _ in 0..5 {
+            e.link_pull_requests(&[merged_pr()]).unwrap();
+            e.rederive_all().unwrap();
+        }
+        assert_eq!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .filter(|w| w.kind == "close")
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn a_task_already_finished_upstream_is_not_reopened_by_a_merge() {
+        // The issue was closed upstream; a merged PR turning up afterwards has
+        // nothing left to say, and closing an already-closed ticket is noise.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        dispatch(&e, "linear:LIN-142", "w1:p9");
+        e.rederive_all().unwrap();
+
+        e.link_pull_requests(&[merged_pr()]).unwrap();
+
+        assert!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .all(|w| w.kind != "close"),
+        );
+        // The PR fact itself is still recorded — only the writeback is skipped.
+        assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_merged);
     }
 
     #[test]

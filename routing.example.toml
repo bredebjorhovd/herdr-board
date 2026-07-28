@@ -29,6 +29,27 @@ workspace = "fintech"
 repo = "~/code/tripletex-int"
 runtime = "claude-code"
 
+# `runtime` is not decoration. Anything `config::herdr_kind_for_runtime` maps is
+# dispatchable — `codex` and `opencode` alongside `claude-code` — and all three
+# have been exercised end to end (AGE-26), including the part that matters:
+# herdr reports them `working`, so their attempts settle on commits and do not
+# need a PR to leave `working`. `doctor` rejects a runtime it cannot map rather
+# than failing at dispatch time.
+#
+# `match` ANDs its keys, so one repo can route to different runtimes by label.
+[[route]]
+match = { gh_repo = "you/scratch", label = "codex" }
+workspace = "scratch"
+repo = "~/code/scratch"
+runtime = "codex"
+
+# Every runtime needs the board conventions in its global instruction file, or a
+# dispatched agent has the CLI on PATH and no idea what it is for:
+#
+#   herdr-board integration install-conventions
+#
+# Claude Code's copy is the skill at ~/.claude/skills/board/SKILL.md instead.
+
 # A route with no `match` is a catch-all and must come last.
 
 [defaults]

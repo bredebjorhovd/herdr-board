@@ -668,7 +668,10 @@ on screen while working and beneath its own approval dialogs.
 
 So a thinking or blocked Claude agent reports `idle`, and the board's `blocked`
 section — the one state that exists to say "an agent needs you" — never fires
-for one. Codex is detected correctly; this is Claude-specific.
+for one. This is Claude-specific, and that is now checked rather than assumed:
+codex matches on `screen_working_fallback`, opencode on `interrupt_hint_working`,
+and neither manifest has a `live_prompt_box` rule to outrank it. Both were
+dispatched a real task and watched through `working` → `review` (AGE-26).
 
 ```bash
 herdr-board integration install claude
@@ -691,6 +694,38 @@ Two things it is not:
 An override replaces the manifest wholesale, so it snapshots the active one and
 will shadow later upstream updates. `herdr-board integration uninstall claude`
 puts it back.
+
+## Teaching each runtime that the board exists
+
+Being dispatchable is not the same as knowing what to do. `herdr-board` is on
+PATH for every runtime and `gh` is authenticated once per user, so nothing about
+reaching the board is Claude-specific — but for the first two dozen attempts the
+conventions existed only as a Claude Code skill, and a codex agent had the CLI
+and no idea what it was for.
+
+```bash
+herdr-board integration install-conventions            # every runtime that has one
+herdr-board integration install-conventions codex      # or just the one
+herdr-board integration status                         # what is installed, and where
+```
+
+The text lives in `agent-conventions.md` at the repo root and is written into
+each runtime's **global instruction file** between markers — `~/.codex/AGENTS.md`
+and `~/.config/opencode/AGENTS.md` today. Anything you wrote outside the markers
+is preserved, and re-running replaces the block rather than appending a second
+copy, so a correction in one place reaches every runtime.
+
+Claude Code is deliberately not a target: its copy is the skill at
+`~/.claude/skills/board/SKILL.md`, and writing it into `CLAUDE.md` as well would
+only give it two copies to disagree with each other.
+
+**An instruction file, not a skill, on purpose.** All three runtimes have a skill
+mechanism, and opencode in fact already discovers `~/.claude/skills` — so the
+board skill is visible to it today, which is not enough. A skill loads when the
+agent decides it is relevant, and an agent dispatched to fix a flaky test has no
+reason to go looking for a board skill; it would finish, leave the work
+uncommitted, and the row would sit in `working`. The instruction file is always
+in context, which is the property this needs.
 
 ## Notes on the herdr integration
 
@@ -743,6 +778,21 @@ against herdr 0.7.5 (`herdr completion zsh` plus the published docs):
   that workspace, which is also the behaviour you want: a retry continues the
   work rather than starting beside it. Clearing them out is a thing you ask for:
   `herdr-board gc`.
+- **A pane can outlive its agent, and that used to strand the row.** herdr
+  reports no `agent` on the pane at all, so the missing-pane path never fires;
+  no status ever arrives, so `saw_working` never latches; and the AGE-19 guard
+  then correctly refuses to settle on commits. Nothing was left alive to move
+  the row and it sat `working` indefinitely. An attempt whose pane has no agent
+  and that never reached `working` is now orphaned after the same two ticks a
+  vanished pane gets — one tick is the window between `agent start` and herdr
+  classifying the pane, and reaping there would end every attempt before it
+  began. An agent that *did* work and was then quit still settles on its
+  commits: that is a finished attempt, not a failed start.
+
+  Found dispatching to opencode (AGE-26), which noticed a new release on launch,
+  upgraded itself and exited straight back to a shell prompt. Codex reaches the
+  same state by exiting on a usage-limit banner. Claude Code does neither, which
+  is why two dozen attempts never hit it.
 - **`agent start` races the shell it is given.** `tab create` returns as soon as
   the pane exists, but `agent start` needs the shell at its prompt owning the
   foreground; starting immediately gets `agent_pane_busy` and leaves an empty

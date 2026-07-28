@@ -604,88 +604,129 @@ impl SyncEngine {
                         self.db.set_missing_ticks(attempt.id, ticks)?;
                     }
                 }
-                Some(pane) => {
-                    if attempt.missing_ticks != 0 {
-                        // It came back — a handoff, not a death.
-                        self.db.set_missing_ticks(attempt.id, 0)?;
+                Some(pane) if pane.agent.is_none() => {
+                    // The pane outlived its agent. Same fact as a pane that
+                    // exited, as far as this attempt is concerned, so it gets
+                    // the same two-tick rule — and it has to be handled
+                    // separately because the pane *is* still there, so the
+                    // missing-pane branch above never fires for it.
+                    //
+                    // Found dispatching to opencode (AGE-26): opencode noticed
+                    // a new release on launch, upgraded itself and exited,
+                    // leaving the pane back at a shell prompt. herdr then had
+                    // no agent to report a status for, `saw_working` never
+                    // latched, and the AGE-19 guard correctly refused to settle
+                    // on commits — so the row sat `working` with nothing left
+                    // alive to change it. Codex can reach the same state by
+                    // exiting on a usage-limit banner. Claude Code does neither,
+                    // which is why two dozen attempts never hit this.
+                    //
+                    // Only an attempt that never worked is reaped here. An agent
+                    // that got going, committed and was then quit is a
+                    // *finished* attempt, not a failed start, so it takes the
+                    // ordinary path and settles on its commits.
+                    if attempt.saw_working {
+                        self.reconcile_live_pane(&task, &attempt, pane, herdr)?;
+                        continue;
                     }
-                    let status = pane.agent_status.unwrap_or(AgentStatus::Unknown);
-                    // An agent that has just started waiting on you is more
-                    // urgent than one that has finished: it is burning
-                    // wall-clock right now, and nothing else on screen says so
-                    // unless you happen to be looking at the board.
-                    if status == AgentStatus::Blocked
-                        && attempt.agent_status != Some(AgentStatus::Blocked)
-                    {
-                        self.notify_settled(herdr, &task, "needs you");
-                    }
-                    if status == AgentStatus::Unknown {
-                        // Worth a line: `unknown` is not proof of completion,
-                        // and the agent name says what herdr actually saw.
-                        self.log.info(format!(
-                            "{} pane {} agent {:?} is unclassified",
-                            task.identifier, pane_id, pane.agent
+                    let ticks = attempt.missing_ticks + 1;
+                    if ticks >= 2 {
+                        self.log.warn(format!(
+                            "{} agent gone from pane {} for {} ticks without ever \
+                             working — orphaned",
+                            task.identifier, pane_id, ticks
                         ));
-                    }
-                    // Persist it so the TUI can render the dim `idle` marker
-                    // without shelling out to herdr on its own tick.
-                    self.db.set_attempt_status(attempt.id, status)?;
-                    // Latch that the agent actually got going, so a settled
-                    // status can be told apart from one that never started.
-                    if status == AgentStatus::Working && !attempt.saw_working {
-                        self.db.set_saw_working(attempt.id)?;
-                    }
-                    // An agent that has settled *and* produced a PR is the only
-                    // explicit done detection we have. Without a PR the attempt
-                    // stays live and the row renders a dim `idle` marker.
-                    let settled = matches!(
-                        status,
-                        AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown
-                    );
-                    if settled {
-                        // A PR is the clearest evidence of finished work, but
-                        // commits on the attempt branch are evidence too — and
-                        // an agent that commits locally and stops would
-                        // otherwise sit `working` forever.
-                        //
-                        // Commits alone only count once the agent has been seen
-                        // working. A just-started Claude reports `idle` because
-                        // it has not been handed its prompt yet — several
-                        // seconds pass between `agent start` and `agent prompt`
-                        // — and reaping it there ends the attempt before it
-                        // begins. A PR needs no such guard: it cannot exist
-                        // unless something ran.
-                        let why = if task.pr_open {
-                            Some("PR")
-                        } else if !attempt.saw_working {
-                            None
-                        } else if self
-                            .attempt_has_commits(
-                                attempt.worktree.as_deref(),
-                                attempt.base_sha.as_deref(),
-                            )
-                        {
-                            Some("commits")
-                        } else {
-                            None
-                        };
-                        if let Some(why) = why {
-                            self.log.info(format!(
-                                "{} agent {} with {why} — attempt done",
-                                task.identifier,
-                                status.as_str()
-                            ));
-                            self.notify_settled(herdr, &task, "finished");
-                            self.db.close_attempt(attempt.id, Outcome::Done)?;
-                            self.enqueue_outcome(
-                                &task,
-                                Outcome::Done,
-                                task.pr_url.as_deref(),
-                            )?;
-                        }
+                        self.notify_settled(herdr, &task, "failed — its agent never started");
+                        self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
+                        self.enqueue_outcome(&task, Outcome::Orphaned, None)?;
+                    } else {
+                        self.log.info(format!(
+                            "{} pane {} has no agent (tick {}/2)",
+                            task.identifier, pane_id, ticks
+                        ));
+                        self.db.set_missing_ticks(attempt.id, ticks)?;
                     }
                 }
+                Some(pane) => self.reconcile_live_pane(&task, &attempt, pane, herdr)?,
             }
+        }
+        Ok(())
+    }
+
+    /// Reconcile one attempt whose pane herdr still reports an agent in.
+    fn reconcile_live_pane(
+        &self,
+        task: &Task,
+        attempt: &Attempt,
+        pane: &PaneInfo,
+        herdr: Option<&Herdr>,
+    ) -> Result<()> {
+        let pane_id = pane.pane_id.as_str();
+        if attempt.missing_ticks != 0 {
+            // It came back — a handoff, not a death.
+            self.db.set_missing_ticks(attempt.id, 0)?;
+        }
+        let status = pane.agent_status.unwrap_or(AgentStatus::Unknown);
+        // An agent that has just started waiting on you is more urgent than one
+        // that has finished: it is burning wall-clock right now, and nothing
+        // else on screen says so unless you happen to be looking at the board.
+        if status == AgentStatus::Blocked && attempt.agent_status != Some(AgentStatus::Blocked) {
+            self.notify_settled(herdr, task, "needs you");
+        }
+        if status == AgentStatus::Unknown {
+            // Worth a line: `unknown` is not proof of completion, and the agent
+            // name says what herdr actually saw.
+            self.log.info(format!(
+                "{} pane {} agent {:?} is unclassified",
+                task.identifier, pane_id, pane.agent
+            ));
+        }
+        // Persist it so the TUI can render the dim `idle` marker without
+        // shelling out to herdr on its own tick.
+        self.db.set_attempt_status(attempt.id, status)?;
+        // Latch that the agent actually got going, so a settled status can be
+        // told apart from one that never started.
+        if status == AgentStatus::Working && !attempt.saw_working {
+            self.db.set_saw_working(attempt.id)?;
+        }
+        // An agent that has settled *and* produced a PR is the only explicit
+        // done detection we have. Without a PR the attempt stays live and the
+        // row renders a dim `idle` marker.
+        let settled = matches!(
+            status,
+            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown
+        );
+        if !settled {
+            return Ok(());
+        }
+        // A PR is the clearest evidence of finished work, but commits on the
+        // attempt branch are evidence too — and an agent that commits locally
+        // and stops would otherwise sit `working` forever.
+        //
+        // Commits alone only count once the agent has been seen working. A
+        // just-started Claude reports `idle` because it has not been handed its
+        // prompt yet — several seconds pass between `agent start` and `agent
+        // prompt` — and reaping it there ends the attempt before it begins. A
+        // PR needs no such guard: it cannot exist unless something ran.
+        let why = if task.pr_open {
+            Some("PR")
+        } else if !attempt.saw_working {
+            None
+        } else if self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+        {
+            Some("commits")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.log.info(format!(
+                "{} agent {} with {why} — attempt done",
+                task.identifier,
+                status.as_str()
+            ));
+            self.notify_settled(herdr, task, "finished");
+            self.db.close_attempt(attempt.id, Outcome::Done)?;
+            self.enqueue_outcome(task, Outcome::Done, task.pr_url.as_deref())?;
         }
         Ok(())
     }

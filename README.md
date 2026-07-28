@@ -705,7 +705,7 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 272 tests (258 unit, 14 integration)
+cargo test                 # 301 tests (283 unit, 18 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
@@ -721,11 +721,21 @@ clicks cannot be used to review the mouse.
 
 Some of the design's rules can only be settled by looking: that it survives a
 light terminal, that it survives a colourless one, and that the mouse really
-does what the keyboard does. `tools/render-check/` drives the demo in a live
-herdr pane, captures what it emits, and re-renders those captures under a dark,
-a light and a monochrome palette — plus a parity script that performs each
-action twice, once from the keyboard and once from a real mouse report, and
-diffs the screens. See `tools/render-check/README.md`.
+does what the keyboard does. `tools/render-check/` drives the demo in live herdr
+panes, captures what it emits, and re-renders those captures under a dark, a
+light and a monochrome palette — plus a script that checks `NO_COLOR` strips hue
+and nothing else, and one that performs each action twice, once from the
+keyboard and once from a real mouse report. See `tools/render-check/README.md`.
+
+Two things there are worth knowing before you write a check of your own, because
+both of them answered *confidently and wrongly* rather than failing. A pane is
+never reused: if the running demo does not quit, the next `herdr pane run`
+starts nothing and types its command into the surviving instance, which leaves a
+board on screen that passes any "does this look right" test under the wrong
+environment. And captures are compared per *cell*, never per escape sequence:
+ratatui emits one SGR sequence per run of same-styled cells, so stripping colour
+merges runs and makes bold look like it fell from 10 to 6 on a screen where all
+53 bold cells were still bold.
 
 Worth knowing before you reach for a herdr theme: a pane app receives the
 **host terminal's** ANSI palette. Switching `[theme] name` restyles herdr's own

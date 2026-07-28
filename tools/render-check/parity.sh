@@ -1,68 +1,105 @@
 #!/bin/bash
 # Drive the same action from the keyboard and from the mouse, and diff the
 # screen each one leaves behind. Real SGR mouse reports, into a real pane.
+#
+# Each half of each pair gets a pane of its own. The old shape reset by sending
+# `q` and relaunching in the same pane, which is exactly the trap: a pane whose
+# `q` was swallowed does not relaunch, it retypes, and the mouse half then
+# "matches" the keyboard half because both halves are the same instance. See
+# pane.sh.
+#
+# The comparison is cell by cell — glyph, emphasis and hue at every position —
+# rather than a diff of the escape stream, where a difference in run boundaries
+# reads as a difference on screen and a difference in trailing pad reads as one
+# too. Elapsed counters are normalised out; they are the board's only motion.
+#
+# Usage: parity.sh <outdir> [parent-pane]
 set -u
-PANE="$1"; OUT="$2"; mkdir -p "$OUT"
-K() { herdr pane send-keys "$PANE" "$@" >/dev/null; sleep 0.4; }
-CLICK() { herdr pane send-text "$PANE" "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm' "$1" "$2" "$1" "$2")" >/dev/null; sleep 0.4; }
-# Both presses in one payload: a double-click has to land inside the 400ms window.
-DBLCLICK() { herdr pane send-text "$PANE" "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm\033[<0;%d;%dM\033[<0;%d;%dm' "$1" "$2" "$1" "$2" "$1" "$2" "$1" "$2")" >/dev/null; sleep 0.5; }
-SNAP() { sleep 0.5; herdr pane read "$PANE" --source visible --format ansi > "$OUT/$1.ansi"; }
-RESET() { herdr pane send-keys "$PANE" q >/dev/null; sleep 1
-          herdr pane run "$PANE" "./target/debug/herdr-board demo populated" >/dev/null; sleep 2; }
-# The footer sits on the last row, and SGR mouse rows are 1-based.
-FOOTER=$(herdr pane get "$PANE" | python3 -c \
-  'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["scroll"]["viewport_rows"])')
-# Column of a footer hint, as a 1-based SGR coordinate.
-hint_at() { awk -v s="$1" -v w="$2" 'BEGIN{print index(s,w)+1}'; }
+cd "$(dirname "$0")/../.." || exit 1
+. tools/render-check/pane.sh
+
+OUT="${1:?usage: parity.sh <outdir> [parent-pane]}"
+RC_PARENT=$(rc_parent "${2:-}")
+DEMO="$RC_BOARD demo populated"
+mkdir -p "$OUT"
+rm -f "$OUT"/*.ansi "$OUT"/*.json 2>/dev/null
 
 fail=0
-# Elapsed counters tick once a second and are the only motion on the board, so
-# they are normalised out before comparing.
-norm() { python3 -c "
-import re,sys
-s=open(sys.argv[1],errors='replace').read()
-s=re.sub(r'\d+m\d\ds','ELAPSED',s)
-# herdr's snapshot ends a line either with a reset or with padding spaces
-# depending on what the pane held before; neither is a board behaviour.
-s='\n'.join(re.sub(r'(\x1b\[0m|\s)+$','',l) for l in s.replace('\r','').split('\n'))
-print(s.strip())" "$1"; }
-cmp_pair() { # name
-  norm "$OUT/$1-key.ansi" > "$OUT/$1-key.norm"; norm "$OUT/$1-mouse.ansi" > "$OUT/$1-mouse.norm"
-  if diff -q "$OUT/$1-key.norm" "$OUT/$1-mouse.norm" >/dev/null; then
-    echo "  same   $1"
-  else
-    echo "  DIFFER $1"; fail=1
-    diff "$OUT/$1-key.norm" "$OUT/$1-mouse.norm" | head -4 | cut -c1-100
-  fi
+
+# A press and its release, as an SGR mouse report, sent as literal text so it
+# reaches the app exactly as a terminal would deliver it.
+rc_click() {
+  herdr pane send-text "$1" \
+    "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm' "$2" "$3" "$2" "$3")" >/dev/null
+  sleep "$RC_KEY_DELAY"
+}
+# Both presses in one payload: a double-click has to land inside the 400ms window.
+rc_dblclick() {
+  herdr pane send-text "$1" \
+    "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm\033[<0;%d;%dM\033[<0;%d;%dm' \
+       "$2" "$3" "$2" "$3" "$2" "$3" "$2" "$3")" >/dev/null
+  sleep 0.5
 }
 
+# A fresh pane with the board verified up in it, ready to be pointed at.
+rc_mouse_pane() {
+  rc_open "$RC_PARENT"
+  rc_launch "$RC_PANE" "$DEMO"
+  sleep "$RC_SETTLE"
+}
+rc_mouse_shot() {  # <name>
+  sleep "$RC_SETTLE"
+  rc_read "$OUT" "$1" "$RC_PANE" "mouse" 0 mouse
+  rc_close "$RC_PANE"
+}
+
+# Column of a footer hint on this pane, as a 1-based SGR coordinate. Read from
+# the pane rather than assumed, because the footer reflows with the width.
+rc_click_hint() {  # <pane> <word> <footer-row>
+  local hint
+  hint=$(herdr pane read "$1" --source visible --format text | tail -1)
+  rc_click "$1" "$(awk -v s="$hint" -v w="$2" 'BEGIN{print index(s,w)+1}')" "$3"
+}
+
+compare() {
+  echo "$1"
+  python3 tools/render-check/cells.py "$OUT/$1-key.ansi" "$OUT/$1-mouse.ansi" \
+    --label-a keyboard --label-b mouse --strict --elapsed || fail=1
+  echo
+}
+
+# The footer sits on the last terminal row. Measured on a throwaway pane split
+# from the same parent, so it matches the panes the captures happen in.
+rc_open "$RC_PARENT"
+FOOTER=$(rc_viewport "$RC_PANE")
+rc_close "$RC_PANE"
+echo "capturing into $OUT, one pane per screen, split from $RC_PARENT"
+echo "footer on row $FOOTER"
+echo
+
 echo "enter on a task row -> detail"
-RESET; K j j j; K enter; SNAP detail-key
-RESET; DBLCLICK 20 7; SNAP detail-mouse               # same row: app row 6 = SGR row 7
-cmp_pair detail
+rc_capture "$OUT" detail-key "$DEMO" -- j j j enter
+rc_mouse_pane; rc_dblclick "$RC_PANE" 20 7; rc_mouse_shot detail-mouse
+compare detail                                  # same row: app row 6 = SGR row 7
 
 echo "section header folds"
-RESET; K k; K enter; SNAP fold-key                     # up from LIN-131 onto BLOCKED
-RESET; CLICK 5 3; SNAP fold-mouse                      # app row 2 = SGR row 3
-cmp_pair fold
+rc_capture "$OUT" fold-key "$DEMO" -- k enter
+rc_mouse_pane; rc_click "$RC_PANE" 5 3; rc_mouse_shot fold-mouse
+compare fold                                    # up from LIN-131: app row 2 = SGR row 3
 
 echo "footer hint: ? help"
-RESET; herdr pane send-text "$PANE" '?' >/dev/null; sleep 0.6; SNAP help-key
-RESET; HINT=$(herdr pane read "$PANE" --source visible --format text | tail -1)
-CLICK "$(hint_at "$HINT" "? help")" "$FOOTER"; SNAP help-mouse
-cmp_pair help
+rc_capture "$OUT" help-key "$DEMO" -- :?
+rc_mouse_pane; rc_click_hint "$RC_PANE" "? help" "$FOOTER"; rc_mouse_shot help-mouse
+compare help
 
 echo "footer hint: o open"
-RESET; K o; SNAP open-key
-RESET; HINT=$(herdr pane read "$PANE" --source visible --format text | tail -1)
-CLICK "$(hint_at "$HINT" "o open")" "$FOOTER"; SNAP open-mouse
-cmp_pair open
+rc_capture "$OUT" open-key "$DEMO" -- o
+rc_mouse_pane; rc_click_hint "$RC_PANE" "o open" "$FOOTER"; rc_mouse_shot open-mouse
+compare open
 
 echo "footer hint: g go to pane"
-RESET; K g; SNAP goto-key
-RESET; HINT=$(herdr pane read "$PANE" --source visible --format text | tail -1)
-CLICK "$(hint_at "$HINT" "g go to pane")" "$FOOTER"; SNAP goto-mouse
-cmp_pair goto
+rc_capture "$OUT" goto-key "$DEMO" -- g
+rc_mouse_pane; rc_click_hint "$RC_PANE" "g go to pane" "$FOOTER"; rc_mouse_shot goto-mouse
+compare goto
 
 exit $fail

@@ -262,6 +262,15 @@ fn main() -> Result<()> {
                         plan.attempt_no,
                         dispatch::dispatcher_phrase(&engine.db, &plan.dispatcher),
                     );
+                    // An orchestrator choosing between blocking on `wait` and
+                    // carrying on needs to know whether anything will tell it
+                    // otherwise — and whether it will is config it cannot see
+                    // (AGE-25).
+                    if engine.cfg.defaults.notify_dispatcher
+                        && let Some(pane) = plan.dispatcher.pane()
+                    {
+                        println!("you will be prompted in {pane} when it settles");
+                    }
                 }
                 Err(e) => {
                     let _ = engine.db.meta_set(

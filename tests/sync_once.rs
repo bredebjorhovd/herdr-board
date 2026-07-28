@@ -140,6 +140,15 @@ fn pane(id: &str, status: AgentStatus) -> PaneInfo {
     }
 }
 
+/// A pane herdr sees no agent in: the agent exited and left the shell behind.
+fn pane_without_agent(id: &str) -> PaneInfo {
+    PaneInfo {
+        agent: None,
+        agent_status: None,
+        ..pane(id, AgentStatus::Unknown)
+    }
+}
+
 #[test]
 fn a_sync_cycle_ingests_recorded_issues_and_derives_their_states() {
     let h = Harness::new("ingest");
@@ -441,6 +450,96 @@ fn an_orphaned_pane_needs_two_ticks_and_then_reads_as_failed() {
     assert_eq!(
         e.db.get_task("linear:OFF-145").unwrap().unwrap().state,
         BoardState::Failed
+    );
+}
+
+#[test]
+fn an_agent_that_exits_without_ever_working_stops_holding_the_row() {
+    // AGE-26, found dispatching to opencode: it saw a new release on launch,
+    // upgraded itself and exited, leaving the pane back at a shell prompt. The
+    // pane is still there, so the missing-pane path never fires; herdr has no
+    // agent to report a status for, so `saw_working` never latches; and the
+    // AGE-19 guard then correctly refuses to settle on commits. Nothing was
+    // left alive to move the row, and it sat `working` indefinitely.
+    let h = Harness::new("agent-exited");
+    let e = h.engine(Box::new(Recorded::new(&[
+        "linear_board_page1.json",
+        "linear_board_page2.json",
+        "linear_empty.json",
+    ])));
+    e.sync_once(None).unwrap();
+
+    let a = e
+        .db
+        .insert_attempt(&herdr_board::db::NewAttempt {
+            task_id: "linear:OFF-145".into(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "opencode".into(),
+            worktree: None,
+            branch: Some("board/off-145".into()),
+            dispatched_by: None,
+            base_sha: None,
+        })
+        .unwrap();
+    e.db.set_attempt_pane(a, "w1:p7").unwrap();
+
+    // One tick is the window between `agent start` and herdr classifying the
+    // pane — the log says "agent None is unclassified" there, and reaping it
+    // would end every attempt before it began.
+    e.reconcile(&[pane_without_agent("w1:p7")]).unwrap();
+    e.rederive_all().unwrap();
+    assert_ne!(
+        e.db.get_task("linear:OFF-145").unwrap().unwrap().state,
+        BoardState::Failed,
+        "a pane herdr has not classified yet is not a dead agent"
+    );
+
+    e.reconcile(&[pane_without_agent("w1:p7")]).unwrap();
+    e.rederive_all().unwrap();
+    assert_eq!(
+        e.db.get_task("linear:OFF-145").unwrap().unwrap().state,
+        BoardState::Failed,
+        "an agent gone two ticks running has to release the row"
+    );
+}
+
+#[test]
+fn an_agent_that_worked_before_exiting_is_not_reaped_as_a_failed_start() {
+    // The other side of it: quitting an agent that already did the work must
+    // leave the attempt to settle on its commits, not turn it into a failure.
+    let h = Harness::new("agent-exited-after-working");
+    let e = h.engine(Box::new(Recorded::new(&[
+        "linear_board_page1.json",
+        "linear_board_page2.json",
+        "linear_empty.json",
+    ])));
+    e.sync_once(None).unwrap();
+
+    let a = e
+        .db
+        .insert_attempt(&herdr_board::db::NewAttempt {
+            task_id: "linear:OFF-145".into(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "codex".into(),
+            worktree: None,
+            branch: Some("board/off-145".into()),
+            dispatched_by: None,
+            base_sha: None,
+        })
+        .unwrap();
+    e.db.set_attempt_pane(a, "w1:p7").unwrap();
+    e.db.set_saw_working(a).unwrap();
+
+    for _ in 0..3 {
+        e.reconcile(&[pane_without_agent("w1:p7")]).unwrap();
+    }
+    e.rederive_all().unwrap();
+    assert_ne!(
+        e.db.get_task("linear:OFF-145").unwrap().unwrap().state,
+        BoardState::Failed,
+        "an agent that worked and was then quit is finished, not a failed start"
     );
 }
 

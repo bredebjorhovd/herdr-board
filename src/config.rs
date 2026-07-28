@@ -829,10 +829,25 @@ runtime = "claude"
     fn the_shipped_example_config_parses_and_validates() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing.example.toml");
         let c = RoutingConfig::load(&path).unwrap();
-        assert_eq!(c.routes.len(), 2);
+        assert_eq!(c.routes.len(), 3);
         // `review_state` ships commented out: the example must not turn on a
         // transition against a state the reader's workspace may not have.
         assert!(c.linear.review_state.is_none());
+        // Every runtime the example names has to be one herdr will accept —
+        // including the non-claude one, which is there precisely because it was
+        // supported-but-never-exercised for the board's first two dozen
+        // attempts (AGE-26).
+        for r in &c.routes {
+            assert!(
+                herdr_kind_for_runtime(&r.runtime).is_some(),
+                "example route runtime `{}` maps to no herdr kind",
+                r.runtime
+            );
+        }
+        assert!(
+            c.routes.iter().any(|r| r.runtime != "claude-code"),
+            "the example should show that `runtime` is not decoration"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod adopt;
 pub mod cli;
 pub mod config;
+pub mod conventions;
 pub mod db;
 pub mod dispatch;
 pub mod gc;

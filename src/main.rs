@@ -1,7 +1,7 @@
 //! herdr-board — a task board fed by Linear and GitHub, dispatching into herdr
 //! panes and reconciling pane state back to the board.
 
-use herdr_board::{cli, config, dispatch, gc, herdr, integration, log, stats, ui};
+use herdr_board::{cli, config, conventions, dispatch, gc, herdr, integration, log, stats, ui};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -22,12 +22,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum IntegrationAction {
-    /// Install the hooks (writes to ~/.claude/settings.json; backed up first).
+    /// Install the agent-detection override (Claude Code only).
     Install { agent: String },
-    /// Remove them again, touching nothing else.
+    /// Remove it again, touching nothing else.
     Uninstall { agent: String },
     /// Report whether they are installed.
     Status,
+    /// Write the board conventions into a runtime's global instruction file.
+    ///
+    /// Omit the agent for every runtime that has one. Claude's copy is the
+    /// skill at ~/.claude/skills/board/SKILL.md and is left alone.
+    InstallConventions { agent: Option<String> },
+    /// Take them out again, keeping anything else in the file.
+    UninstallConventions { agent: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -148,7 +155,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Teach herdr to read Claude Code's working state off the screen.
+    /// Teach herdr to read an agent's state, and agents that the board exists.
     Integration {
         #[command(subcommand)]
         action: IntegrationAction,
@@ -163,6 +170,18 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+}
+
+/// One named agent, or every runtime with a global instruction file.
+///
+/// Defaulting to all is the point: the reason the board was Claude-only for two
+/// dozen attempts is that keeping several copies in step was somebody's manual
+/// job, and nobody's.
+fn agents_for(agent: Option<&str>) -> Vec<String> {
+    match agent {
+        Some(a) => vec![a.to_string()],
+        None => conventions::AGENTS.iter().map(|a| a.to_string()).collect(),
+    }
 }
 
 fn main() -> Result<()> {
@@ -432,6 +451,32 @@ fn main() -> Result<()> {
                         println!(
                             "not installed — a working or blocked Claude pane reports `idle`"
                         );
+                    }
+                    for agent in conventions::AGENTS {
+                        let path = conventions::instruction_path(agent)?;
+                        println!(
+                            "{agent} conventions: {} ({})",
+                            if conventions::installed(agent) {
+                                "installed"
+                            } else {
+                                "missing or stale"
+                            },
+                            path.display()
+                        );
+                    }
+                }
+                IntegrationAction::InstallConventions { agent } => {
+                    for agent in agents_for(agent.as_deref()) {
+                        let path = conventions::install(&log, &agent)?;
+                        println!("wrote {}", path.display());
+                    }
+                }
+                IntegrationAction::UninstallConventions { agent } => {
+                    for agent in agents_for(agent.as_deref()) {
+                        match conventions::uninstall(&log, &agent)? {
+                            Some(path) => println!("removed from {}", path.display()),
+                            None => println!("{agent}: nothing of ours to remove"),
+                        }
                     }
                 }
             }

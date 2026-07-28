@@ -123,11 +123,30 @@ pub fn uninstall(log: &Logger) -> Result<()> {
     Ok(())
 }
 
+/// Only Claude Code needs the override — and this is now checked rather than
+/// assumed.
+///
+/// The refusal used to rest on a belief nobody had tested, which mattered
+/// because of the AGE-19 guard: an attempt may only settle on commits once herdr
+/// has reported it `working` at least once. A runtime herdr never reports
+/// `working` for could therefore never settle without a PR, and would sit
+/// `working` forever.
+///
+/// Checked under AGE-26 by dispatching a real task to each and watching the row
+/// through its whole life. Both went `working` → `review` on commits alone, no
+/// PR involved, and the daemon logged `agent done with commits — attempt done`:
+///
+/// - **codex** has `screen_working_fallback` (priority 500), matching its
+///   on-screen `• Working (7s • esc to interrupt)` line. Its manifest has no
+///   `live_prompt_box` rule to outrank it, which is the whole of Claude Code's
+///   problem.
+/// - **opencode** has `interrupt_hint_working` (priority 110), matching the
+///   `esc to interrupt` hint it shows while running.
 pub fn check_supported(agent: &str) -> Result<()> {
     if agent != "claude" {
         bail!(
-            "only `claude` needs this — herdr reads the other runtimes' state \
-             from the screen correctly"
+            "only `claude` needs this — herdr reads codex and opencode from the \
+             screen correctly, verified by dispatching to both (AGE-26)"
         );
     }
     Ok(())

@@ -199,6 +199,63 @@ impl PullRequest {
     }
 }
 
+/// Where a piece of review feedback came from.
+///
+/// Three endpoints, not one. An issue comment on the pull request is the
+/// obvious channel and the only one the board already talks to; an inline
+/// comment hangs off a line of the diff; and a review *submission* carries the
+/// verdict — `changes requested` is the most actionable signal there is and is
+/// not an issue comment at all. Each has its own id sequence, so a watermark
+/// has to be kept per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackKind {
+    /// `/issues/{n}/comments` — the pull request's conversation.
+    Issue,
+    /// `/pulls/{n}/comments` — anchored to a file and line.
+    Inline,
+    /// `/pulls/{n}/reviews` — a submission with a verdict.
+    Review,
+}
+
+impl FeedbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedbackKind::Issue => "comment",
+            FeedbackKind::Inline => "inline comment",
+            FeedbackKind::Review => "review",
+        }
+    }
+}
+
+/// One comment or review on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Feedback {
+    pub kind: FeedbackKind,
+    /// Unique within its own endpoint, and increasing — which is what makes it
+    /// usable as a watermark.
+    pub id: i64,
+    pub body: String,
+    pub url: String,
+    pub created_at: String,
+    pub author: String,
+    /// Inline comments only: the file the comment is anchored to.
+    pub path: Option<String>,
+    /// Inline comments only. GitHub reports `line` against the current diff and
+    /// `original_line` against the commit that was reviewed; a comment on a
+    /// line that has since moved keeps only the latter.
+    pub line: Option<i64>,
+    /// Review submissions only: `changes_requested`, `approved`, `commented`.
+    pub state: Option<String>,
+}
+
+impl Feedback {
+    /// A reviewer asked for changes. The single most actionable thing that can
+    /// happen to a pull request, and worth saying out loud on delivery.
+    pub fn requests_changes(&self) -> bool {
+        self.state.as_deref() == Some("changes_requested")
+    }
+}
+
 pub struct Github<T: Rest> {
     pub rest: T,
 }
@@ -322,6 +379,40 @@ impl<T: Rest> Github<T> {
         Ok(())
     }
 
+    /// Everything anybody has said about one pull request.
+    ///
+    /// Three calls, so a caller has to have a reason before asking: the pull
+    /// request list already reports `updated_at`, and only a pull request whose
+    /// timestamp has moved can have anything new on it.
+    ///
+    /// Returned in the order it was written, across all three endpoints, so a
+    /// reader gets the conversation rather than three piles of it.
+    pub fn pr_feedback(&self, repo: &str, number: i64) -> Result<Vec<Feedback>> {
+        let mut out = Vec::new();
+        for (kind, path) in [
+            (
+                FeedbackKind::Issue,
+                format!("/repos/{repo}/issues/{number}/comments?per_page={PAGE}"),
+            ),
+            (
+                FeedbackKind::Inline,
+                format!("/repos/{repo}/pulls/{number}/comments?per_page={PAGE}"),
+            ),
+            (
+                FeedbackKind::Review,
+                format!("/repos/{repo}/pulls/{number}/reviews?per_page={PAGE}"),
+            ),
+        ] {
+            let v = self.rest.get(&path)?;
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow!("github {path}: expected an array"))?;
+            out.extend(arr.iter().filter_map(|n| parse_feedback(kind, n)));
+        }
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
     pub fn pulls(&self, repo: &str) -> Result<Vec<PullRequest>> {
         let v = self
             .rest
@@ -369,6 +460,57 @@ fn parse_issue(repo: &str, n: &Value) -> Option<GithubIssue> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+    })
+}
+
+fn parse_feedback(kind: FeedbackKind, n: &Value) -> Option<Feedback> {
+    let state = n
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if kind == FeedbackKind::Review {
+        // `pending` is a review its author has not submitted — GitHub only
+        // returns your own, and it is not feedback until it is sent. `dismissed`
+        // is a verdict somebody explicitly withdrew.
+        if matches!(state.as_deref(), Some("pending") | Some("dismissed")) {
+            return None;
+        }
+    }
+    Some(Feedback {
+        kind,
+        id: n.get("id")?.as_i64()?,
+        body: n
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        url: n
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // A review carries `submitted_at`; the two comment endpoints carry
+        // `created_at`. Same fact under two names.
+        created_at: n
+            .get("created_at")
+            .or_else(|| n.get("submitted_at"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        author: n
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        path: n.get("path").and_then(Value::as_str).map(str::to_string),
+        // `line` is null once the diff has moved under the comment; the line it
+        // was written against still says where to look.
+        line: n
+            .get("line")
+            .and_then(Value::as_i64)
+            .or_else(|| n.get("original_line").and_then(Value::as_i64)),
+        state: (kind == FeedbackKind::Review).then_some(state).flatten(),
     })
 }
 
@@ -585,6 +727,94 @@ mod tests {
         let g = Github::new(Refuses);
         let err = g.merge_pr("o/r", 508).unwrap_err().to_string();
         assert!(err.contains("required status check"), "{err}");
+    }
+
+    fn reviewed_pr() -> Github<FixtureRest> {
+        Github::new(FixtureRest::new(vec![
+            (
+                "/repos/o/r/issues/14/comments".into(),
+                json!([{ "id": 41, "body": "Also check the watermark.",
+                         "html_url": "https://github.com/o/r/pull/14#issuecomment-41",
+                         "created_at": "2026-07-28T11:10:00Z",
+                         "user": { "login": "bredebjorhovd" } }]),
+            ),
+            (
+                "/repos/o/r/pulls/14/comments".into(),
+                json!([{ "id": 77, "body": "This drops a human comment.",
+                         "html_url": "https://github.com/o/r/pull/14#discussion_r77",
+                         "created_at": "2026-07-28T11:05:00Z",
+                         "path": "src/review.rs", "line": 88,
+                         "user": { "login": "bredebjorhovd" } }]),
+            ),
+            (
+                "/repos/o/r/pulls/14/reviews".into(),
+                json!([
+                    { "id": 900, "body": "Two things.", "state": "CHANGES_REQUESTED",
+                      "html_url": "https://github.com/o/r/pull/14#pullrequestreview-900",
+                      "submitted_at": "2026-07-28T11:00:00Z",
+                      "user": { "login": "bredebjorhovd" } },
+                    // Never submitted, so not feedback yet.
+                    { "id": 901, "body": "draft", "state": "PENDING",
+                      "submitted_at": "2026-07-28T11:20:00Z",
+                      "user": { "login": "bredebjorhovd" } },
+                    // Explicitly withdrawn.
+                    { "id": 902, "body": "old", "state": "DISMISSED",
+                      "submitted_at": "2026-07-28T11:21:00Z",
+                      "user": { "login": "bredebjorhovd" } }
+                ]),
+            ),
+        ]))
+    }
+
+    /// The three sources, in one conversation. A review submission carries the
+    /// verdict and is not an issue comment at all, which is why asking only the
+    /// endpoint the board already writes to would miss the loudest signal.
+    #[test]
+    fn feedback_comes_from_all_three_endpoints_in_the_order_it_was_written() {
+        let g = reviewed_pr();
+        let f = g.pr_feedback("o/r", 14).unwrap();
+        assert_eq!(
+            f.iter().map(|x| (x.kind, x.id)).collect::<Vec<_>>(),
+            vec![
+                (FeedbackKind::Review, 900),
+                (FeedbackKind::Inline, 77),
+                (FeedbackKind::Issue, 41),
+            ]
+        );
+        assert!(f[0].requests_changes());
+        assert_eq!(f[0].state.as_deref(), Some("changes_requested"));
+        // Enough to act on without a lookup.
+        assert_eq!(f[1].path.as_deref(), Some("src/review.rs"));
+        assert_eq!(f[1].line, Some(88));
+        assert_eq!(f[2].body, "Also check the watermark.");
+    }
+
+    #[test]
+    fn unsubmitted_and_withdrawn_reviews_are_not_feedback() {
+        let g = reviewed_pr();
+        let f = g.pr_feedback("o/r", 14).unwrap();
+        assert!(
+            !f.iter().any(|x| x.id == 901 || x.id == 902),
+            "pending and dismissed reviews must not reach a pane"
+        );
+    }
+
+    /// GitHub nulls `line` once the diff has moved under a comment. The line it
+    /// was written against still says where to look.
+    #[test]
+    fn an_inline_comment_on_moved_code_keeps_the_line_it_was_written_against() {
+        let g = Github::new(FixtureRest::new(vec![
+            ("/repos/o/r/issues/14/comments".into(), json!([])),
+            (
+                "/repos/o/r/pulls/14/comments".into(),
+                json!([{ "id": 77, "body": "here", "created_at": "t",
+                         "path": "src/sync.rs", "line": null, "original_line": 412,
+                         "user": { "login": "b" } }]),
+            ),
+            ("/repos/o/r/pulls/14/reviews".into(), json!([])),
+        ]));
+        let f = g.pr_feedback("o/r", 14).unwrap();
+        assert_eq!(f[0].line, Some(412));
     }
 
     #[test]

@@ -1177,6 +1177,20 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                 },
             });
 
+            checks.push(Check {
+                name: "review delivery".into(),
+                ok: true,
+                detail: if cfg.github.deliver_reviews {
+                    "on — a review on a pull request is delivered into the pane that \
+                     wrote it, while that pane is still alive and idle"
+                        .into()
+                } else {
+                    "off — a review reaches nobody until you go and tell the agent \
+                     (`[github] deliver_reviews = true` to enable)"
+                        .into()
+                },
+            });
+
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.

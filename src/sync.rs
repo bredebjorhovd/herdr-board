@@ -80,6 +80,11 @@ pub mod meta {
     pub fn writeback_at(task_id: &str) -> String {
         format!("wb_at:{task_id}")
     }
+    /// Which review comments have already been delivered into a task's pane —
+    /// see [`crate::review::Delivered`].
+    pub fn reviews_for(task_id: &str) -> String {
+        format!("reviews:{task_id}")
+    }
 }
 
 impl SyncEngine {
@@ -87,7 +92,10 @@ impl SyncEngine {
     /// marks the header and serves stale data (impl spec §7).
     pub fn sync_once(&self, herdr: Option<&Herdr>) -> Result<()> {
         self.poll_linear();
-        self.poll_github();
+        // The polled pull requests are handed on rather than refetched: review
+        // delivery needs each one's `updated_at` to decide whether asking about
+        // its comments is worth a call at all.
+        let pulls = self.poll_github();
 
         // Reconciliation needs to know what herdr currently believes.
         let panes = match herdr {
@@ -111,6 +119,12 @@ impl SyncEngine {
             && let Err(e) = self.dispose_finished_panes(h)
         {
             self.log.warn(format!("disposing finished panes: {e}"));
+        }
+        // After derivation, because `review` is the state that keeps a pane
+        // alive, and after disposal, so a task that just reached `done` is not
+        // woken on its way out (gh#13).
+        if let (Some(h), Some(panes)) = (herdr, &panes) {
+            self.deliver_reviews(h, panes, &pulls);
         }
         self.drain_writebacks();
         // A repo with a herdr workspace and no board config is silent — its
@@ -298,12 +312,14 @@ impl SyncEngine {
         }
     }
 
-    fn poll_github(&self) {
+    /// Returns every pull request seen this cycle, so the caller does not have
+    /// to ask GitHub for them a second time.
+    fn poll_github(&self) -> Vec<PullRequest> {
         let Some(gh) = &self.github else {
-            return;
+            return Vec::new();
         };
         if self.cfg.github.repos.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut all_pulls: Vec<PullRequest> = Vec::new();
         let mut failed: Option<String> = None;
@@ -402,6 +418,7 @@ impl SyncEngine {
                     .warn(format!("github poll failed (attempt {failures}): {e}"));
             }
         }
+        all_pulls
     }
 
     /// Attach PRs to tasks by attempt branch (`board/<identifier>`), which is

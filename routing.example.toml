@@ -103,6 +103,19 @@ pull_requests = true
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
 writeback = false
+# Deliver review comments back into the pane that wrote the pull request.
+#
+# A task in `review` keeps its pane, so the agent that wrote the PR is still
+# sitting there with the whole task in context — and a review is a notification
+# it has no way to receive. This wakes it with the comment, the PR url, and for
+# an inline comment the file and line. Issue comments, inline comments and
+# review submissions all count; `changes requested` is the loudest and is not an
+# issue comment at all.
+#
+# On by default, unlike `writeback`: this writes nothing to anybody's repository,
+# it types into a pane of your own. Comments only reach an agent that is idle,
+# never one mid-turn, and each is delivered once.
+deliver_reviews = true
 
 # One repo, answering differently from the list above. `name` must also appear
 # in `repos` — a table naming anything else is settings that apply to nothing,

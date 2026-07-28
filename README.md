@@ -577,6 +577,62 @@ Two different things are called labels, which is easy to trip on:
 - `[[route]] match = { label = ... }` — the **router**: where a task goes once
   it is on the board.
 
+### Reviewing a pull request reaches the agent that wrote it
+
+An orchestrator reviews a task and writes its feedback on the pull request. The
+agent that wrote the PR never saw it: it is sitting idle in a live pane with the
+entire task in context, and the review is a notification it has no way to
+receive. So the board delivers it.
+
+The precondition already held by accident. `dispose_finished_panes` only closes a
+pane once its *task* reaches `done`; a task in `review` keeps its pane, so the
+author is still alive with its context. And the delivery mechanism is the one
+every dispatch uses — `herdr agent prompt` — which costs an idle pane nothing.
+
+Three sources, not one, because the loudest signal is not a comment at all:
+
+| endpoint | what it carries |
+|---|---|
+| `/issues/{n}/comments` | the pull request's conversation |
+| `/pulls/{n}/comments` | anchored to a file and line — both are delivered |
+| `/pulls/{n}/reviews` | the verdict; `changes requested` is the strongest thing that can happen to a PR |
+
+The agent is woken with the body, the PR url, and for an inline comment the file
+and line — enough to act on without going and looking.
+
+**The loop, and why author filtering cannot close it.** The orchestrator and the
+agent act as the same GitHub identity — both are your token — so "skip my own
+comments" has nothing to key on. Deliver a comment, the agent replies on the PR,
+the board sees a new comment and delivers it back, forever. Three things close
+it, and they are requirements rather than details:
+
+- **A watermark per pull request**, per endpoint, of the last comment id
+  consumed. An id below it can never come back, so nothing arrives twice.
+- **Only an idle agent is woken.** An agent that just replied is working, so its
+  own reply is not delivered back to it. Feedback that lands while it is busy is
+  *kept*, not consumed — it goes in when the agent frees up.
+- **A latch on the wake.** Between waking an agent and seeing it settle again,
+  whatever appears on the PR is its own reply: consumed rather than delivered,
+  and logged so that is visible. A human comment landing inside that window is
+  swallowed with it — the honest limit of having no author to key on.
+
+Two more things it will not do. It verifies the pane still exists *and* still
+holds the agent that wrote the PR — herdr must report an agent in it, and the
+pane's cwd must still be that attempt's checkout — because delivering someone
+else's review into an unrelated session is worse than not delivering. And a task
+whose pane is gone is skipped quietly, said once in `syncd.log`, never
+re-dispatched: that would be a second agent on work already written.
+
+Poll cost is a call only when there is something to ask about. The pull request
+list already reports `updated_at`, so the three comment endpoints are read only
+for a PR whose timestamp has moved since the last look; the steady state is free.
+The board's own dispatch and outcome comments are recognised and never delivered,
+and an approval with nothing written on it wakes nobody.
+
+Turn it off with `deliver_reviews = false` under `[github]`. It is on by default,
+unlike `writeback`, because it writes nothing to anybody's repository — it types
+into a pane of your own. `doctor` states which way it is set.
+
 ### What Linear is told, and when
 
 Three transitions, and each one is a moment a person reading Linear rather than

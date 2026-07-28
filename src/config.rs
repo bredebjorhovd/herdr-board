@@ -370,6 +370,17 @@ pub struct GithubConfig {
     /// upstream.
     #[serde(default)]
     pub writeback: bool,
+    /// Wake the agent that wrote a pull request when somebody reviews it.
+    ///
+    /// The agent is still sitting in its pane with the whole task in context —
+    /// a task in `review` keeps its pane, so the author is alive and idle — and
+    /// a review is a notification it has no way to receive. This delivers new
+    /// comments into that pane.
+    ///
+    /// **On by default**, unlike [`GithubConfig::writeback`]: this writes
+    /// nothing to anybody's repository. It types into a pane of your own.
+    #[serde(default = "default_true")]
+    pub deliver_reviews: bool,
 }
 
 fn default_true() -> bool {
@@ -384,6 +395,7 @@ impl Default for GithubConfig {
             per_repo: Vec::new(),
             pull_requests: true,
             writeback: false,
+            deliver_reviews: true,
         }
     }
 }

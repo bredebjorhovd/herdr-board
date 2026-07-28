@@ -352,39 +352,30 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
     render_header(buf, area, "herdr-board", Some(&app.sync));
 
     let last = area.height.saturating_sub(1);
-    let body_top = 2u16;
     let body_bottom = last.saturating_sub(2); // rule sits at last-1
     let mut more_marker: Option<String> = None;
 
-    if app.is_empty() {
-        render_empty(buf, area, body_top, app);
+    // An empty queue does not mean an empty body: a board with no tasks and a
+    // repo nobody has adopted is exactly the case this exists for, and the
+    // section has to draw underneath the empty copy rather than instead of it.
+    let body_top = if app.is_empty() {
+        render_empty(buf, area, 2, app)
     } else {
-        // Own the section layout before mutating `app.rows` below.
-        let sections: Vec<(BoardState, Vec<TaskView>)> = app
-            .sections()
-            .into_iter()
-            .map(|(s, rows)| (s, rows.into_iter().cloned().collect()))
-            .collect();
+        2u16
+    };
 
-        // Flatten to the full list of lines the body would draw, then take a
-        // window of it. Without this the body is simply clipped: a selection
-        // below the fold is invisible and unreachable, which on a short pane is
-        // most of the board.
-        let mut lines: Vec<Row> = Vec::new();
-        for (state, rows) in sections {
-            // One selectable header per section, whichever way it is folded.
-            lines.push(Row::Section(state));
-            if app.is_collapsed(state) {
-                continue;
-            }
-            lines.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
-        }
+    // Flatten to the full list of lines the body would draw, then take a window
+    // of it. Without this the body is simply clipped: a selection below the fold
+    // is invisible and unreachable, which on a short pane is most of the board.
+    let lines: Vec<Row> = app.rows();
 
+    if body_top <= body_bottom {
         let height = (body_bottom + 1).saturating_sub(body_top) as usize;
         app.scroll = clamp_scroll(&lines, app.selected_id.as_deref(), app.scroll, height);
 
         let mut y = body_top;
         for row in lines.iter().skip(app.scroll).take(height) {
+            let selected = app.selected_id.as_deref() == Some(row.id().as_str());
             match row {
                 Row::Section(state) => {
                     render_section_header(
@@ -395,7 +386,7 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
                         app.is_collapsed(*state),
                         app.section_len(*state),
                     );
-                    if app.on_section_header() == Some(*state) {
+                    if selected {
                         reverse_row(buf, area, y, COL_GUTTER);
                     }
                 }
@@ -403,8 +394,25 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
                     let Some(v) = app.views.iter().find(|v| v.id() == id) else {
                         continue;
                     };
-                    let selected = app.selected_id.as_deref() == Some(id.as_str());
                     render_task_row(buf, area, y, v, selected);
+                }
+                Row::UnadoptedSection => {
+                    render_unadopted_header(
+                        buf,
+                        area,
+                        y,
+                        app.collapsed_unadopted,
+                        app.unadopted.len(),
+                    );
+                    if selected {
+                        reverse_row(buf, area, y, COL_GUTTER);
+                    }
+                }
+                Row::Unadopted(slug) => {
+                    let Some(u) = app.unadopted.iter().find(|u| &u.slug == slug) else {
+                        continue;
+                    };
+                    render_unadopted_row(buf, area, y, u, selected);
                 }
             }
             app.rows.push((y, row.clone()));
@@ -432,7 +440,8 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
     render_footer(buf, area, last, app);
 }
 
-fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
+/// Draw the empty state and return the first row still free beneath it.
+fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) -> u16 {
     // Two different empty states. A configured board with nothing on it says so
     // and stops; a board that was never set up says what is missing, because
     // naming a config file the operator has not created is not an instruction.
@@ -454,7 +463,7 @@ fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
             "maps issues to a workspace and a runtime.",
             theme::dim(),
         );
-        return;
+        return y + 5;
     }
 
     put(
@@ -465,8 +474,8 @@ fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
         "Nothing queued, because the board is not set up yet.",
         theme::fg_default(),
     );
-    for (i, hint) in app.setup_hints.iter().enumerate() {
-        let row = y + 2 + i as u16;
+    let mut row = y + 2;
+    for hint in &app.setup_hints {
         if row >= area.height.saturating_sub(3) {
             break;
         }
@@ -478,6 +487,82 @@ fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) {
             &truncate(hint, area.width.saturating_sub(2) as usize),
             theme::dim(),
         );
+        row += 1;
+    }
+    row + 1
+}
+
+/// The glyph for a repo the board is not watching.
+///
+/// A seventh shape, distinct from all six state glyphs: an unadopted repo is
+/// not a state a task can be in, and reading it as one would be worse than not
+/// showing it. Like every other gutter it has to survive color being stripped,
+/// so the shape carries it.
+pub const UNADOPTED_GLYPH: &str = "⌾";
+
+fn render_unadopted_header(buf: &mut Buffer, area: Rect, y: u16, collapsed: bool, len: usize) {
+    put(buf, area, COL_GUTTER, y, UNADOPTED_GLYPH, theme::fg_default());
+    let used = put(buf, area, COL_ID, y, "UNADOPTED  ", theme::bold());
+    let hint = if collapsed {
+        format!("{len} hidden · enter to expand  ")
+    } else {
+        // Says what the section *is* rather than counting rows you can see —
+        // the same rule the state headers follow.
+        "not polled, not dispatchable  ".to_string()
+    };
+    let used2 = put(buf, area, COL_ID + used, y, &hint, theme::dim());
+    rule(
+        buf,
+        area,
+        COL_ID + used + used2,
+        area.width.saturating_sub(2),
+        y,
+        theme::dim(),
+    );
+}
+
+/// `⌾ tripletex-mcp                        Florin-AS/tripletex-mcp`
+///
+/// The workspace label reads as the title, because it is the name you recognise
+/// from the spaces sidebar; the slug is metadata, because it is what gets
+/// written to config. Same hierarchy as a task row.
+fn render_unadopted_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    u: &crate::adopt::Unadopted,
+    selected: bool,
+) {
+    put(buf, area, COL_GUTTER, y, UNADOPTED_GLYPH, theme::fg_default());
+
+    let meta = format!("{}{}", u.slug, u.missing.note());
+    let right = area.width.saturating_sub(2);
+    let meta_w = meta.chars().count() as u16;
+    // Below the narrow limit the slug goes rather than the name: the name is
+    // what identifies the row, and a truncated slug identifies nothing.
+    let show_meta = area.width >= NARROW_LIMIT && meta_w + COL_ID + 12 < right;
+    let name_max = if show_meta {
+        right
+            .saturating_sub(meta_w)
+            .saturating_sub(TITLE_METADATA_GAP)
+            .saturating_sub(COL_ID)
+            + 1
+    } else {
+        right.saturating_sub(COL_ID) + 1
+    };
+    put(
+        buf,
+        area,
+        COL_ID,
+        y,
+        &truncate(&u.label, name_max as usize),
+        theme::fg_default(),
+    );
+    if show_meta {
+        put_right(buf, area, right, y, &meta, theme::dim());
+    }
+    if selected {
+        reverse_row(buf, area, y, COL_GUTTER);
     }
 }
 
@@ -612,6 +697,27 @@ pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
             v.push(("?", "help", '?'));
             v
         }
+        // The two keys the design sketches beneath the row itself. They live in
+        // the footer instead, where every other affordance on this board lives —
+        // a second line per row would be the only variable-height row on screen.
+        Screen::List if app.unadopted_selected().is_some() => vec![
+            ("a", "adopt — write the route and start polling", 'a'),
+            ("X", "ignore", 'X'),
+            ("?", "help", '?'),
+        ],
+        Screen::List if app.on_unadopted_header() => vec![
+            (
+                "enter",
+                if app.collapsed_unadopted {
+                    "expand"
+                } else {
+                    "collapse"
+                },
+                '\r',
+            ),
+            ("s", "sync", 's'),
+            ("?", "help", '?'),
+        ],
         Screen::List if app.on_section_header().is_some() => {
             let folded = app
                 .on_section_header()
@@ -989,6 +1095,13 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "unadopted",
+        &[
+            ("a", "adopt — write its route and poll its issues"),
+            ("X", "ignore — a repo you are only reading"),
+        ],
+    ),
+    (
         "elsewhere",
         &[
             ("g", "focus the bound herdr pane"),
@@ -1059,12 +1172,9 @@ pub fn clamp_scroll(
     let Some(id) = selected else {
         return scroll.min(max);
     };
-    // The `done` header is a selectable row that is not a task, so it has to be
-    // findable here too or selecting it below the fold scrolls nowhere.
-    let Some(ix) = lines.iter().position(|r| match r {
-        Row::Task(t) => t == id,
-        Row::Section(st) => crate::ui::state::section_row_id(*st) == id,
-    }) else {
+    // Headers are selectable rows that are not tasks, so they have to be
+    // findable here too or selecting one below the fold scrolls nowhere.
+    let Some(ix) = lines.iter().position(|r| r.id() == id) else {
         return scroll.min(max);
     };
     // Keep the section header above the selection visible where it is cheap to
@@ -1309,6 +1419,78 @@ mod tests {
     }
 
     #[test]
+    fn an_unadopted_repo_is_named_on_the_board_rather_than_being_silent() {
+        // The bug: a repo with a herdr workspace and no board config polls
+        // nothing and says nothing. The section is the whole fix.
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        let buf = draw(&mut app, 80, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        assert!(
+            body.iter().any(|l| l.contains("UNADOPTED")),
+            "no section header:\n{}",
+            body.join("\n")
+        );
+        let row = body
+            .iter()
+            .find(|l| l.contains("tripletex-mcp"))
+            .expect("the repo is not on screen");
+        assert!(
+            row.contains("Florin-AS/tripletex-mcp"),
+            "the slug is what gets written to config, so it has to be shown: {row:?}"
+        );
+        // The half-fixes say which half, or the operator cannot tell a row that
+        // will not dispatch from one that is never polled.
+        assert!(body.iter().any(|l| l.contains("· no route")), "{body:?}");
+        assert!(body.iter().any(|l| l.contains("· not polled")), "{body:?}");
+    }
+
+    #[test]
+    fn an_empty_queue_still_draws_the_reason_it_is_empty() {
+        // "Nothing queued" and "and here is the repo nobody adopted" have to
+        // share a body; showing only the first is the silence AGE-18 removes.
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        assert!(app.is_empty());
+        let buf = draw(&mut app, 80, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        assert!(body.iter().any(|l| l.contains("Nothing queued")));
+        assert!(body.iter().any(|l| l.contains("UNADOPTED")));
+    }
+
+    #[test]
+    fn the_unadopted_glyph_is_not_any_states_glyph() {
+        // Rule 3: color gets stripped, so the shape is the only carrier left.
+        for st in BoardState::SECTION_ORDER {
+            assert_ne!(st.glyph(), UNADOPTED_GLYPH, "{st} shares the adoption glyph");
+        }
+    }
+
+    #[test]
+    fn the_section_draws_last_however_full_the_board_is() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        app.collapsed.clear();
+        let buf = draw(&mut app, 80, 40);
+        let body: Vec<String> = (0..40).map(|y| line(&buf, y)).collect();
+        let unadopted = body.iter().position(|l| l.contains("UNADOPTED")).unwrap();
+        let done = body.iter().position(|l| l.contains("DONE today")).unwrap();
+        assert!(unadopted > done, "it pushed the queue down:\n{}", body.join("\n"));
+    }
+
+    #[test]
+    fn a_narrow_pane_keeps_the_name_and_drops_the_slug() {
+        // A truncated `owner/repo` identifies nothing; the workspace label is
+        // the part you recognise.
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        let buf = draw(&mut app, 44, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        assert!(body.iter().any(|l| l.contains("tripletex-mcp")));
+        assert!(
+            !body.iter().any(|l| l.contains("Florin-AS/")),
+            "a half-slug on a narrow pane:\n{}",
+            body.join("\n")
+        );
+    }
+
+    #[test]
     fn the_selection_is_always_on_screen() {
         // Without a viewport the body is just clipped, and every row below the
         // fold is invisible and unreachable.
@@ -1319,10 +1501,7 @@ mod tests {
         for id in &ids {
             app.selected_id = Some(id.clone());
             let buf = draw(&mut app, 80, 12);
-            let on_screen = app.rows.iter().any(|(_, r)| match r {
-                Row::Task(t) => t == id,
-                Row::Section(st) => &crate::ui::state::section_row_id(*st) == id,
-            });
+            let on_screen = app.rows.iter().any(|(_, r)| &r.id() == id);
             assert!(on_screen, "{id:?} was selected but never drawn");
             let _ = buf;
         }

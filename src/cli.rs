@@ -83,6 +83,11 @@ pub fn reconcile_once(paths: &Paths, log: Arc<Logger>) -> Result<()> {
     let panes = herdr.pane_list()?;
     engine.reconcile(&panes)?;
     engine.rederive_all()?;
+    // Also what `pane.created` fires: opening a pane in a repo the board has
+    // never seen is the moment to notice it, rather than up to a poll interval
+    // later. The sync loop detects the same thing on its own, so this only ever
+    // makes it sooner.
+    engine.detect_unadopted(&herdr);
     Ok(())
 }
 
@@ -283,16 +288,7 @@ pub fn github_slug(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn git_remote(repo_root: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", repo_root, "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
+use crate::adopt::git_remote;
 
 /// Generate a starter `routing.toml` from the herdr workspaces that actually
 /// exist, so nobody has to hand-write repo lists to see anything.
@@ -1168,6 +1164,15 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                     detail,
                 });
             }
+
+            // A repo whose workspace exists but whose config does not is
+            // silent, not broken — `ok` stays true, or a repo you are only
+            // reading would make the whole report exit non-zero.
+            checks.push(Check {
+                name: "unadopted repos".into(),
+                ok: true,
+                detail: crate::adopt::doctor_detail(&cfg, &herdr),
+            });
 
             let workspaces = herdr.workspace_list().unwrap_or_default();
             for r in &cfg.routes {

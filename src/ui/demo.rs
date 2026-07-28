@@ -119,6 +119,9 @@ fn apply(app: &mut App, action: Action) -> bool {
                 Screen::Prompt
             }
         }
+        Action::Enter if app.on_unadopted_header() => {
+            app.collapsed_unadopted = !app.collapsed_unadopted
+        }
         Action::Enter => match app.on_section_header() {
             Some(state) => app.toggle_collapsed(state),
             None => match app.selected().map(|v| (v.state(), v.has_route)) {
@@ -194,6 +197,25 @@ fn apply(app: &mut App, action: Action) -> bool {
             if let Some(v) = app.selected() {
                 let ident = v.task.identifier.clone();
                 app.flash(format!("opened {ident} in your browser"));
+            }
+        }
+        // Both write to routing.toml, which the demo has none of — so they stop
+        // at the line the board flashes, which is the part worth reviewing: it
+        // has to say what was written and that the label is a guess.
+        Action::Adopt => {
+            if let Some(u) = app.unadopted_selected() {
+                let (slug, name) = (u.slug.clone(), u.name().to_string());
+                app.flash(format!(
+                    "✓ adopted {slug} — route + polling. Linear label `{name}` is only a suggestion, commented out in routing.toml"
+                ));
+            }
+        }
+        Action::Ignore => {
+            if let Some(u) = app.unadopted_selected() {
+                let slug = u.slug.clone();
+                app.flash(format!(
+                    "✓ ignoring {slug} — remove it from `[adopt] ignore` to be offered it again"
+                ));
             }
         }
         Action::Sync => app.flash("synced"),

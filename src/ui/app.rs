@@ -47,6 +47,10 @@ pub enum Action {
     Cancel,
     /// Merge the pull request on a `review` row.
     Merge,
+    /// Write the config an unadopted repo is missing.
+    Adopt,
+    /// Stop offering an unadopted repo.
+    Ignore,
     Sync,
     /// Throughput.
     Stats,
@@ -93,6 +97,10 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('d') => Action::MarkDone,
         KeyCode::Char('x') => Action::Cancel,
         KeyCode::Char('m') => Action::Merge,
+        KeyCode::Char('a') => Action::Adopt,
+        // Uppercase because `x` is already cancel, and because adopting the
+        // wrong repo is one edit to undo while ignoring one makes it vanish.
+        KeyCode::Char('X') => Action::Ignore,
         KeyCode::Char('s') => Action::Sync,
         KeyCode::Char('t') => Action::Stats,
         KeyCode::Char('?') => Action::Help,
@@ -120,6 +128,8 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
                 'o' => Action::Open,
                 'x' => Action::Cancel,
                 'm' => Action::Merge,
+                'a' => Action::Adopt,
+                'X' => Action::Ignore,
                 'r' => Action::Retry,
                 'd' => Action::MarkDone,
                 's' => Action::Sync,
@@ -139,6 +149,18 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
         Row::Section(state) => {
             app.selected_id = Some(crate::ui::state::section_row_id(state));
             Action::Enter
+        }
+        Row::UnadoptedSection => {
+            app.selected_id = Some(crate::ui::state::UNADOPTED_ROW.to_string());
+            Action::Enter
+        }
+        // Selects, and nothing more. Both keys on this row write to a file the
+        // operator hand-maintains, which is not something a stray double-click
+        // should be able to do — the footer hints are the click target.
+        Row::Unadopted(slug) => {
+            app.selected_id = Some(crate::adopt::row_id(&slug));
+            *last_click = Some((y, Instant::now()));
+            Action::None
         }
         Row::Task(id) => {
             let double = last_click
@@ -250,7 +272,11 @@ impl Board {
         let tasks = self.engine.db.load_tasks()?;
         let views = build_views(tasks, &self.engine.cfg, &self.paths);
         let sync = read_sync_status(&self.engine)?;
-        self.app.refresh(views, sync);
+        // Written by whoever last swept — the daemon, a `pane.created` hook, or
+        // this board after an adoption. Reading it is what keeps the TUI from
+        // shelling out to herdr on its own tick.
+        let unadopted = crate::adopt::stored(&self.engine.db);
+        self.app.refresh(views, sync, unadopted);
         self.app.setup_hints = setup_hints(&self.engine.cfg, &self.paths);
         self.revive_daemon();
         Ok(())
@@ -310,11 +336,17 @@ impl Board {
             Action::ConfirmYes => self.do_cancel()?,
             Action::Retry => self.retry()?,
             Action::MarkDone => self.mark_done()?,
+            Action::Adopt => self.adopt()?,
+            Action::Ignore => self.ignore()?,
         }
         Ok(())
     }
 
     fn on_enter(&mut self) -> Result<()> {
+        if self.app.on_unadopted_header() {
+            self.app.collapsed_unadopted = !self.app.collapsed_unadopted;
+            return Ok(());
+        }
         // On the collapsed done header, enter expands it in place.
         if let Some(state) = self.app.on_section_header() {
             // The header is the only way in and the only way out.
@@ -462,6 +494,67 @@ impl Board {
         // A retry clears a previous `mark done` so the row can move again.
         self.engine.db.set_local_done(v.id(), false)?;
         self.open_picker(v.id())
+    }
+
+    /// `a` — write the config an unadopted repo is missing.
+    ///
+    /// The whole point of adopting explicitly is that the operator sees what
+    /// was written, so this says so rather than flashing `✓ adopted` and
+    /// leaving them to diff the file.
+    fn adopt(&mut self) -> Result<()> {
+        let Some(u) = self.app.unadopted_selected().cloned() else {
+            return Ok(());
+        };
+        match crate::adopt::adopt(&self.paths.routing(), &u) {
+            Ok(done) => {
+                let wrote = match (done.wrote_route, done.wrote_repo) {
+                    (true, true) => "route + polling",
+                    (true, false) => "route",
+                    (false, true) => "polling",
+                    (false, false) => "nothing",
+                };
+                self.log
+                    .info(format!("adopted {} ({wrote})", u.slug));
+                // Naming the guess is the point: a git remote cannot tell you a
+                // Linear label, and a suggestion nobody reads is not one.
+                self.app.flash(format!(
+                    "✓ adopted {} — {wrote}. Linear label `{}` is only a suggestion, commented out in routing.toml",
+                    u.slug, done.suggested_label
+                ));
+            }
+            Err(e) => {
+                self.log.error(format!("adopting {}: {e:#}", u.slug));
+                self.app.flash(format!("✕ could not adopt {}: {e}", u.slug));
+            }
+        }
+        self.after_config_write()
+    }
+
+    /// `X` — stop offering a repo. Plenty of the repos you open a pane in are
+    /// ones you are only reading; without this the section never empties.
+    fn ignore(&mut self) -> Result<()> {
+        let Some(u) = self.app.unadopted_selected().cloned() else {
+            return Ok(());
+        };
+        match crate::adopt::ignore(&self.paths.routing(), &u.slug) {
+            Ok(()) => self.app.flash(format!(
+                "✓ ignoring {} — remove it from `[adopt] ignore` to be offered it again",
+                u.slug
+            )),
+            Err(e) => self.app.flash(format!("✕ could not ignore {}: {e}", u.slug)),
+        }
+        self.after_config_write()
+    }
+
+    /// Re-read the config we just wrote and re-run detection, so the row leaves
+    /// the board on this keypress rather than on the daemon's next cycle.
+    fn after_config_write(&mut self) -> Result<()> {
+        // Force the mtime check to re-read: an edit landing inside the same
+        // filesystem timestamp as the last one would otherwise look unchanged.
+        self.routing_mtime = None;
+        self.reload_routing();
+        self.engine.detect_unadopted(&self.herdr);
+        self.reload()
     }
 
     fn mark_done(&mut self) -> Result<()> {
@@ -664,6 +757,8 @@ pub fn open_board(paths: Paths, log: Arc<Logger>) -> Result<Board> {
         sync,
         paths.routing().to_string_lossy().into_owned(),
     );
+    app.unadopted = crate::adopt::stored(&engine.db);
+    app.selected_id = app.first_actionable().or(app.selected_id);
     app.setup_hints = setup_hints(&engine.cfg, &paths);
     Ok(Board {
         app,
@@ -752,6 +847,65 @@ mod tests {
                 "`{c}` is bound but the help screen never mentions it"
             );
         }
+    }
+
+    #[test]
+    fn adoption_binds_a_and_a_capital_x() {
+        // `X` rather than `x`, which is already cancel — and ignoring a repo is
+        // the one thing here that makes a row disappear.
+        let app = fixtures::app(fixtures::UNADOPTED);
+        assert_eq!(key_action(&app, key('a')), Action::Adopt);
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Action::Ignore
+        );
+        assert_eq!(key_action(&app, key('x')), Action::Cancel, "`x` still cancels");
+    }
+
+    #[test]
+    fn an_unadopted_row_offers_exactly_the_two_keys_that_act_on_it() {
+        let app = fixtures::app(fixtures::UNADOPTED);
+        assert!(app.unadopted_selected().is_some(), "the cursor is on a repo");
+        let keys: Vec<char> = render::footer_hints(&app).iter().map(|(_, _, c)| *c).collect();
+        assert_eq!(keys, vec!['a', 'X', '?']);
+    }
+
+    #[test]
+    fn enter_on_the_unadopted_header_folds_it_like_any_other() {
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        app.selected_id = Some(crate::ui::state::UNADOPTED_ROW.into());
+        assert!(app.on_unadopted_header());
+        let hints = render::footer_hints(&app);
+        assert_eq!(hints[0], ("enter", "collapse", '\r'));
+        app.collapsed_unadopted = true;
+        assert_eq!(render::footer_hints(&app)[0], ("enter", "expand", '\r'));
+    }
+
+    #[test]
+    fn clicking_an_unadopted_row_selects_it_and_does_nothing_else() {
+        // Both its keys write to a file the operator hand-maintains, which is
+        // not something a stray double-click should be able to do.
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.last_height = 24;
+        render::render(&mut buf, area, &mut app);
+        let (y, slug) = app
+            .rows
+            .iter()
+            .find_map(|(y, r)| match r {
+                Row::Unadopted(s) => Some((*y, s.clone())),
+                _ => None,
+            })
+            .expect("the fixture draws repo rows");
+        let mut last = None;
+        assert_eq!(mouse_action(&mut app, click(20, y), &mut last), Action::None);
+        assert_eq!(app.selected_id, Some(crate::adopt::row_id(&slug)));
+        assert_eq!(
+            mouse_action(&mut app, click(20, y), &mut last),
+            Action::None,
+            "a double-click must not write config"
+        );
     }
 
     #[test]

@@ -1357,6 +1357,7 @@ mod tests {
             agent_status: Some(status),
             focused: false,
             label: None,
+            cwd: None,
         }
     }
 

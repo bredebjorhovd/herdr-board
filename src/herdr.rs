@@ -45,6 +45,10 @@ pub struct PaneInfo {
     /// Pane label. herdr sets this from the manifest `title` for plugin panes,
     /// which is how we recognise our own board.
     pub label: Option<String>,
+    /// Where the pane is. A workspace herdr has no `repo_root` for can still
+    /// hold a pane sitting inside a checkout, which is the only thing that says
+    /// what repo the operator is actually working in.
+    pub cwd: Option<String>,
 }
 
 /// A pane's position and size within its tab.
@@ -781,6 +785,10 @@ fn parse_pane(p: &Value) -> Option<PaneInfo> {
             .map(AgentStatus::parse),
         focused: p.get("focused").and_then(Value::as_bool).unwrap_or(false),
         label: p.get("label").and_then(Value::as_str).map(str::to_string),
+        cwd: p
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -822,6 +830,7 @@ mod tests {
             agent_status: None,
             focused,
             label: None,
+            cwd: None,
         }
     }
 

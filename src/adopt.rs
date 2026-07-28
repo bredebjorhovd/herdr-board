@@ -45,13 +45,36 @@ pub enum Missing {
 }
 
 impl Missing {
-    /// Suffix for the board row. Empty for `Both`, which is the ordinary case
-    /// and needs no explaining.
+    /// Suffix for the board row.
+    ///
+    /// Says what is present as well as what is not. A bare "no route" on a repo
+    /// the board *is* polling reads as "this workspace cannot be dispatched to",
+    /// which is false whenever the repo's tickets live in Linear and route by
+    /// label — the herdr-board row said exactly that while AGE tickets were
+    /// dispatching into that workspace all day.
     pub fn note(self) -> &'static str {
         match self {
-            Missing::Polling => " · not polled",
-            Missing::Route => " · no route",
+            Missing::Polling => " · routed, not polled",
+            Missing::Route => " · polled, no route for its issues",
             Missing::Both => "",
+        }
+    }
+
+    /// What the section header can honestly claim about a set of rows.
+    ///
+    /// Only the part every row shares. Asserting both halves for a row missing
+    /// one of them is how the header came to contradict the row beneath it.
+    pub fn header_note(rows: &[Missing]) -> &'static str {
+        let (mut polling, mut route) = (true, true);
+        for m in rows {
+            polling &= matches!(m, Missing::Polling | Missing::Both);
+            route &= matches!(m, Missing::Route | Missing::Both);
+        }
+        match (polling, route) {
+            (true, true) => "not polled, not dispatchable  ",
+            (true, false) => "not polled  ",
+            (false, true) => "no route for their issues  ",
+            (false, false) => "missing config  ",
         }
     }
 }
@@ -171,19 +194,54 @@ pub fn git_remote(repo_root: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The repo root containing `dir`, if any.
+///
+/// A pane's cwd can be anywhere inside a checkout — or nowhere near one — so
+/// this asks git rather than assuming the cwd *is* the root.
+pub fn git_toplevel(dir: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Run a detection sweep and store it for the board to read.
 ///
 /// Best-effort by design: herdr being unreachable means the board shows the
 /// last sweep rather than an empty section, which is the same bargain every
 /// other source makes here.
 pub fn refresh(db: &Db, cfg: &RoutingConfig, herdr: &Herdr, log: &Logger) -> Vec<Unadopted> {
-    let workspaces = match herdr.workspace_list() {
+    let mut workspaces = match herdr.workspace_list() {
         Ok(w) => w,
         Err(e) => {
             log.warn(format!("could not list workspaces for adoption: {e}"));
             return stored(db);
         }
     };
+    // herdr only records a `repo_root` for a workspace it opened *from* a repo.
+    // Start a session another way — a bare workspace you then `cd` into — and it
+    // has none, so the sweep skipped it entirely and a repo being actively
+    // worked in was invisible. Its panes know where they are, so ask them.
+    if let Ok(panes) = herdr.pane_list() {
+        for w in workspaces.iter_mut().filter(|w| w.repo_root.is_none()) {
+            let root = panes
+                .iter()
+                .filter(|p| p.workspace_id == w.workspace_id)
+                .filter_map(|p| p.cwd.as_deref())
+                .find_map(git_toplevel);
+            if let Some(root) = root {
+                log.info(format!(
+                    "workspace {} has no repo_root; its pane is in {root}",
+                    w.label
+                ));
+                w.repo_root = Some(root);
+            }
+        }
+    }
     let found = detect(&workspaces, cfg, git_remote);
     match serde_json::to_string(&found) {
         Ok(json) => {

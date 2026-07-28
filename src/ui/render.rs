@@ -397,12 +397,15 @@ pub fn render_list(buf: &mut Buffer, area: Rect, app: &mut App) {
                     render_task_row(buf, area, y, v, selected);
                 }
                 Row::UnadoptedSection => {
+                    let missing: Vec<crate::adopt::Missing> =
+                        app.unadopted.iter().map(|u| u.missing).collect();
                     render_unadopted_header(
                         buf,
                         area,
                         y,
                         app.collapsed_unadopted,
                         app.unadopted.len(),
+                        &missing,
                     );
                     if selected {
                         reverse_row(buf, area, y, COL_GUTTER);
@@ -500,15 +503,24 @@ fn render_empty(buf: &mut Buffer, area: Rect, y: u16, app: &App) -> u16 {
 /// so the shape carries it.
 pub const UNADOPTED_GLYPH: &str = "⌾";
 
-fn render_unadopted_header(buf: &mut Buffer, area: Rect, y: u16, collapsed: bool, len: usize) {
+fn render_unadopted_header(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    collapsed: bool,
+    len: usize,
+    missing: &[crate::adopt::Missing],
+) {
     put(buf, area, COL_GUTTER, y, UNADOPTED_GLYPH, theme::fg_default());
     let used = put(buf, area, COL_ID, y, "UNADOPTED  ", theme::bold());
     let hint = if collapsed {
         format!("{len} hidden · enter to expand  ")
     } else {
         // Says what the section *is* rather than counting rows you can see —
-        // the same rule the state headers follow.
-        "not polled, not dispatchable  ".to_string()
+        // the same rule the state headers follow. Only what every row shares:
+        // a fixed "not polled, not dispatchable" contradicted any row that was
+        // missing just one of the two.
+        crate::adopt::Missing::header_note(missing).to_string()
     };
     let used2 = put(buf, area, COL_ID + used, y, &hint, theme::dim());
     rule(
@@ -1439,9 +1451,44 @@ mod tests {
             "the slug is what gets written to config, so it has to be shown: {row:?}"
         );
         // The half-fixes say which half, or the operator cannot tell a row that
-        // will not dispatch from one that is never polled.
-        assert!(body.iter().any(|l| l.contains("· no route")), "{body:?}");
-        assert!(body.iter().any(|l| l.contains("· not polled")), "{body:?}");
+        // will not dispatch from one that is never polled. They also say what
+        // *is* configured: a bare "no route" on a polled repo reads as "this
+        // workspace cannot be dispatched to", which is false whenever its
+        // tickets live in Linear and route by label.
+        assert!(
+            body.iter().any(|l| l.contains("polled, no route")),
+            "{body:?}"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("routed, not polled")),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn the_unadopted_header_never_claims_more_than_its_rows() {
+        use crate::adopt::Missing;
+        // Seen live: the header read "not polled, not dispatchable" above a row
+        // for a repo that *was* polled and merely lacked a `gh_repo` route.
+        assert_eq!(
+            Missing::header_note(&[Missing::Route]),
+            "no route for their issues  ",
+            "a polled repo must not be described as unpolled"
+        );
+        assert_eq!(
+            Missing::header_note(&[Missing::Polling]),
+            "not polled  ",
+            "a routed repo must not be described as undispatchable"
+        );
+        // Only what every row shares.
+        assert_eq!(
+            Missing::header_note(&[Missing::Route, Missing::Polling]),
+            "missing config  "
+        );
+        assert_eq!(
+            Missing::header_note(&[Missing::Both, Missing::Both]),
+            "not polled, not dispatchable  "
+        );
     }
 
     #[test]

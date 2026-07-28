@@ -692,11 +692,45 @@ pub fn new_task(
                 (engine.cfg.github.repos.len() == 1)
                     .then(|| engine.cfg.github.repos[0].clone())
             })
+            // Standing in a repo is a statement about which repo you mean. An
+            // agent filing a ticket is almost always inside the checkout the
+            // ticket is about, so making it pass `--repo` is asking it to
+            // repeat what the working directory already says.
+            //
+            // Only a repo the board actually polls: filing into an unpolled
+            // one writes a real issue that never reaches the board, which is
+            // the failure this would otherwise cause silently and often.
+            .or_else(|| {
+                let slug = crate::adopt::git_remote(".")
+                    .as_deref()
+                    .and_then(github_slug)?;
+                engine
+                    .cfg
+                    .github
+                    .repos
+                    .iter()
+                    .find(|r| r.eq_ignore_ascii_case(&slug))
+                    .cloned()
+            })
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "name the repo with --repo; configured: {}",
-                    engine.cfg.github.repos.join(", ")
-                )
+                let here = crate::adopt::git_remote(".")
+                    .as_deref()
+                    .and_then(github_slug);
+                match here {
+                    // In a GitHub repo, but not one the board watches. Naming
+                    // the repo would not help: the issue still would not show
+                    // up. Adopting it is the fix.
+                    Some(slug) => anyhow::anyhow!(
+                        "{slug} is not polled by the board, so a ticket filed there \
+                         would not appear — adopt it from the board's UNADOPTED \
+                         section first, or name another with --repo; configured: {}",
+                        engine.cfg.github.repos.join(", ")
+                    ),
+                    None => anyhow::anyhow!(
+                        "name the repo with --repo; configured: {}",
+                        engine.cfg.github.repos.join(", ")
+                    ),
+                }
             })?;
         let gh = engine
             .github

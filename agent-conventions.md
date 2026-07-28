@@ -87,6 +87,23 @@ Note `done` means the *issue* is closed; herdr's own `done` is this board's
    instruction — releases tasks. Reading the board is always safe; dispatching is
    not.
 
+**Reviewing a pull request is how you reach the agent that wrote it.** The board
+delivers new comments on an open PR back into the pane that produced it — the
+agent is still sitting there with the whole task in context, because a task in
+`review` keeps its pane. Issue comments, inline comments on the diff, and review
+submissions all arrive; `changes requested` is the clearest. So say what is
+wrong on the pull request, rather than describing it to a human to relay.
+
+Three things follow from how the loop is kept closed:
+
+- Only an **idle** agent is woken. Feedback left while it is working is
+  delivered when it settles, not on top of its turn.
+- Each comment is delivered **once**. Editing a comment does not resend it;
+  write a new one.
+- If its pane is gone — you closed it, or the session ended — nothing is
+  delivered and nothing is re-dispatched. The review then waits on the pull
+  request for whoever opens it, and `syncd.log` says so once.
+
 **If you were dispatched by the board, commit your work.** The board has no
 callback: it decides an attempt is finished by seeing the pane go idle with
 either an open PR or commits on the attempt branch. Work left uncommitted in the

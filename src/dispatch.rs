@@ -4,7 +4,7 @@ use crate::config::{Route, RoutingConfig, herdr_kind_for_runtime, interpolate};
 use crate::db::{Db, NewAttempt};
 use crate::herdr::{Herdr, agent_name};
 use crate::log::Logger;
-use crate::model::{AgentStatus, Dispatcher, Outcome, Task};
+use crate::model::{Dispatcher, Outcome, Task};
 use crate::sync::{SyncEngine, route_context};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -363,7 +363,7 @@ pub fn dispatch(
         let name = agent_name(&p.identifier, p.attempt_no);
         start_agent_when_ready(herdr, log, &name, p.herdr_kind, &pane_id)?;
 
-        deliver_prompt(herdr, log, &name, &pane_id, &p.prompt);
+        crate::wake::first_prompt(herdr, log, &name, &p.prompt);
         Ok(pane_id)
     })();
 
@@ -431,73 +431,6 @@ fn start_agent_when_ready(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("agent {name} never became startable")))
-}
-
-/// Send the prompt, and make sure it actually arrived.
-///
-/// `agent start` returns once herdr *detects* the agent, but a full-screen agent
-/// is often still painting its welcome screen and silently swallows a paste that
-/// arrives too early. herdr reports the send as successful either way, so the
-/// only evidence of delivery is the agent leaving its idle state.
-///
-/// Deliberately still not `--wait`: that would block for the length of the whole
-/// turn. This waits only for the agent to *start* reacting.
-fn deliver_prompt(herdr: &Herdr, log: &Logger, name: &str, pane_id: &str, prompt: &str) {
-    // Let the agent's UI settle before typing into it.
-    for _ in 0..20 {
-        if herdr.agent_status(name).is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
-    // Delivered is not the same as sent.
-    //
-    // `agent prompt` is documented to submit text plus Enter atomically, and it
-    // usually does — but against a full-screen agent that is still settling it
-    // can leave the text sitting unsent in the input box. The pane changes
-    // either way, so watching the screen cannot tell the two apart; only the
-    // agent actually starting work can.
-    let _ = pane_id;
-    if let Err(e) = herdr.agent_prompt(name, prompt) {
-        log.warn(format!("prompt delivery failed for {name}: {e}"));
-        return;
-    }
-    if started(herdr, name, 16) {
-        return;
-    }
-
-    // Text pasted but never submitted. Nudge it — and only ever nudge: sending
-    // the prompt a second time leaves the agent reading the same instructions
-    // twice, which it notices and comments on.
-    for nudge in 1..=3 {
-        log.info(format!("{name} has not started; sending enter ({nudge})"));
-        if herdr.agent_send_keys(name, &["enter"]).is_err() {
-            break;
-        }
-        if started(herdr, name, 20) {
-            log.info(format!("prompt for {name} needed an explicit enter"));
-            return;
-        }
-    }
-    log.error(format!(
-        "{name} never started work — it may be sitting on an unsent prompt"
-    ));
-}
-
-/// Did the agent start reacting within `ticks` quarter-seconds?
-fn started(herdr: &Herdr, name: &str, ticks: u32) -> bool {
-    for _ in 0..ticks {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        match herdr.agent_status(name) {
-            Some(AgentStatus::Working) | Some(AgentStatus::Blocked) => return true,
-            // Gone: nothing left to wait for.
-            None => return true,
-            _ => {}
-        }
-    }
-    false
 }
 
 /// A parent task's issue identifier, falling back to the raw task id when the

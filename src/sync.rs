@@ -766,6 +766,22 @@ impl SyncEngine {
                 self.log
                     .info(format!("{}: {} → {}", task.identifier, task.state, state));
             }
+            // A Linear row that has reached `review` is work that is finished and
+            // waiting on a human — and Linear was never told. Dispatch moves the
+            // issue to a started-type state and nothing moves it again until a
+            // merge, so anyone reading Linear rather than the board sees
+            // In Progress for the whole review window (AGE-21).
+            //
+            // Only when `[linear] review_state` names the state to move to:
+            // Linear has no review *type* to resolve, so with nothing configured
+            // there is no correct target and the ticket stays where it is.
+            if state == BoardState::Review
+                && task.source == Source::Linear
+                && !task.upstream.is_final()
+                && self.cfg.linear.review_state.is_some()
+            {
+                self.enqueue_review(&task)?;
+            }
             // A GitHub row that has reached `done` while its issue is still open
             // upstream needs closing, or the next poll undoes it. `is_final`
             // rather than `!= Terminal`: an issue that is *gone* cannot be
@@ -818,6 +834,34 @@ impl SyncEngine {
             })
             .to_string(),
             idem_key: format!("{}:dispatch:{}", task.id, attempt_no),
+        })?;
+        Ok(())
+    }
+
+    /// Tell Linear the work is finished and waiting on a human.
+    ///
+    /// Keyed by attempt so a retry can move the ticket back out of review and in
+    /// again: dispatch sends it to In Progress, and the attempt that follows has
+    /// its own review transition to make.
+    fn enqueue_review(&self, task: &Task) -> Result<()> {
+        let Some(want) = self.cfg.linear.review_state.as_deref() else {
+            return Ok(());
+        };
+        // Already there — nothing to say. Usually because we moved it on an
+        // earlier tick, sometimes because the operator did it by hand; either
+        // way a mutation that changes nothing is not worth sending.
+        if task
+            .source_state
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(want))
+        {
+            return Ok(());
+        }
+        self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "review".into(),
+            payload: json!({ "state": want }).to_string(),
+            idem_key: format!("{}:review:{}", task.id, task.attempt_count()),
         })?;
         Ok(())
     }
@@ -963,6 +1007,34 @@ impl SyncEngine {
                                         payload["log"].as_str().unwrap_or("(none)"),
                                     ),
                                 )?;
+                            }
+                        }
+                    }
+                    // The attempt settled with work waiting on a human. Dispatch
+                    // moved this issue to In Progress and, before this, nothing
+                    // moved it again until a merge — so Linear read In Progress
+                    // for the whole review window (AGE-21).
+                    "review" => {
+                        // Config decides, at delivery: turning the setting off
+                        // must stop a transition still sitting in the queue.
+                        let Some(want) = self.cfg.linear.review_state.as_deref() else {
+                            return Ok(Sent::Dropped(format!(
+                                "no [linear] review_state configured ({})",
+                                task.identifier
+                            )));
+                        };
+                        let team = task.identifier.split('-').next().unwrap_or_default();
+                        match linear.state_id_named(team, want)? {
+                            Ok(state_id) => linear.set_state(&task.source_id, &state_id)?,
+                            // A named state that does not exist is a config
+                            // mistake, not an outage: retrying it against Linear
+                            // forever would only bury the reason. `doctor`
+                            // checks this name for exactly this reason.
+                            Err(have) => {
+                                return Ok(Sent::Dropped(format!(
+                                    "team {team} has no state named `{want}` (has: {})",
+                                    have.join(", ")
+                                )));
                             }
                         }
                     }
@@ -1230,6 +1302,7 @@ mod tests {
                 routes: vec![],
                 defaults: Defaults::default(),
                 github: Default::default(),
+                linear: Default::default(),
             },
             credentials: Default::default(),
             paths: Paths {
@@ -1944,6 +2017,236 @@ mod tests {
             BoardState::Done
         );
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    // ---- AGE-21: Linear has to be told the work is waiting on a human ----
+
+    /// One page of workflow states, as `state_id_named` reads them. `In Review`
+    /// and `In Progress` are both `started`, which is the whole problem.
+    fn states_page() -> Value {
+        json!({
+            "teams": { "nodes": [ { "id": "team-1", "states": { "nodes": [
+                { "id": "s-rev",  "name": "In Review",   "type": "started",   "position": 2.0 },
+                { "id": "s-prog", "name": "In Progress", "type": "started",   "position": 1.0 }
+            ] } } ] }
+        })
+    }
+
+    /// A fixture transport the test can still read after the engine has boxed
+    /// it away, so what was actually sent to Linear can be asserted on.
+    struct Shared(std::rc::Rc<FixtureTransport>);
+
+    impl GraphQl for Shared {
+        fn query(&self, body: &Value) -> Result<Value> {
+            self.0.query(body)
+        }
+    }
+
+    /// A Linear engine that has been told which state means review.
+    fn engine_with_review_state(responses: Vec<Value>) -> SyncEngine {
+        recording_engine(responses).0
+    }
+
+    fn recording_engine(responses: Vec<Value>) -> (SyncEngine, std::rc::Rc<FixtureTransport>) {
+        let transport = std::rc::Rc::new(FixtureTransport::new(responses));
+        let mut e = engine(Some(Linear::new(
+            Box::new(Shared(transport.clone())) as Box<dyn GraphQl>
+        )));
+        e.cfg.linear.review_state = Some("In Review".into());
+        (e, transport)
+    }
+
+    /// A Linear row with an open pull request — the board derives `review`.
+    fn seed_in_review(e: &SyncEngine) {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/291"),
+            Some(291),
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_row_that_reaches_review_queues_the_linear_transition() {
+        // AGE-17 and AGE-18 both read In Progress in Linear for the whole time
+        // their PRs sat waiting: dispatch moved them, and nothing moved them
+        // again until a merge.
+        let e = engine_with_review_state(vec![]);
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Review
+        );
+        assert!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "review"),
+            "reaching review must tell Linear, not only the board"
+        );
+    }
+
+    #[test]
+    fn with_no_review_state_configured_linear_is_left_where_it_was() {
+        // The default. Linear has no review state *type*, so with nothing named
+        // there is no correct target — and a workspace without such a state must
+        // keep behaving exactly as it did.
+        let e = engine(None);
+        assert!(e.cfg.linear.review_state.is_none(), "unset by default");
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Review
+        );
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_transition_is_queued_once_however_many_times_we_rederive() {
+        let e = engine_with_review_state(vec![]);
+        seed_in_review(&e);
+        for _ in 0..5 {
+            e.rederive_all().unwrap();
+        }
+        assert_eq!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .filter(|w| w.kind == "review")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_retry_gets_a_transition_of_its_own() {
+        // Dispatching again moves the ticket back to In Progress, so the attempt
+        // that follows has its own review to announce.
+        let e = engine_with_review_state(vec![]);
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+        let first = e.db.pending_writebacks(10).unwrap();
+
+        let a = dispatch(&e, "linear:LIN-142", "w1:p9");
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        e.rederive_all().unwrap();
+
+        let after = e.db.pending_writebacks(10).unwrap();
+        assert_eq!(
+            after.iter().filter(|w| w.kind == "review").count(),
+            2,
+            "queued: {:?} then {:?}",
+            first.iter().map(|w| &w.idem_key).collect::<Vec<_>>(),
+            after.iter().map(|w| &w.idem_key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_ticket_already_in_the_review_state_is_not_moved_again() {
+        // The operator dragged it there themselves, or an earlier tick did. A
+        // mutation that changes nothing is still a write to somebody's tracker.
+        let e = engine_with_review_state(vec![]);
+        seed_in_review(&e);
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET source_state = 'In Review' WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_closed_issue_is_never_dragged_back_into_review() {
+        // `d mark done` derives Done, not Review, so the case that matters is an
+        // issue closed upstream while its PR is still open.
+        let e = engine_with_review_state(vec![]);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        e.db.set_pr("linear:LIN-142", Some("u"), Some(291), true)
+            .unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delivering_the_transition_sets_the_named_state() {
+        let (e, transport) = recording_engine(vec![
+            states_page(),
+            json!({ "issueUpdate": { "success": true } }),
+        ]);
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+        e.drain_writebacks();
+
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+        let sent = transport.sent.borrow();
+        // Not the lowest-position `started` state, which is In Progress and is
+        // where dispatch already put it.
+        assert_eq!(sent[1]["variables"]["stateId"], json!("s-rev"));
+        assert_eq!(sent[1]["variables"]["id"], json!("uuid-1"));
+    }
+
+    #[test]
+    fn a_review_state_that_does_not_exist_is_dropped_rather_than_retried() {
+        // A name that resolves to nothing is a config mistake, and doctor is
+        // where it gets reported. Backing off against Linear forever would only
+        // bury it.
+        let e = engine_with_review_state(vec![json!({
+            "teams": { "nodes": [ { "id": "team-1", "states": { "nodes": [
+                { "id": "s-prog", "name": "Pågår", "type": "started", "position": 1.0 }
+            ] } } ] }
+        })]);
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+
+        let w = e.db.pending_writebacks(10).unwrap();
+        let w = w.iter().find(|w| w.kind == "review").unwrap();
+        assert!(matches!(e.deliver(w).unwrap(), Sent::Dropped(_)));
+    }
+
+    #[test]
+    fn turning_the_setting_off_stops_a_transition_still_in_the_queue() {
+        let mut e = engine_with_review_state(vec![]);
+        seed_in_review(&e);
+        e.rederive_all().unwrap();
+        e.cfg.linear.review_state = None;
+
+        let w = e.db.pending_writebacks(10).unwrap();
+        let w = w.iter().find(|w| w.kind == "review").unwrap();
+        assert!(matches!(e.deliver(w).unwrap(), Sent::Dropped(_)));
+    }
+
+    /// GitHub has no equivalent gap to close. An issue there is open or closed —
+    /// there is no state between the two to advance to — and the `outcome`
+    /// writeback already comments the PR link on the issue when an attempt
+    /// settles, which is the whole of what GitHub can be told. So a repo that
+    /// turns writeback on gets the same information Linear now gets; it just
+    /// arrives as a comment rather than a state.
+    #[test]
+    fn a_github_row_reaching_review_has_nothing_to_transition() {
+        let mut e = engine_with_gh_writeback();
+        e.cfg.linear.review_state = Some("In Review".into());
+        seed_gh(&e);
+        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
+            .unwrap();
+        e.rederive_all().unwrap();
+
+        assert_eq!(
+            e.db.get_task("gh:o/r#87").unwrap().unwrap().state,
+            BoardState::Review
+        );
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "a Linear state name says nothing about a GitHub issue"
+        );
     }
 
     #[test]

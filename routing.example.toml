@@ -52,6 +52,19 @@ branch_template = "board/{identifier_lower}"
 # is on GitHub; a repo whose issues you already keep on GitHub is the reverse.
 # new_source = "linear"
 
+[linear]
+# Which workflow state means "finished, waiting on a human". When the board
+# derives `review`, the issue moves there — otherwise dispatch leaves it at
+# In Progress and nothing moves it again until the PR merges, so anyone reading
+# Linear rather than the board sees In Progress for the whole review window.
+#
+# A name, not a type, and unavoidably so: `In Review` and `In Progress` are both
+# `type: started`, so the API cannot be asked which one means review. Every other
+# state the board touches is resolved by type. Unset (the default) means no
+# transition at all, which is right if your workflow has no such state.
+# `herdr-board doctor` checks the name resolves in each team you route to.
+# review_state = "In Review"
+
 # GitHub is entirely optional. With no repos listed it is never polled, the
 # header omits it, and GITHUB_TOKEN is not needed at all.
 [github]

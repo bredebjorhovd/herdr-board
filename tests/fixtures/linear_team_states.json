@@ -1,0 +1,17 @@
+{
+  "teams": {
+    "nodes": [
+      {
+        "id": "team-off",
+        "states": {
+          "nodes": [
+            { "id": "state-todo", "name": "Todo", "type": "unstarted", "position": 0 },
+            { "id": "state-progress", "name": "In Progress", "type": "started", "position": 1 },
+            { "id": "state-review", "name": "In Review", "type": "started", "position": 2 },
+            { "id": "state-done", "name": "Done", "type": "completed", "position": 3 }
+          ]
+        }
+      }
+    ]
+  }
+}

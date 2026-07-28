@@ -386,6 +386,41 @@ Two different things are called labels, which is easy to trip on:
 - `[[route]] match = { label = ... }` — the **router**: where a task goes once
   it is on the board.
 
+### What Linear is told, and when
+
+Three transitions, and each one is a moment a person reading Linear rather than
+the board would otherwise be misinformed:
+
+| board event | Linear |
+|---|---|
+| dispatch | first `started`-type state (usually **In Progress**), plus a comment |
+| the attempt settles with work waiting | `[linear] review_state`, if you set one |
+| the pull request merges | first `completed`-type state (**Done**) |
+
+The middle one is opt-in because Linear leaves no choice. Every other state here
+is resolved by *type*, so a renamed or non-English workflow keeps working — but
+there is no review type: `In Review` and `In Progress` are both `type: started`,
+which is exactly why dispatch lands on In Progress (lowest position wins). So the
+state has to be named:
+
+```toml
+[linear]
+review_state = "In Review"
+```
+
+This follows the board's own derivation rather than the dispatch history, so an
+issue with an open pull request linked to it moves too, even if the board never
+released it — that is the same fact the `review` section is showing you, and the
+point of the setting is that Linear and the board stop disagreeing.
+
+Unset, nothing fires when the attempt settles and the ticket sits at In Progress
+until the PR merges — the old behaviour, and the right one for a workflow with no
+such state. `doctor` checks the name resolves in every team you route to, and a
+name that resolves to nothing drops the transition rather than retrying against
+Linear forever. Nothing needs configuring on the GitHub side: an issue there is
+open or closed, with no state in between to advance to, and the outcome comment
+already carries the PR link.
+
 ### Subcommands
 
 | command | role |
@@ -689,6 +724,15 @@ resolved here rather than guessed at repeatedly.
   `[github] writeback = false` to keep it strictly read-only. The loop guard
   carries across — there are two writers on one issue now, the board and the
   agent in the pane.
+- **The review state is named, not derived.** Linear writeback had two
+  transitions and no third: dispatch moved the issue to In Progress and nothing
+  moved it again until a merge, so a ticket read In Progress for the entire
+  review window — precisely when someone checking Linear wants to see that the
+  work is done and needs a human. The board cannot ask the API which state means
+  review (`In Review` and `In Progress` are both `type: started`), and matching
+  on a name it guessed would break the first renamed or non-English workflow it
+  met. So `[linear] review_state` is config, unset by default, and unset means no
+  transition at all.
 - **Branch template follows the impl spec** (`board/{identifier_lower}` →
   `board/lin-145`), not the design fixtures. It is config either way.
 - **Daemon liveness and source freshness are separate clocks.** During an outage

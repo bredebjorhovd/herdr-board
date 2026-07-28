@@ -61,8 +61,9 @@ pub fn run(scenario: &str) -> Result<()> {
             }
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    // `n` is demo-only: it cycles the scenarios.
-                    if k.code == KeyCode::Char('n') && app.confirm.is_none() {
+                    // `n` is demo-only: it cycles the scenarios. Not while the
+                    // `/` field is open, where it is a letter like any other.
+                    if k.code == KeyCode::Char('n') && app.confirm.is_none() && !app.typing {
                         ix = (ix + 1) % fixtures::ALL.len();
                         let screen = app.screen;
                         app = fixtures::app(fixtures::ALL[ix]);
@@ -104,6 +105,9 @@ fn apply(app: &mut App, action: Action) -> bool {
         Action::Quit => return true,
         Action::Move(d) => match &mut app.adopt {
             Some(view) if app.screen == Screen::Adopt => view.move_cursor(d),
+            // On the key reference, moving scrolls it — there is no cursor
+            // there, and moving the one behind it would be invisible.
+            _ if app.screen == Screen::Help => app.scroll_help(d),
             _ => app.select_delta(d),
         },
         Action::Toggle => {
@@ -111,7 +115,10 @@ fn apply(app: &mut App, action: Action) -> bool {
                 view.toggle();
             }
         }
-        Action::Help => app.screen = Screen::Help,
+        Action::Help => {
+            app.help_scroll = 0;
+            app.screen = Screen::Help;
+        }
         // Fixtures have no attempt history, so the screen shows its empty state.
         Action::Stats => app.screen = Screen::Stats,
         Action::Back => {
@@ -263,6 +270,15 @@ fn apply(app: &mut App, action: Action) -> bool {
             }
         }
         Action::Sync => app.flash("synced"),
+        // Filtering is pure view state, so the demo runs the real thing —
+        // there is nothing here to have a side effect on.
+        Action::CycleRoute => app.cycle_route(),
+        Action::ClearFilter => app.clear_filter(),
+        Action::Find => app.open_find(),
+        Action::FindChar(c) => app.filter_type(c),
+        Action::FindBackspace => app.filter_backspace(),
+        Action::FindAccept => app.accept_filter(),
+        Action::FindCancel => app.clear_filter(),
     }
     false
 }

@@ -137,6 +137,96 @@ impl AdoptView {
     }
 }
 
+/// Showing less than everything.
+///
+/// **A filter is a view, and changes nothing else.** Not what syncs, not what
+/// is dispatchable, not what counts against `max_concurrent_per_workspace` — a
+/// hidden row is still a live attempt. Everything here reads [`App::views`];
+/// nothing here writes to them.
+///
+/// One filter at a time. `f` and `/` answer different questions — "show me one
+/// project" and "where was that ticket" — and a board obeying both answers
+/// neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Filter {
+    #[default]
+    All,
+    /// One route, cycled with `f`.
+    Route(String),
+    /// A substring of identifier, title or route, typed at `/`.
+    Text(String),
+}
+
+impl Filter {
+    pub fn active(&self) -> bool {
+        !matches!(self, Filter::All)
+    }
+
+    pub fn matches(&self, v: &TaskView) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Route(r) => v.route_name.as_deref() == Some(r.as_str()),
+            Filter::Text(q) => {
+                let q = q.trim();
+                q.is_empty()
+                    || contains(&v.task.identifier, q)
+                    || contains(&v.task.title, q)
+                    || v.route_name.as_deref().is_some_and(|r| contains(r, q))
+            }
+        }
+    }
+
+    /// Whether an unadopted repo survives.
+    ///
+    /// The route filter never hides one: a repo with no board config has no
+    /// route *by definition*, and the section is how you notice it. Hiding it
+    /// whenever a route is picked would hide it exactly when you are looking
+    /// project by project. A typed query is different — it is a search, and a
+    /// repo is findable by name like anything else.
+    pub fn matches_repo(&self, u: &crate::adopt::Unadopted) -> bool {
+        match self {
+            Filter::All | Filter::Route(_) => true,
+            Filter::Text(q) => {
+                let q = q.trim();
+                q.is_empty() || contains(&u.label, q) || contains(&u.slug, q)
+            }
+        }
+    }
+
+    /// What the header says is active. A filtered board that does not say so is
+    /// a board that looks broken.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Filter::All => None,
+            Filter::Route(r) => Some(format!("filter: {r}")),
+            Filter::Text(q) => Some(format!("/{q}")),
+        }
+    }
+
+    /// What to say when the filter has hidden every row, which otherwise draws
+    /// a body with nothing in it at all.
+    ///
+    /// A query that is still empty has hidden nothing, whatever else is wrong
+    /// with the board — an empty field must not accuse itself of emptying a
+    /// board that had no rows to begin with.
+    pub fn empty_note(&self) -> Option<String> {
+        match self {
+            Filter::Text(q) if q.trim().is_empty() => None,
+            Filter::All => None,
+            Filter::Route(r) => Some(format!(
+                "Nothing on the board routes to {r}.  f moves on, F clears the filter."
+            )),
+            Filter::Text(q) => Some(format!(
+                "No identifier, title or route matches `{q}`.  F clears the filter."
+            )),
+        }
+    }
+}
+
+fn contains(hay: &str, needle: &str) -> bool {
+    hay.to_lowercase().contains(&needle.to_lowercase())
+}
+
 /// One task, plus everything the renderer needs that is not on the row.
 #[derive(Debug, Clone)]
 pub struct TaskView {
@@ -357,6 +447,14 @@ pub struct App {
     /// UNADOPTED starts **open**. It is a notice, and the whole point of it is
     /// that a silent repo stops being silent.
     pub collapsed_unadopted: bool,
+    /// Showing less than everything, and why.
+    ///
+    /// Deliberately **not persisted**. Coming back to a board that silently
+    /// hides most of its rows, for a reason given in a session that ended, is a
+    /// worse failure than retyping four characters.
+    pub filter: Filter,
+    /// The `/` field is open and taking keys. Implies [`Filter::Text`].
+    pub typing: bool,
     pub sync: SyncStatus,
     /// Footer flash for `o` / `g` / `s` and post-dispatch acknowledgements.
     pub message: Option<(String, Instant)>,
@@ -385,6 +483,9 @@ pub struct App {
     /// First body line on screen. Rows below the fold are otherwise
     /// unreachable, which on a short pane is most of the board.
     pub scroll: usize,
+    /// The same, for the key reference — which binds more keys than a 24-row
+    /// pane has lines, and used to stop halfway without saying so.
+    pub help_scroll: usize,
 }
 
 pub const MESSAGE_TTL: std::time::Duration = std::time::Duration::from_millis(2600);
@@ -398,6 +499,8 @@ impl App {
             screen: Screen::List,
             collapsed: std::collections::HashSet::from([BoardState::Done]),
             collapsed_unadopted: false,
+            filter: Filter::All,
+            typing: false,
             sync,
             message: None,
             confirm: None,
@@ -411,6 +514,7 @@ impl App {
             last_height: 0,
             stats: None,
             scroll: 0,
+            help_scroll: 0,
         };
         app.selected_id = app
             .first_actionable()
@@ -423,6 +527,11 @@ impl App {
     /// `done` is bounded to today. The header says "DONE today" and it means
     /// it: every issue ever closed in a tracked repo derives to `done`, and
     /// ninety-odd of them is a wall of history, not a board.
+    ///
+    /// The filter is applied **here**, so everything downstream — the rows, the
+    /// header counts, which sections exist at all — agrees on what is shown
+    /// without each having to remember to ask. A section whose rows are all
+    /// filtered away is empty, and an empty section is already omitted.
     pub fn sections(&self) -> Vec<(BoardState, Vec<&TaskView>)> {
         BoardState::SECTION_ORDER
             .iter()
@@ -432,6 +541,7 @@ impl App {
                     .iter()
                     .filter(|v| v.state() == state)
                     .filter(|v| state != BoardState::Done || finished_today(v))
+                    .filter(|v| self.filter.matches(v))
                     .collect();
                 if rows.is_empty() {
                     None
@@ -459,13 +569,28 @@ impl App {
             }
             out.extend(rows.iter().map(|v| Row::Task(v.id().to_string())));
         }
-        if !self.unadopted.is_empty() {
+        let repos = self.unadopted_shown();
+        if !repos.is_empty() {
             out.push(Row::UnadoptedSection);
             if !self.collapsed_unadopted {
-                out.extend(self.unadopted.iter().map(|u| Row::Unadopted(u.slug.clone())));
+                out.extend(repos.iter().map(|u| Row::Unadopted(u.slug.clone())));
             }
         }
         out
+    }
+
+    /// The unadopted repos the filter lets through.
+    pub fn unadopted_shown(&self) -> Vec<&crate::adopt::Unadopted> {
+        self.unadopted
+            .iter()
+            .filter(|u| self.filter.matches_repo(u))
+            .collect()
+    }
+
+    /// How many task rows the filter lets through, for the count beside the
+    /// `/` field. Headers and repo rows are not rows you searched for.
+    pub fn shown_tasks(&self) -> usize {
+        self.sections().iter().map(|(_, rows)| rows.len()).sum()
     }
 
     /// The rows a cursor can land on, in display order.
@@ -473,10 +598,11 @@ impl App {
         self.rows().iter().map(Row::id).collect()
     }
 
-    /// The unadopted repo the cursor is on, if any.
+    /// The unadopted repo the cursor is on, if any — and only if the filter is
+    /// showing it, for the same reason a filtered-away task is not selected.
     pub fn unadopted_selected(&self) -> Option<&crate::adopt::Unadopted> {
         let id = self.selected_id.as_deref()?;
-        self.unadopted.iter().find(|u| u.row_id() == id)
+        self.unadopted_shown().into_iter().find(|u| u.row_id() == id)
     }
 
     pub fn on_unadopted_header(&self) -> bool {
@@ -532,9 +658,22 @@ impl App {
 
     /// The selected task, or `None` — including when the cursor is on the
     /// collapsed `done` header, which is a row but not a task.
+    ///
+    /// A filtered-away row is **not** selected, however the cursor came to be
+    /// on it. Every key that acts on a task comes through here, so nothing can
+    /// dispatch, cancel or merge a row that is not on screen.
     pub fn selected(&self) -> Option<&TaskView> {
         let id = self.selected_id.as_deref()?;
-        self.views.iter().find(|v| v.id() == id)
+        self.views
+            .iter()
+            .find(|v| v.id() == id)
+            .filter(|v| self.filter.matches(v))
+    }
+
+    /// `j` / `k` on the key reference, which is longer than the pane. Clamped
+    /// against the pane's height by the renderer, which is what knows it.
+    pub fn scroll_help(&mut self, delta: isize) {
+        self.help_scroll = self.help_scroll.saturating_add_signed(delta);
     }
 
     pub fn select_delta(&mut self, delta: isize) {
@@ -565,6 +704,14 @@ impl App {
         self.views = views;
         self.unadopted = unadopted;
         self.sync = sync;
+        self.clamp_selection();
+    }
+
+    /// Keep the cursor on a row that is actually on screen.
+    ///
+    /// Called after a refresh and after every filter change: the row under the
+    /// cursor being filtered away is the ordinary case, not an edge one.
+    pub fn clamp_selection(&mut self) {
         let ids = self.visible_task_ids();
         let keep = self
             .selected_id
@@ -575,6 +722,123 @@ impl App {
             // rather than to nothing — or to a header, which is not actionable.
             self.selected_id = self.first_actionable().or_else(|| ids.first().cloned());
         }
+    }
+
+    /// Every route with a row on the board, alphabetically.
+    ///
+    /// Alphabetical rather than in board order: `f` is a tour of the projects,
+    /// and a tour whose order changes as rows move between sections is not one
+    /// you can learn. Only routes with a row that is *on* the board — offering
+    /// a route whose only rows are yesterday's `done` would filter to nothing.
+    pub fn routes_present(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .views
+            .iter()
+            .filter(|v| v.state() != BoardState::Done || finished_today(v))
+            .filter_map(|v| v.route_name.clone())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// `f` — the next route, then back to all.
+    ///
+    /// No input mode, no cursor, nothing to escape: one key, and one more press
+    /// always gets you further out. Wrapping past the last route lands on
+    /// everything, which is the way back for anyone who never finds `F`.
+    pub fn cycle_route(&mut self) {
+        let routes = self.routes_present();
+        if routes.is_empty() {
+            self.clear_filter();
+            self.flash("no row on the board has a route");
+            return;
+        }
+        let next = match &self.filter {
+            Filter::Route(cur) => match routes.iter().position(|r| r == cur) {
+                Some(i) => i + 1,
+                // The route left the board while it was filtering; start again
+                // rather than dropping the operator somewhere arbitrary.
+                None => 0,
+            },
+            _ => 0,
+        };
+        self.filter = match routes.get(next) {
+            Some(r) => Filter::Route(r.clone()),
+            None => Filter::All,
+        };
+        self.typing = false;
+        self.clamp_selection();
+    }
+
+    /// `F` — clear whichever filter is active.
+    pub fn clear_filter(&mut self) {
+        self.filter = Filter::All;
+        self.typing = false;
+        self.clamp_selection();
+    }
+
+    /// `/` — open the text field. Matching is live, so an empty query is the
+    /// whole board rather than nothing.
+    pub fn open_find(&mut self) {
+        self.filter = Filter::Text(String::new());
+        self.typing = true;
+        self.clamp_selection();
+    }
+
+    pub fn filter_type(&mut self, c: char) {
+        match &mut self.filter {
+            Filter::Text(q) => q.push(c),
+            _ => self.filter = Filter::Text(c.to_string()),
+        }
+        self.typing = true;
+        self.clamp_selection();
+    }
+
+    pub fn filter_backspace(&mut self) {
+        if let Filter::Text(q) = &mut self.filter
+            && q.pop().is_none()
+        {
+            // Backspacing past the start closes the field. An empty field
+            // filtering nothing is not a state worth being stuck in.
+            self.clear_filter();
+            return;
+        }
+        self.clamp_selection();
+    }
+
+    /// `enter` on the field: keep the query, close the field, hand the keys
+    /// back to the board.
+    pub fn accept_filter(&mut self) {
+        self.typing = false;
+        if matches!(&self.filter, Filter::Text(q) if q.trim().is_empty()) {
+            self.filter = Filter::All;
+        }
+        self.clamp_selection();
+    }
+
+    /// Put a task on screen and the cursor on it, whatever is currently hiding
+    /// it — a folded section, or a filter.
+    ///
+    /// This is how arriving from a link lands. Following a link to a row and
+    /// getting a board that does not contain it is the worst of both outcomes,
+    /// so a request naming one task outranks both ways of showing fewer.
+    pub fn reveal(&mut self, task_id: &str) {
+        if !self.visible_task_ids().iter().any(|i| i == task_id) {
+            self.collapsed.remove(&BoardState::Done);
+            self.clear_filter();
+        }
+        self.selected_id = Some(task_id.to_string());
+    }
+
+    /// What the header says. Nothing while the field is open — the footer is
+    /// showing the query as it is typed, and one live thing said in two places
+    /// is one of them being ignored.
+    pub fn header_filter(&self) -> Option<String> {
+        if self.typing {
+            return None;
+        }
+        self.filter.label()
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -954,6 +1218,305 @@ mod tests {
         a.selected_id = Some(crate::adopt::row_id("o/thing"));
         a.refresh(a.views.clone(), sync(), Vec::new());
         assert_eq!(a.selected_id.as_deref(), Some("d"), "back onto a task");
+    }
+
+    // ---- AGE-27: filtering ---------------------------------------------
+
+    fn routed(id: &str, state: BoardState, route: &str) -> TaskView {
+        TaskView {
+            route_name: Some(route.into()),
+            workspace: Some(route.into()),
+            ..view(id, state)
+        }
+    }
+
+    /// Three routes, so cycling has somewhere to go.
+    fn many_routes() -> App {
+        App::new(
+            vec![
+                routed("a", BoardState::Ready, "offhand"),
+                routed("b", BoardState::Working, "itsm-agent"),
+                routed("c", BoardState::Ready, "itsm-agent"),
+                routed("d", BoardState::Blocked, "tally"),
+            ],
+            sync(),
+            "/cfg".into(),
+        )
+    }
+
+    #[test]
+    fn f_cycles_the_routes_on_the_board_and_then_back_to_all() {
+        // One key, no input mode, and one more press always gets you further
+        // out — wrapping past the last route lands on everything.
+        let mut a = many_routes();
+        assert_eq!(a.routes_present(), vec!["itsm-agent", "offhand", "tally"]);
+
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::Route("itsm-agent".into()));
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::Route("offhand".into()));
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::Route("tally".into()));
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::All, "the tour has to end back at the board");
+    }
+
+    #[test]
+    fn a_route_with_nothing_left_on_the_board_is_not_offered() {
+        // `done` is bounded to today, so a route whose only row closed
+        // yesterday would filter to an empty board.
+        let mut old = routed("old", BoardState::Done, "archived");
+        old.task.updated_at = "2020-01-01T00:00:00Z".into();
+        let a = App::new(
+            vec![old, routed("a", BoardState::Ready, "offhand")],
+            sync(),
+            "/cfg".into(),
+        );
+        assert_eq!(a.routes_present(), vec!["offhand"]);
+    }
+
+    #[test]
+    fn a_route_filter_hides_the_other_routes_rows_and_their_sections() {
+        // A section whose rows are all filtered out disappears; it does not
+        // render an empty header.
+        let mut a = many_routes();
+        a.filter = Filter::Route("tally".into());
+        let sections: Vec<BoardState> = a.sections().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(sections, vec![BoardState::Blocked]);
+        assert!(!a.visible_task_ids().iter().any(|i| i == "a"));
+        assert!(a.visible_task_ids().iter().any(|i| i == "d"));
+    }
+
+    #[test]
+    fn the_unadopted_section_survives_the_route_filter() {
+        // A repo with no board config has no route by definition, and the
+        // section is how you notice it. Hiding it while looking project by
+        // project would hide it exactly when it is the answer.
+        let mut a = many_routes();
+        a.unadopted = vec![unadopted("o/thing")];
+        a.filter = Filter::Route("tally".into());
+        let rows = a.rows();
+        assert!(rows.contains(&Row::UnadoptedSection));
+        assert!(rows.contains(&Row::Unadopted("o/thing".into())));
+    }
+
+    #[test]
+    fn a_typed_query_matches_identifier_title_and_route() {
+        let mut a = many_routes();
+        a.views[0].task.title = "Add retry to the Altinn poller".into();
+        a.views[0].task.identifier = "LIN-145".into();
+
+        // By title, case-insensitively.
+        a.filter = Filter::Text("altinn".into());
+        assert_eq!(a.shown_tasks(), 1);
+        // By identifier.
+        a.filter = Filter::Text("lin-145".into());
+        assert_eq!(a.shown_tasks(), 1);
+        // By route — one word, every row on that project.
+        a.filter = Filter::Text("itsm".into());
+        assert_eq!(a.shown_tasks(), 2);
+        // And an empty query is the whole board, not none of it.
+        a.filter = Filter::Text(String::new());
+        assert_eq!(a.shown_tasks(), 4);
+    }
+
+    #[test]
+    fn a_typed_query_searches_unadopted_repos_by_name_too() {
+        let mut a = many_routes();
+        a.unadopted = vec![unadopted("o/tripletex-mcp"), unadopted("o/altinn-forms")];
+        a.filter = Filter::Text("tripletex".into());
+        assert_eq!(
+            a.unadopted_shown().iter().map(|u| u.slug.as_str()).collect::<Vec<_>>(),
+            vec!["o/tripletex-mcp"]
+        );
+        // ...and a query matching neither empties the section rather than
+        // leaving a header over nothing.
+        a.filter = Filter::Text("zzz".into());
+        assert!(a.unadopted_shown().is_empty());
+        assert!(!a.rows().contains(&Row::UnadoptedSection));
+    }
+
+    #[test]
+    fn selection_clamps_when_the_row_under_the_cursor_is_filtered_away() {
+        let mut a = many_routes();
+        a.selected_id = Some("a".into());
+        a.filter = Filter::Route("tally".into());
+        a.clamp_selection();
+        assert_eq!(a.selected_id.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn a_hidden_row_is_never_acted_on() {
+        // Every key that acts on a task goes through `selected`. A cursor left
+        // on a filtered row must not dispatch, cancel or merge it.
+        let mut a = many_routes();
+        a.selected_id = Some("a".into());
+        a.filter = Filter::Route("tally".into());
+        assert!(a.selected().is_none(), "a hidden row answered to the keys");
+    }
+
+    #[test]
+    fn a_filter_changes_the_view_and_nothing_else() {
+        // Not what syncs, not what is dispatchable, not what counts against
+        // max_concurrent_per_workspace. A hidden row is still a live attempt.
+        let mut a = many_routes();
+        let before = a.views.len();
+        let working: Vec<String> = a
+            .views
+            .iter()
+            .filter(|v| v.state().holds_pane())
+            .map(|v| v.id().to_string())
+            .collect();
+        a.filter = Filter::Route("tally".into());
+        assert_eq!(a.views.len(), before, "filtering dropped rows from the model");
+        assert_eq!(
+            a.views
+                .iter()
+                .filter(|v| v.state().holds_pane())
+                .map(|v| v.id().to_string())
+                .collect::<Vec<_>>(),
+            working,
+            "a hidden row stopped holding its pane"
+        );
+        assert!(a.views.iter().any(|v| v.id() == "b" && v.has_route));
+    }
+
+    #[test]
+    fn collapsing_and_filtering_do_not_fight() {
+        // They are independent: a filter must not fold or unfold anything, and
+        // clearing it must give back exactly the board that was folded.
+        let mut a = many_routes();
+        a.toggle_collapsed(BoardState::Ready);
+        a.filter = Filter::Route("itsm-agent".into());
+        assert!(a.is_collapsed(BoardState::Ready));
+        assert!(!a.visible_task_ids().iter().any(|i| i == "c"));
+        // ...and the header is still there to unfold, with the filtered count.
+        assert!(a.rows().contains(&Row::Section(BoardState::Ready)));
+        assert_eq!(a.section_len(BoardState::Ready), 1);
+
+        a.clear_filter();
+        assert!(a.is_collapsed(BoardState::Ready), "the filter unfolded a section");
+        assert_eq!(a.section_len(BoardState::Ready), 2);
+    }
+
+    #[test]
+    fn header_counts_report_what_is_shown_including_done_today() {
+        // The DONE header already narrows to today; the filter narrows it
+        // again, and the count on the folded header has to agree with both.
+        let mut a = App::new(
+            vec![
+                routed("x", BoardState::Done, "offhand"),
+                routed("y", BoardState::Done, "itsm-agent"),
+                routed("z", BoardState::Done, "itsm-agent"),
+            ],
+            sync(),
+            "/cfg".into(),
+        );
+        assert_eq!(a.section_len(BoardState::Done), 3);
+        a.filter = Filter::Route("itsm-agent".into());
+        assert_eq!(a.section_len(BoardState::Done), 2);
+    }
+
+    #[test]
+    fn f_clears_whichever_filter_is_active() {
+        let mut a = many_routes();
+        a.cycle_route();
+        assert!(a.filter.active());
+        a.clear_filter();
+        assert_eq!(a.filter, Filter::All);
+
+        a.open_find();
+        a.filter_type('t');
+        assert!(a.filter.active());
+        a.clear_filter();
+        assert_eq!(a.filter, Filter::All);
+        assert!(!a.typing, "the field was left open with nothing in it");
+    }
+
+    #[test]
+    fn the_two_filters_replace_each_other_rather_than_stacking() {
+        // They answer different questions — "show me one project" and "where
+        // was that ticket" — and a board obeying both answers neither.
+        let mut a = many_routes();
+        a.open_find();
+        a.filter_type('x');
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::Route("itsm-agent".into()));
+        assert!(!a.typing);
+    }
+
+    #[test]
+    fn backspacing_past_the_start_closes_the_field() {
+        let mut a = many_routes();
+        a.open_find();
+        a.filter_type('t');
+        a.filter_backspace();
+        assert!(a.typing, "one character back is still a field");
+        a.filter_backspace();
+        assert!(!a.typing);
+        assert_eq!(a.filter, Filter::All);
+    }
+
+    #[test]
+    fn an_empty_query_accepted_is_no_filter_at_all() {
+        let mut a = many_routes();
+        a.open_find();
+        a.accept_filter();
+        assert_eq!(a.filter, Filter::All);
+        assert!(!a.typing);
+    }
+
+    #[test]
+    fn the_header_says_what_is_active_except_while_it_is_being_typed() {
+        let mut a = many_routes();
+        assert_eq!(a.header_filter(), None);
+        a.cycle_route();
+        assert_eq!(a.header_filter().as_deref(), Some("filter: itsm-agent"));
+
+        a.open_find();
+        a.filter_type('a');
+        assert_eq!(
+            a.header_filter(),
+            None,
+            "the field is on screen showing the query; saying it twice is one of them being ignored"
+        );
+        a.accept_filter();
+        assert_eq!(a.header_filter().as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn arriving_from_a_link_reveals_the_row_whatever_is_hiding_it() {
+        // Following a link to a row and landing on a board that does not
+        // contain it is the worst of both outcomes.
+        let mut a = many_routes();
+        a.filter = Filter::Route("itsm-agent".into());
+        assert!(!a.visible_task_ids().iter().any(|i| i == "d"));
+
+        a.reveal("d");
+        assert_eq!(a.filter, Filter::All);
+        assert_eq!(a.selected_id.as_deref(), Some("d"));
+        assert!(a.selected().is_some(), "the row is on screen but not selectable");
+    }
+
+    #[test]
+    fn a_link_to_a_row_the_filter_already_shows_leaves_the_filter_alone() {
+        let mut a = many_routes();
+        a.filter = Filter::Route("itsm-agent".into());
+        a.reveal("c");
+        assert_eq!(a.filter, Filter::Route("itsm-agent".into()));
+        assert_eq!(a.selected_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_new_board_is_never_filtered() {
+        // Deliberately not persisted: coming back to a board that silently
+        // hides most of its rows, for a reason given in a session that ended,
+        // is worse than retyping four characters.
+        let mut a = many_routes();
+        a.cycle_route();
+        let fresh = App::new(a.views.clone(), sync(), "/cfg".into());
+        assert_eq!(fresh.filter, Filter::All);
+        assert!(!fresh.typing);
     }
 
     #[test]

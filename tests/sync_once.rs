@@ -479,6 +479,7 @@ fn an_agent_that_exits_without_ever_working_stops_holding_the_row() {
             worktree: None,
             branch: Some("board/off-145".into()),
             dispatched_by: None,
+            dispatched_by_pane: None,
             base_sha: None,
         })
         .unwrap();
@@ -526,6 +527,7 @@ fn an_agent_that_worked_before_exiting_is_not_reaped_as_a_failed_start() {
             worktree: None,
             branch: Some("board/off-145".into()),
             dispatched_by: None,
+            dispatched_by_pane: None,
             base_sha: None,
         })
         .unwrap();

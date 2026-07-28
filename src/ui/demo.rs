@@ -102,11 +102,22 @@ fn apply(app: &mut App, action: Action) -> bool {
     match action {
         Action::None => {}
         Action::Quit => return true,
-        Action::Move(d) => app.select_delta(d),
+        Action::Move(d) => match &mut app.adopt {
+            Some(view) if app.screen == Screen::Adopt => view.move_cursor(d),
+            _ => app.select_delta(d),
+        },
+        Action::Toggle => {
+            if let Some(view) = &mut app.adopt {
+                view.toggle();
+            }
+        }
         Action::Help => app.screen = Screen::Help,
         // Fixtures have no attempt history, so the screen shows its empty state.
         Action::Stats => app.screen = Screen::Stats,
-        Action::Back => app.screen = Screen::List,
+        Action::Back => {
+            app.adopt = None;
+            app.screen = Screen::List;
+        }
         Action::Detail => {
             if app.selected().is_some() {
                 app.screen = Screen::Detail;
@@ -118,6 +129,24 @@ fn apply(app: &mut App, action: Action) -> bool {
             } else {
                 Screen::Prompt
             }
+        }
+        // The adoption screen writes routing.toml, which the demo has none of,
+        // so it stops at the line the board flashes — which is the part worth
+        // reviewing: it has to name the filter that was just chosen.
+        Action::Enter if app.screen == Screen::Adopt => {
+            let Some(view) = app.adopt.take() else {
+                return false;
+            };
+            app.screen = Screen::List;
+            let filter = match view.written_labels().as_deref() {
+                Some([]) => ", every open issue".to_string(),
+                Some(l) => format!(", only {}", l.join(" + ")),
+                None => String::new(),
+            };
+            let (slug, name) = (view.repo.slug.clone(), view.repo.name().to_string());
+            app.flash(format!(
+                "✓ adopted {slug} — route + polling{filter}. Linear label `{name}` is only a suggestion, commented out in routing.toml"
+            ));
         }
         Action::Enter if app.on_unadopted_header() => {
             app.collapsed_unadopted = !app.collapsed_unadopted
@@ -199,15 +228,30 @@ fn apply(app: &mut App, action: Action) -> bool {
                 app.flash(format!("opened {ident} in your browser"));
             }
         }
-        // Both write to routing.toml, which the demo has none of — so they stop
-        // at the line the board flashes, which is the part worth reviewing: it
-        // has to say what was written and that the label is a guess.
+        // `a` opens the ask, exactly as it does on the board. The two shapes
+        // that screen has both need looking at, so the demo reaches both: a
+        // repo GitHub answered for, and one it could not be asked about.
         Action::Adopt => {
-            if let Some(u) = app.unadopted_selected() {
-                let (slug, name) = (u.slug.clone(), u.name().to_string());
-                app.flash(format!(
-                    "✓ adopted {slug} — route + polling. Linear label `{name}` is only a suggestion, commented out in routing.toml"
-                ));
+            if let Some(u) = app.unadopted_selected().cloned() {
+                // Already polled — the filter is decided and there is nothing
+                // to ask, same guard as the board's.
+                if u.missing == crate::adopt::Missing::Route {
+                    let (slug, name) = (u.slug.clone(), u.name().to_string());
+                    app.flash(format!(
+                        "✓ adopted {slug} — route. Linear label `{name}` is only a suggestion, commented out in routing.toml"
+                    ));
+                    return false;
+                }
+                // Answered outright: the demo has no network, so the wait the
+                // real board draws once has nothing to wait for here.
+                let preview = if u.missing == crate::adopt::Missing::Polling {
+                    Err("github HTTP 404 for /repos/…".to_string())
+                } else {
+                    Ok(fixtures::repo_preview())
+                };
+                app.adopt =
+                    Some(crate::ui::state::AdoptView::new(u, Some(preview), Vec::new()));
+                app.screen = Screen::Adopt;
             }
         }
         Action::Ignore => {

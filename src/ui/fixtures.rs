@@ -245,6 +245,26 @@ fn unadopted_repos() -> Vec<crate::adopt::Unadopted> {
     ]
 }
 
+/// What GitHub would answer for a repo that keeps its roadmap as open issues.
+///
+/// The shape that caused AGE-28, reproduced so the adoption screen can be
+/// reviewed at the size it has to work at: a backlog far larger than the board,
+/// carrying labels that would cut it down to what is current. The demo has no
+/// network, so without this the screen is unreachable.
+pub fn repo_preview() -> crate::adopt::RepoPreview {
+    crate::adopt::RepoPreview {
+        open_issues: 83,
+        truncated: false,
+        labels: vec![
+            ("release-a".into(), 68),
+            ("area:design".into(), 20),
+            ("release-b".into(), 15),
+            ("bug".into(), 9),
+            ("needs-spec".into(), 4),
+        ],
+    }
+}
+
 pub fn app(scenario: &str) -> App {
     if scenario == UNADOPTED {
         // No tasks at all: nothing is polling these repos, which is the point.

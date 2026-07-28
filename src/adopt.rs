@@ -261,6 +261,80 @@ pub fn stored(db: &Db) -> Vec<Unadopted> {
         .unwrap_or_default()
 }
 
+// ---- what adopting is about to pull ------------------------------------
+
+/// The open issues a repo would contribute, and the labels they carry.
+///
+/// Adoption already knows the repo, so it can ask before it writes. Pointing
+/// the board at `bredebjorhovd/itsm-agent` put 83 rows on it in one poll — 76%
+/// of everything not done — and nothing had been wrong: `labels = []` means
+/// "every open issue", and that repo has 83 of them. The information needed to
+/// poll only what is current was already on those issues, unused.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoPreview {
+    /// Open issues, pull requests excluded.
+    pub open_issues: usize,
+    /// The page was full, so the count is a floor rather than a total.
+    pub truncated: bool,
+    /// Labels present on those issues, commonest first, then alphabetical.
+    pub labels: Vec<(String, usize)>,
+}
+
+impl RepoPreview {
+    /// How many issues that label alone would let through.
+    pub fn count_of(&self, label: &str) -> usize {
+        self.labels
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    /// How many issues a set of labels would let through. GitHub's `labels=`
+    /// filter is an AND, so this is the smallest of them — never the sum, which
+    /// would over-promise on issues carrying two of the chosen labels.
+    pub fn count_for(&self, labels: &[String]) -> usize {
+        labels
+            .iter()
+            .map(|l| self.count_of(l))
+            .min()
+            .unwrap_or(self.open_issues)
+    }
+
+    /// `83 open issues` / `100+ open issues`.
+    pub fn count_phrase(&self) -> String {
+        format!(
+            "{}{} open issue{}",
+            self.open_issues,
+            if self.truncated { "+" } else { "" },
+            if self.open_issues == 1 && !self.truncated { "" } else { "s" }
+        )
+    }
+}
+
+/// Ask GitHub what adopting this repo unfiltered would put on the board.
+pub fn preview<T: crate::sources::github::Rest>(
+    gh: &crate::sources::github::Github<T>,
+    repo: &str,
+) -> Result<RepoPreview> {
+    let issues = gh.open_issues(repo)?;
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for issue in &issues {
+        for label in &issue.labels {
+            *counts.entry(label.clone()).or_default() += 1;
+        }
+    }
+    let mut labels: Vec<(String, usize)> = counts.into_iter().collect();
+    // Commonest first: the label that would let most of the backlog through is
+    // the one worth seeing, and the tail is what you scroll for.
+    labels.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(RepoPreview {
+        open_issues: issues.len(),
+        truncated: issues.len() >= crate::sources::github::PAGE,
+        labels,
+    })
+}
+
 // ---- writing routing.toml ----------------------------------------------
 
 /// What one adoption wrote, for the footer to report.
@@ -270,11 +344,22 @@ pub struct Adopted {
     pub wrote_repo: bool,
     /// The label suggested for Linear issues, left commented out in the file.
     pub suggested_label: String,
+    /// The `[[github.repo]] labels` written, if the operator picked any.
+    pub labels: Option<Vec<String>>,
+}
+
+/// Adopt a repo, polling it for everything its `[github] labels` lets through.
+pub fn adopt(path: &Path, u: &Unadopted) -> Result<Adopted> {
+    adopt_with(path, u, None)
 }
 
 /// Adopt a repo: write the route it needs and the `[github] repos` entry, and
 /// leave a suggestion for the one thing that cannot be derived.
-pub fn adopt(path: &Path, u: &Unadopted) -> Result<Adopted> {
+///
+/// `labels` is what the operator chose in the adoption screen. `None` keeps the
+/// global `[github] labels` — which is what adoption always did, and is right
+/// whenever the repo's tracker is curated.
+pub fn adopt_with(path: &Path, u: &Unadopted, labels: Option<&[String]>) -> Result<Adopted> {
     let before = read(path)?;
     let mut text = before.clone();
     let mut wrote_route = false;
@@ -293,12 +378,18 @@ pub fn adopt(path: &Path, u: &Unadopted) -> Result<Adopted> {
         text = add_to_array(&text, "github", "repos", &u.slug, NEW_GITHUB_TABLE);
         wrote_repo = true;
     }
+    // After the repos entry, always: a `[[github.repo]]` naming a repo that is
+    // not polled does not validate, and `apply` would then refuse the lot.
+    if let Some(labels) = labels {
+        text = insert_repo_table(&text, u, labels);
+    }
 
     apply(path, &before, &text)?;
     Ok(Adopted {
         wrote_route,
         wrote_repo,
         suggested_label: u.name().to_string(),
+        labels: labels.map(<[String]>::to_vec),
     })
 }
 
@@ -378,6 +469,75 @@ fn route_block(u: &Unadopted, runtime: &str) -> String {
         ws = u.label,
         slug = u.slug,
     )
+}
+
+/// The `[[github.repo]]` block that narrows what one repo contributes.
+fn repo_table_block(slug: &str, labels: &[String]) -> String {
+    let list = labels
+        .iter()
+        .map(|l| toml_string(l))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let opening = if labels.is_empty() {
+        "# Adopted from the board's UNADOPTED section. An empty list is every\n\
+         # open issue, said out loud — it overrides `[github] labels` rather\n\
+         # than falling back to it."
+    } else {
+        "# Adopted from the board's UNADOPTED section. Only these labels are\n\
+         # polled, so the board carries what is current rather than the whole\n\
+         # backlog. Add labels to widen it, `labels = []` for every open issue,\n\
+         # or delete the table to fall back to `[github] labels`."
+    };
+    format!(
+        "{opening}\n\
+         [[github.repo]]\n\
+         name = {name}\n\
+         labels = [{list}]\n\
+         \n",
+        name = toml_string(slug),
+    )
+}
+
+/// A TOML basic string. Labels are somebody else's data — `area:design` is
+/// fine, and a label with a quote in it would otherwise write a file that does
+/// not parse, which `apply` would then refuse in full.
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Insert the `[[github.repo]]` table for a repo, directly below the `[github]`
+/// table it belongs to.
+///
+/// A no-op when the repo already has one: two tables for one repo do not
+/// validate, and `apply` would then refuse the whole adoption rather than the
+/// one part of it that was redundant.
+fn insert_repo_table(text: &str, u: &Unadopted, labels: &[String]) -> String {
+    if toml::from_str::<RoutingConfig>(text)
+        .ok()
+        .is_some_and(|c| c.github.settings_for(&u.slug).is_some())
+    {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let headers = header_lines(text);
+    // Below `[github]` rather than at the end of the file: it configures what
+    // `repos` lists, and a reader looking at one should see the other. Table
+    // order carries no meaning in TOML — only `[[route]]` order does — so
+    // appending is the safe fallback when there is no `[github]` table yet.
+    let at = headers
+        .iter()
+        .position(|(_, name)| name == "[github]")
+        .and_then(|ix| headers.get(ix + 1))
+        .map(|(i, _)| start_of_block(&lines, *i))
+        .unwrap_or(lines.len());
+
+    let mut out: Vec<String> = lines[..at].iter().map(|s| s.to_string()).collect();
+    if out.last().is_some_and(|l| !l.trim().is_empty()) {
+        out.push(String::new());
+    }
+    out.extend(repo_table_block(&u.slug, labels).lines().map(str::to_string));
+    out.extend(lines[at..].iter().map(|s| s.to_string()));
+    join(&out, text)
 }
 
 /// The runtime to write.
@@ -837,6 +997,10 @@ repos = ["Florin-AS/Tally"]
     }
 
     fn adopt_text(text: &str, u: &Unadopted) -> String {
+        adopt_text_with(text, u, None)
+    }
+
+    fn adopt_text_with(text: &str, u: &Unadopted, labels: Option<&[String]>) -> String {
         let parsed = cfg(text);
         let mut out = text.to_string();
         if u.missing != Missing::Polling {
@@ -844,6 +1008,9 @@ repos = ["Florin-AS/Tally"]
         }
         if u.missing != Missing::Route {
             out = add_to_array(&out, "github", "repos", &u.slug, NEW_GITHUB_TABLE);
+        }
+        if let Some(labels) = labels {
+            out = insert_repo_table(&out, u, labels);
         }
         // Everything the writer emits has to survive the gate `apply` puts it
         // through, or the keypress does nothing at all.
@@ -1036,6 +1203,227 @@ runtime = "claude-code"
         );
         assert_eq!(habitual_runtime(&c), "codex");
         assert_eq!(habitual_runtime(&cfg("")), "claude-code");
+    }
+
+    // ---- AGE-28: adopting a backlog ------------------------------------
+
+    fn preview_of(issues: serde_json::Value) -> RepoPreview {
+        use crate::sources::github::{FixtureRest, Github};
+        let gh = Github::new(FixtureRest::new(vec![("/repos".into(), issues)]));
+        let p = preview(&gh, "b/itsm-agent").unwrap();
+        // Open issues only: `state=all` would count years of closed ones and
+        // say nothing about what is about to arrive.
+        assert!(
+            gh.rest.asked.borrow()[0].contains("state=open"),
+            "{:?}",
+            gh.rest.asked.borrow()
+        );
+        p
+    }
+
+    fn issue(number: i64, labels: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "number": number, "node_id": format!("n{number}"), "title": "t",
+            "html_url": "u", "state": "open", "updated_at": "t",
+            "labels": labels.iter().map(|l| serde_json::json!({ "name": l })).collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn the_preview_counts_what_adopting_unfiltered_would_pull() {
+        let p = preview_of(serde_json::json!([
+            issue(1, &["release-a"]),
+            issue(2, &["release-a", "area:design"]),
+            issue(3, &["release-b"]),
+            issue(4, &[]),
+        ]));
+        assert_eq!(p.open_issues, 4);
+        assert!(!p.truncated);
+        assert_eq!(p.count_phrase(), "4 open issues");
+        // Commonest first: the label that would let most of the backlog through
+        // is the one worth looking at.
+        assert_eq!(
+            p.labels,
+            vec![
+                ("release-a".to_string(), 2),
+                ("area:design".to_string(), 1),
+                ("release-b".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pull_request_is_not_an_open_issue() {
+        // GitHub's issues endpoint returns both, and counting PRs would
+        // over-state what adopting is about to pull.
+        let p = preview_of(serde_json::json!([
+            issue(1, &["release-a"]),
+            serde_json::json!({ "number": 2, "node_id": "n2", "title": "a PR",
+                                "html_url": "u", "state": "open", "updated_at": "t",
+                                "pull_request": { "url": "x" }, "labels": [] }),
+        ]));
+        assert_eq!(p.open_issues, 1);
+    }
+
+    #[test]
+    fn a_full_page_is_reported_as_a_floor_rather_than_a_total() {
+        // Nothing paginates. Saying `100 open issues` when there may be 400
+        // would be a number the board made up.
+        let many: Vec<serde_json::Value> =
+            (1..=crate::sources::github::PAGE as i64).map(|n| issue(n, &["release-a"])).collect();
+        let p = preview_of(serde_json::Value::Array(many));
+        assert!(p.truncated);
+        assert_eq!(p.count_phrase(), "100+ open issues");
+    }
+
+    #[test]
+    fn a_chosen_filter_is_counted_as_github_would_apply_it() {
+        // `labels=a,b` is an AND. Summing them would promise more rows than
+        // arrive, which is the same over-claiming the preview exists to stop.
+        let p = preview_of(serde_json::json!([
+            issue(1, &["release-a"]),
+            issue(2, &["release-a", "area:design"]),
+            issue(3, &["release-b"]),
+        ]));
+        assert_eq!(p.count_for(&["release-a".into()]), 2);
+        assert_eq!(
+            p.count_for(&["release-a".into(), "area:design".into()]),
+            1,
+            "an AND, not a sum"
+        );
+        // No filter at all is the whole open set.
+        assert_eq!(p.count_for(&[]), 3);
+    }
+
+    #[test]
+    fn adopting_with_labels_writes_a_table_the_poller_then_honours() {
+        // The bug: adopting a repo whose backlog is 83 open issues put all 83
+        // on the board, because `labels = []` means "everything".
+        let out = adopt_text_with(CATCH_ALL, &unadopted(), Some(&["release-a".into()]));
+        let parsed = cfg(&out);
+        assert_eq!(
+            parsed.github.labels_for("Florin-AS/tripletex-mcp"),
+            ["release-a"]
+        );
+        // And the repo it configures is polled at all — a table naming an
+        // unlisted repo does not validate.
+        assert!(parsed.github.repos.iter().any(|r| r == "Florin-AS/tripletex-mcp"));
+        // The other repo keeps the global answer.
+        assert!(parsed.github.labels_for("Florin-AS/Tally").is_empty());
+    }
+
+    #[test]
+    fn choosing_everything_over_a_global_filter_is_writable() {
+        // The override has to work in both directions: a repo whose tracker is
+        // curated wants everything even when the global list is narrow.
+        let text = "[github]\nrepos = [\"a/b\"]\nlabels = [\"herd\"]\n";
+        let out = adopt_text_with(text, &unadopted(), Some(&[]));
+        let parsed = cfg(&out);
+        assert!(parsed.github.labels_for("Florin-AS/tripletex-mcp").is_empty());
+        assert_eq!(parsed.github.labels_for("a/b"), ["herd"], "and only that repo");
+    }
+
+    #[test]
+    fn adopting_without_a_filter_writes_no_table_at_all() {
+        // Unchanged behaviour: a repo whose tracker is already curated does not
+        // need a table saying so.
+        let out = adopt_text_with(CATCH_ALL, &unadopted(), None);
+        assert!(!out.contains("[[github.repo]]"), "{out}");
+        assert!(cfg(&out).github.per_repo.is_empty());
+    }
+
+    #[test]
+    fn the_table_lands_under_the_github_table_it_configures() {
+        let out = adopt_text_with(CATCH_ALL, &unadopted(), Some(&["release-a".into()]));
+        let lines: Vec<&str> = out.lines().collect();
+        let github = lines.iter().position(|l| l.trim() == "[github]").unwrap();
+        let table = lines.iter().position(|l| l.trim() == "[[github.repo]]").unwrap();
+        assert!(table > github, "the table reads as configuring nothing:\n{out}");
+        // Between them, `repos` — which is the list it is narrowing.
+        let repos = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("repos"))
+            .unwrap();
+        assert!(github < repos && repos < table, "{out}");
+    }
+
+    #[test]
+    fn adopting_twice_does_not_write_a_second_table() {
+        // Two tables for one repo do not validate, so a second write would take
+        // the whole adoption down rather than just being redundant.
+        let once = adopt_text_with(CATCH_ALL, &unadopted(), Some(&["release-a".into()]));
+        let twice = insert_repo_table(&once, &unadopted(), &["release-b".into()]);
+        assert_eq!(once, twice);
+        cfg(&twice).check().unwrap();
+    }
+
+    #[test]
+    fn a_second_repo_gets_a_table_of_its_own_beside_the_first() {
+        // The insertion point is computed from `[github]`, and after the first
+        // adoption the header directly below it is another `[[github.repo]]`.
+        let first = adopt_text_with(CATCH_ALL, &unadopted(), Some(&["release-a".into()]));
+        let second = Unadopted {
+            label: "brreg".into(),
+            slug: "Florin-AS/brreg".into(),
+            repo_root: "/code/brreg".into(),
+            missing: Missing::Both,
+        };
+        let out = adopt_text_with(&first, &second, Some(&["bug".into()]));
+        let parsed = cfg(&out);
+        assert_eq!(parsed.github.per_repo.len(), 2);
+        assert_eq!(parsed.github.labels_for("Florin-AS/brreg"), ["bug"]);
+        assert_eq!(
+            parsed.github.labels_for("Florin-AS/tripletex-mcp"),
+            ["release-a"],
+            "the first repo's filter was disturbed:\n{out}"
+        );
+        assert_eq!(parsed.github.repos.len(), 3);
+    }
+
+    #[test]
+    fn a_label_with_a_quote_in_it_does_not_break_the_file() {
+        // Labels are somebody else's data, and a file that does not parse is an
+        // adoption that silently does nothing.
+        let out = adopt_text_with(CATCH_ALL, &unadopted(), Some(&["needs \"design\"".into()]));
+        assert_eq!(
+            cfg(&out).github.labels_for("Florin-AS/tripletex-mcp"),
+            ["needs \"design\""]
+        );
+    }
+
+    #[test]
+    fn a_repo_that_is_already_polled_is_adopted_without_touching_its_filter() {
+        // `Missing::Route` means the operator already chose what this repo
+        // contributes; adopting the missing half must not re-decide it.
+        let mut u = unadopted();
+        u.missing = Missing::Route;
+        let text = "[github]\nrepos = [\"Florin-AS/tripletex-mcp\"]\nlabels = [\"herd\"]\n";
+        let out = adopt_text_with(text, &u, None);
+        assert!(!out.contains("[[github.repo]]"), "{out}");
+        assert_eq!(
+            cfg(&out).github.labels_for("Florin-AS/tripletex-mcp"),
+            ["herd"]
+        );
+    }
+
+    #[test]
+    fn the_written_labels_come_back_for_the_footer_to_report() {
+        let dir = std::env::temp_dir().join(format!("hb-adopt-labels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing.toml");
+        std::fs::write(&path, CATCH_ALL).unwrap();
+
+        let done = adopt_with(&path, &unadopted(), Some(&["release-a".into()])).unwrap();
+        assert_eq!(done.labels.as_deref(), Some(&["release-a".to_string()][..]));
+        assert!(done.wrote_route && done.wrote_repo);
+        // And the file on disk is one the loader accepts.
+        let reloaded = RoutingConfig::load(&path).unwrap();
+        assert_eq!(
+            reloaded.github.labels_for("Florin-AS/tripletex-mcp"),
+            ["release-a"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

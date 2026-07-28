@@ -282,14 +282,16 @@ waiting: telling you to go poke a finished agent would be worse than silence.
 | `enter` | collapsed done | expand the section |
 | `l` | list | detail view |
 | `p` | any row | prompt view; again to toggle back |
-| `h` `esc` | detail, prompt, help | back |
+| `h` `esc` | detail, prompt, help, adopt | back — the adoption screen writes nothing |
 | `g` | bound row | focus the herdr pane running that task |
 | `o` | any row | open the issue (or the PR) in a browser |
 | `r` | failed row | re-dispatch as a new attempt |
 | `d` | failed row | mark done on the board |
 | `m` | review with a PR | merge the pull request — confirms first |
 | `x` | working, blocked | cancel — confirms, then kills the pane |
-| `a` | unadopted repo | adopt — write its route and start polling it |
+| `a` | unadopted repo | adopt — asks what it would put on the board first |
+| `space` | adoption screen | pick a label to poll that repo for |
+| `enter` | adoption screen | adopt, with whatever is picked |
 | `X` | unadopted repo | ignore — stop offering it |
 | `s` | anywhere | sync now |
 | `t` | anywhere | throughput — is any of this working |
@@ -359,8 +361,8 @@ below the queue:
 ⌾ brreg-client                    Florin-AS/brreg-client · no route
 ```
 
-- `a` writes what is missing: a `[[route]]` matching the repo, and the
-  `[github] repos` entry.
+- `a` asks what the repo would put on the board (see below), then writes what is
+  missing: a `[[route]]` matching the repo, and the `[github] repos` entry.
 - `X` adds it to `[adopt] ignore`, so it stops being offered. You need this —
   you open a pane in plenty of repos you are only reading. Delete the line to be
   offered it again.
@@ -412,6 +414,47 @@ repo = "~/code/tripletex-mcp"
 runtime = "claude-code"
 ```
 
+**Adopting asks how much of the board it is about to become.** `a` used to write
+straight through, and `[github] labels = []` means *every open issue* — so
+adopting `bredebjorhovd/itsm-agent` put 83 rows on the board in one poll, 76% of
+everything not done. Nothing was wrong; the board had simply never been told
+that this repo's tracker is a roadmap rather than a queue.
+
+So `a` opens a screen first. It has already resolved the repo, so it can ask
+GitHub what is there and offer the labels those issues carry:
+
+```
+ board ▸ adopt bredebjorhovd/itsm-agent                          83 open issues
+ ──────────────────────────────────────────────────────────────────────────────
+
+ 83 open issues would become rows. A board is a queue of work in play, and a
+ repo's whole backlog is not that — pick the labels that are current.
+
+ poll only issues labelled                                              68 rows
+ ● release-a                                                                 68
+ ○ area:design                                                               20
+ ○ release-b                                                                 15
+
+ writes `[[github.repo]] labels = ["release-a"]` · delete it later to widen
+ ──────────────────────────────────────────────────────────────────────────────
+ space pick a label · enter adopt · esc cancel — nothing is written · ? help
+```
+
+The count on the right is the board you would get, and it moves as you pick.
+Picking several is an AND, because that is what GitHub's `labels=` does — so the
+number goes *down*, never up. `esc` writes nothing and leaves the repo on the
+UNADOPTED list, which is the honest outcome of a question that was asked and not
+answered.
+
+Picking nothing is not "poll everything": it leaves the repo on the global
+`[github] labels`, which is what every adoption did before this screen and is
+right whenever the repo's tracker is already curated. A repo that is *already*
+polled and only missing a route is adopted without the ask — the filter was
+decided when it was first added, and re-deciding it is not what `a` was for.
+
+The preview is a courtesy, not a gate. A 404, a missing token or a rate limit
+leaves the screen saying why, and `enter` still adopts.
+
 A repo covered only by a catch-all still counts as unadopted. `enter` would
 work, and would start an agent in the catch-all's checkout rather than this
 repo's — dispatching into the wrong workspace is a worse silence than the one
@@ -425,6 +468,41 @@ if the event never arrives. `doctor` reports the same list.
 ```bash
 herdr-board demo unadopted    # what the section looks like
 ```
+
+### What each repo contributes
+
+`[github] labels` is a filter over issues, and one filter cannot answer for
+every repo. `labels = []` — every open issue — is exactly right for a tracker
+you curate, and a backlog dump for the repo next to it. So it is a *fallback*,
+and a repo can answer for itself:
+
+```toml
+[github]
+repos = ["Florin-AS/Tally", "bredebjorhovd/itsm-agent"]
+labels = []
+
+[[github.repo]]
+name = "bredebjorhovd/itsm-agent"
+labels = ["release-a"]
+```
+
+Tally keeps `labels = []` and contributes everything it has open. itsm-agent
+contributes the 68 issues labelled `release-a` instead of all 83, because that
+is what is current in a repo whose issue list is also its roadmap.
+
+- Omit `labels` to fall back to `[github] labels`.
+- `labels = []` is every open issue, said out loud — it *overrides* a global
+  filter rather than falling back to it. Absent and empty are different answers,
+  and both are needed: the override has to widen as well as narrow.
+- `name` must also appear in `repos`. A table naming anything else would be
+  settings that apply to nothing — silently, which is the failure this table
+  exists to fix — so `doctor` refuses the config and says which name is wrong.
+  Two tables for one repo are refused for the same reason.
+- `doctor` states the filter in force for each repo, and whether it is the
+  repo's own or the global one.
+
+Adopting a repo through the board writes this table for you; see the screen
+above. Everything it writes is ordinary config you can edit or delete by hand.
 
 ## How it fits together
 
@@ -914,6 +992,15 @@ resolved here rather than guessed at repeatedly.
   detection would be worse than the silence. Hence a section and two keys. The
   ignore list exists for the same reason: without it the section never empties
   and stops being read.
+- **Label filters are per repo, and adoption asks before it writes one.** One
+  global `[github] labels` asks every repo the same question and repos want
+  different answers, so `[[github.repo]]` overrides it and the global list
+  becomes a fallback. The asking is the other half: adoption already knows the
+  repo, so writing `[github] repos` with no filter and finding out on the next
+  poll — 83 rows, 76% of everything not done — was a surprise the board could
+  cheaply avoid. It now shows the count and the labels those issues carry, and
+  `esc` writes nothing. Picking nothing still means "use the global list", not
+  "poll everything": not answering has to leave things as they were.
 - **The board draws no vertical rules at all.** The design handoff flagged
   unbroken vertical rules as an open risk that the HTML prototype could not
   settle. The preferred resolution there was to draw none — herdr already owns

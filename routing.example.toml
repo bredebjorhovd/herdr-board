@@ -90,6 +90,10 @@ branch_template = "board/{identifier_lower}"
 # header omits it, and GITHUB_TOKEN is not needed at all.
 [github]
 repos = []
+# The fallback filter, not the law — an empty list means every open issue.
+# Repos want different answers here: a curated tracker is right to say
+# "everything", while a repo that keeps its roadmap as open issues would put
+# its whole backlog on the board. Override per repo below.
 labels = ["herd"]
 # Show open pull requests as their own `review` rows — work waiting on you that
 # nobody dispatched. A PR from a board dispatch attaches to its task instead.
@@ -99,6 +103,18 @@ pull_requests = true
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
 writeback = false
+
+# One repo, answering differently from the list above. `name` must also appear
+# in `repos` — a table naming anything else is settings that apply to nothing,
+# and `doctor` refuses it rather than letting it sit there looking effective.
+#
+# Omit `labels` to fall back to `[github] labels`; `labels = []` is every open
+# issue, said out loud. The board writes one of these for you when you adopt a
+# repo and pick labels on the way in.
+#
+# [[github.repo]]
+# name = "bredebjorhovd/itsm-agent"
+# labels = ["release-a"]
 
 # The board lists git repos that have a herdr workspace but no config here, in
 # an UNADOPTED section: `a` writes the route and the [github] repos entry, `X`

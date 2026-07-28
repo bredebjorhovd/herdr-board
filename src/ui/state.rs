@@ -16,6 +16,125 @@ pub enum Screen {
     Help,
     /// Throughput: whether the delegating is actually working.
     Stats,
+    /// What adopting a repo is about to put on the board, before it does.
+    Adopt,
+}
+
+/// The adoption screen: how many issues a repo would contribute, and the labels
+/// it could be narrowed to.
+///
+/// A board is a queue of work in play, and a repo's whole backlog is not that.
+/// Adoption already knows the repo, so it asks rather than finding out
+/// afterwards — 83 rows arriving in one poll is a surprise worth one keypress.
+#[derive(Debug, Clone)]
+pub struct AdoptView {
+    pub repo: crate::adopt::Unadopted,
+    /// What GitHub answered, or why it could not be asked. `None` while the
+    /// question is still out — the call blocks, and a board that freezes with
+    /// nothing on screen explaining why is the surprise this screen exists to
+    /// remove. A repo that cannot be previewed is still adoptable: the ask is a
+    /// courtesy, not a gate.
+    pub preview: Option<Result<crate::adopt::RepoPreview, String>>,
+    /// Label rows the operator has picked, by index into `preview.labels`.
+    /// Empty means every open issue.
+    pub chosen: Vec<usize>,
+    pub cursor: usize,
+    /// The `[github] labels` this repo would fall back to with no table of its
+    /// own — so the screen can tell an override from agreeing with the default.
+    pub fallback: Vec<String>,
+}
+
+impl AdoptView {
+    pub fn new(
+        repo: crate::adopt::Unadopted,
+        preview: Option<Result<crate::adopt::RepoPreview, String>>,
+        fallback: Vec<String>,
+    ) -> AdoptView {
+        AdoptView {
+            repo,
+            preview,
+            chosen: Vec::new(),
+            cursor: 0,
+            fallback,
+        }
+    }
+
+    /// Still waiting on GitHub.
+    pub fn pending(&self) -> bool {
+        self.preview.is_none()
+    }
+
+    /// The labels available to pick from.
+    pub fn label_rows(&self) -> &[(String, usize)] {
+        match &self.preview {
+            Some(Ok(p)) => &p.labels,
+            _ => &[],
+        }
+    }
+
+    /// The labels currently picked, in the order they are shown.
+    pub fn labels(&self) -> Vec<String> {
+        let rows = self.label_rows();
+        let mut ix = self.chosen.clone();
+        ix.sort_unstable();
+        ix.iter().filter_map(|i| rows.get(*i)).map(|(l, _)| l.clone()).collect()
+    }
+
+    pub fn is_chosen(&self, ix: usize) -> bool {
+        self.chosen.contains(&ix)
+    }
+
+    pub fn toggle(&mut self) {
+        let ix = self.cursor;
+        if ix >= self.label_rows().len() {
+            return;
+        }
+        match self.chosen.iter().position(|c| *c == ix) {
+            Some(at) => {
+                self.chosen.remove(at);
+            }
+            None => self.chosen.push(ix),
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.label_rows().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.cursor as isize + delta).clamp(0, len as isize - 1);
+        self.cursor = next as usize;
+    }
+
+    /// The labels this repo would actually be polled for: what is picked, or
+    /// the global list it falls back to when nothing is.
+    pub fn effective_labels(&self) -> Vec<String> {
+        let chosen = self.labels();
+        if chosen.is_empty() {
+            self.fallback.clone()
+        } else {
+            chosen
+        }
+    }
+
+    /// How many issues the current choice would put on the board, if that can
+    /// be known at all.
+    pub fn would_pull(&self) -> Option<usize> {
+        let p = self.preview.as_ref()?.as_ref().ok()?;
+        Some(p.count_for(&self.effective_labels()))
+    }
+
+    /// What to write as `[[github.repo]] labels`, or `None` to leave the repo
+    /// on the global list.
+    ///
+    /// Picking nothing is not "poll everything" — it is not answering, which
+    /// leaves the repo where every repo was before this screen existed. And a
+    /// table restating `[github] labels` is config that decides nothing, which
+    /// the next reader has to compare two lists to discover.
+    pub fn written_labels(&self) -> Option<Vec<String>> {
+        let chosen = self.labels();
+        (!chosen.is_empty() && chosen != self.fallback).then_some(chosen)
+    }
 }
 
 /// One task, plus everything the renderer needs that is not on the row.
@@ -243,11 +362,17 @@ pub struct App {
     pub message: Option<(String, Instant)>,
     /// Inline cancel confirmation — replaces the footer, never a second modal.
     pub confirm: Option<String>,
+    /// The repo [`Screen::Adopt`] is asking about. Set by `a`, cleared on the
+    /// way out either way.
+    pub adopt: Option<AdoptView>,
     pub should_quit: bool,
     /// Rows as laid out by the last render, for click hit-testing.
     pub rows: Vec<(u16, Row)>,
     /// Footer hint click targets from the last render: (x range, key).
     pub footer_hits: Vec<(u16, u16, char)>,
+    /// Label rows on the adoption screen from the last render: (y, index).
+    /// herdr is mouse-first, and a picker you cannot click is half a picker.
+    pub adopt_hits: Vec<(u16, usize)>,
     pub config_path: String,
     /// What is stopping the board from having anything on it. Empty once the
     /// board is set up, at which point an empty board just means an empty queue.
@@ -276,9 +401,11 @@ impl App {
             sync,
             message: None,
             confirm: None,
+            adopt: None,
             should_quit: false,
             rows: Vec::new(),
             footer_hits: Vec::new(),
+            adopt_hits: Vec::new(),
             config_path,
             setup_hints: Vec::new(),
             last_height: 0,

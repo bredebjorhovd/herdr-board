@@ -9,6 +9,11 @@ use serde_json::Value;
 
 pub const API: &str = "https://api.github.com";
 
+/// GitHub's maximum page size. Nothing here paginates: one page is enough for
+/// every repo the board is pointed at, and a caller that gets exactly this many
+/// rows back knows to say "or more" rather than pretending to a total.
+pub const PAGE: usize = 100;
+
 /// The REST surface we use. A seam, so tests never touch the network.
 pub trait Rest {
     fn get(&self, path: &str) -> Result<Value>;
@@ -206,11 +211,25 @@ impl<T: Rest> Github<T> {
     /// Issues for a repo. GitHub's issues endpoint also returns pull requests;
     /// those carry a `pull_request` key and are filtered out here.
     pub fn issues(&self, repo: &str, labels: &[String]) -> Result<Vec<GithubIssue>> {
-        let mut path = format!("/repos/{repo}/issues?state=all&per_page=100");
+        let mut path = format!("/repos/{repo}/issues?state=all&per_page={PAGE}");
         if !labels.is_empty() {
             path.push_str(&format!("&labels={}", labels.join(",")));
         }
-        let v = self.rest.get(&path)?;
+        self.issue_page(repo, &path)
+    }
+
+    /// Open issues only, unfiltered — what adopting a repo unfiltered would put
+    /// on the board, before it is put there.
+    ///
+    /// Deliberately not [`Github::issues`]: that asks for `state=all`, so on a
+    /// repo with years of closed issues the page would be mostly history and
+    /// the count would say nothing about what is about to arrive.
+    pub fn open_issues(&self, repo: &str) -> Result<Vec<GithubIssue>> {
+        self.issue_page(repo, &format!("/repos/{repo}/issues?state=open&per_page={PAGE}"))
+    }
+
+    fn issue_page(&self, repo: &str, path: &str) -> Result<Vec<GithubIssue>> {
+        let v = self.rest.get(path)?;
         let arr = v
             .as_array()
             .ok_or_else(|| anyhow!("github issues: expected an array"))?;

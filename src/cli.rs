@@ -1189,8 +1189,22 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                         use crate::sources::github::Rest;
                         r.get(&format!("/repos/{repo}"))
                     });
+                // Which issues this repo actually contributes, and which key
+                // decided that. `labels = []` means every open issue, and a
+                // repo whose backlog is its roadmap will fill the board with
+                // it — so the answer in force is worth stating rather than
+                // leaving to be worked out from two places in the file.
+                let filter = match (
+                    cfg.github.settings_for(repo).is_some(),
+                    cfg.github.labels_for(repo),
+                ) {
+                    (true, []) => " · its own filter: every open issue".to_string(),
+                    (true, l) => format!(" · its own filter: labels {}", l.join(" + ")),
+                    (false, []) => " · [github] labels = []: every open issue".to_string(),
+                    (false, l) => format!(" · [github] labels: {}", l.join(" + ")),
+                };
                 let (ok, detail) = match reachable {
-                    Some(Ok(_)) => (true, "reachable".to_string()),
+                    Some(Ok(_)) => (true, format!("reachable{filter}")),
                     Some(Err(e)) if e.to_string().contains("404") => (
                         false,
                         "404 — either it does not exist, or the token cannot see it"

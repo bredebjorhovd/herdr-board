@@ -2479,6 +2479,52 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_does_not_inherit_the_cancelled_runs_commits() {
+        // herdr-board#10, seen live on gh#71: cancelled after 10 minutes and
+        // four commits, re-dispatched onto the same branch, marked `done` 62
+        // seconds later while its agent was still working. The base recorded
+        // before dispatch is the *repo* HEAD, and the reused branch was already
+        // four commits ahead of it.
+        let work = repo_ahead_of_its_remote();
+        let e = engine(None);
+        let wt = work.to_string_lossy().into_owned();
+        let sha = |r: &str| {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["-C", &wt, "rev-parse", r])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+
+        // What the first attempt started from, and what it left behind.
+        let repo_head_at_first_dispatch = sha("HEAD");
+        std::fs::write(work.join("first"), "1").unwrap();
+        for args in [
+            ["-C", &wt, "add", "."].as_slice(),
+            ["-C", &wt, "commit", "-m", "the cancelled run's work"].as_slice(),
+        ] {
+            std::process::Command::new("git").args(args).output().unwrap();
+        }
+
+        // The retry: same checkout, and the branch tip is now the honest base.
+        let base_for_retry = sha("HEAD");
+        assert_ne!(base_for_retry, repo_head_at_first_dispatch);
+        assert!(
+            !e.attempt_has_commits(Some(&wt), Some(&base_for_retry)),
+            "a retry that has committed nothing yet must not look finished"
+        );
+        assert!(
+            e.attempt_has_commits(Some(&wt), Some(&repo_head_at_first_dispatch)),
+            "measuring from the repo HEAD is what made it look finished — pinned              so the regression is recognisable if it returns"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn an_operators_unpushed_commit_is_not_the_agents_output() {
         let work = repo_ahead_of_its_remote();
         let e = engine(None);

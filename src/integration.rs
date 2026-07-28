@@ -44,10 +44,20 @@ const RULE: &str = r#"
 #
 # Priority sits above `live_prompt_box` and below the blocked rules (980), so an
 # agent waiting on an approval still reports blocked.
+#
+# The region was 6, which is roughly where the spinner sits with nothing between
+# it and the prompt box — and a todo list goes exactly there. Five items pushed
+# the spinner to line 10 on a live pane, the rule missed it, `live_prompt_box`
+# won, and an agent running a shell command reported `idle`. Widened to cover a
+# long todo list plus the four lines of prompt-box chrome beneath it.
+#
+# Safe to widen because the spinner is *ephemeral*: it is removed when a turn
+# ends. Checked across six genuinely idle panes — none carried a token-counter
+# line at all — so a larger window cannot resurrect a finished turn.
 id = "board_working_token_counter"
 state = "working"
 priority = 976
-region = "bottom_non_empty_lines(6)"
+region = "bottom_non_empty_lines(20)"
 visible_working = true
 line_regex = ['\u{b7}\s*\u{2193}\s*[\d.]+[kKmM]?\s*tokens']
 "#;
@@ -195,6 +205,32 @@ mod tests {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         !digits.is_empty() && rest.contains("tokens")
+    }
+
+    #[test]
+    fn the_region_clears_a_todo_list() {
+        // Seen live (herdr-board#9): a five-item todo sits between the spinner
+        // and the prompt box, putting the spinner ten non-empty lines from the
+        // bottom. A region of 6 missed it, `live_prompt_box` won at 950, and an
+        // agent visibly running a shell command reported `idle`.
+        //
+        // The floor: four lines of prompt-box chrome (rule, `❯`, rule, auto
+        // mode) plus a todo list plus its header. Anything under about 16 is
+        // one long todo away from the same failure.
+        let region: usize = RULE
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("region = \"bottom_non_empty_lines(")?
+                    .split(')')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("the rule declares a bottom_non_empty_lines region");
+        assert!(
+            region >= 16,
+            "region {region} leaves no room for a todo list above the prompt box"
+        );
     }
 
     #[test]

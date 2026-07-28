@@ -521,6 +521,20 @@ impl Db {
         Ok(())
     }
 
+    /// Correct the attempt's starting commit once its checkout exists.
+    ///
+    /// Recorded provisionally from the repo's HEAD before dispatch, because the
+    /// row is inserted before the worktree is cut — but a retry reuses a branch
+    /// that already carries the previous attempt's commits, and measuring from
+    /// the repo HEAD counts those as this attempt's output.
+    pub fn set_attempt_base_sha(&self, attempt_id: i64, sha: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET base_sha = ?2 WHERE id = ?1",
+            params![attempt_id, sha],
+        )?;
+        Ok(())
+    }
+
     /// Latch that this attempt has been seen working. Never cleared: it records
     /// that the agent got going at all, not what it is doing now.
     pub fn set_saw_working(&self, attempt_id: i64) -> Result<()> {

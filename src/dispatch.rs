@@ -324,6 +324,30 @@ pub fn dispatch(
             wt.workspace_id,
             wt.path.display()
         ));
+
+        // Where this attempt *actually* starts, now that the checkout exists.
+        //
+        // The provisional base recorded before dispatch is the repo's HEAD,
+        // which is right only for a branch that did not exist yet. A retry
+        // reuses the branch, and the branch already carries the previous
+        // attempt's commits — so measuring from the repo's HEAD counted work
+        // this attempt had not done, and closed it as `done` seconds after it
+        // started. Seen live on gh#71: cancelled, re-dispatched, marked done
+        // 62 seconds later with four commits from the cancelled run, while its
+        // agent was still typing (herdr-board#10).
+        //
+        // The worktree's own HEAD is the honest answer for both cases: for a
+        // fresh branch it equals the repo HEAD, and for a reused one it is the
+        // tip the agent is building on.
+        match head_sha(&wt.path) {
+            Some(sha) => engine.db.set_attempt_base_sha(attempt_id, &sha)?,
+            None => log.info(format!(
+                "{}: could not read HEAD of {} — completion falls back to the \
+                 provisional base",
+                p.identifier,
+                wt.path.display()
+            )),
+        }
         engine
             .db
             .conn

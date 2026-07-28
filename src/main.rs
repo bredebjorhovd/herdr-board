@@ -60,8 +60,9 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
         /// Parent task id, when one agent releases work for another. Normally
-        /// omitted: a dispatch from inside an agent's pane resolves its parent
-        /// automatically.
+        /// omitted: a dispatch from inside an agent's pane is recognised as
+        /// that agent's on its own. Pass this to name a parent *issue* as well,
+        /// which only exists if the board dispatched the parent too.
         #[arg(long)]
         via: Option<String>,
     },
@@ -240,7 +241,7 @@ fn main() -> Result<()> {
                         plan.workspace,
                         plan.runtime,
                         plan.attempt_no,
-                        plan.dispatched_by.as_deref().unwrap_or("you"),
+                        dispatch::dispatcher_phrase(&engine.db, &plan.dispatcher),
                     );
                 }
                 Err(e) => {

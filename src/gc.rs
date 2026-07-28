@@ -855,6 +855,7 @@ mod tests {
                 worktree: Some(worktree.into()),
                 branch: Some("board/x".into()),
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();
@@ -1018,6 +1019,7 @@ mod tests {
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();

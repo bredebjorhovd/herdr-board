@@ -820,24 +820,19 @@ impl SyncEngine {
 
     // ---- writeback ------------------------------------------------------
 
+    /// `via` is the dispatcher already named for a reader — an issue identifier,
+    /// or the pane an orchestrator is running in. `None` is the operator, and
+    /// says nothing upstream.
     pub fn enqueue_dispatch(
         &self,
         task: &Task,
         runtime: &str,
         workspace: &str,
         attempt_no: usize,
-        dispatched_by: Option<&str>,
+        via: Option<&str>,
     ) -> Result<()> {
         // Name the parent upstream too: reading the Linear issue should tell you
         // an agent released this, not a person.
-        let by = dispatched_by.and_then(|id| {
-            self.db
-                .get_task(id)
-                .ok()
-                .flatten()
-                .map(|t| t.identifier)
-                .or_else(|| Some(id.to_string()))
-        });
         self.db.enqueue_writeback(&NewWriteback {
             task_id: task.id.clone(),
             kind: "dispatch".into(),
@@ -845,7 +840,7 @@ impl SyncEngine {
                 "runtime": runtime,
                 "workspace": workspace,
                 "attempt": attempt_no,
-                "via": by,
+                "via": via,
             })
             .to_string(),
             idem_key: format!("{}:dispatch:{}", task.id, attempt_no),
@@ -1372,6 +1367,7 @@ mod tests {
                 worktree: None,
                 branch: Some("board/lin-142".into()),
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();

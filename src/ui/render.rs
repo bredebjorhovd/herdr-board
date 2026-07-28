@@ -1879,6 +1879,41 @@ mod tests {
         assert!(a.contains("ws:offhand"), "{a:?}");
     }
 
+    /// The row released by an orchestrator — a pane the board never dispatched,
+    /// which is how most agent dispatch actually happens. There is no issue to
+    /// name it by, so the pane is the name, in the same column.
+    #[test]
+    fn a_row_released_by_an_orchestrator_names_its_pane() {
+        let v = fixtures::app(fixtures::POPULATED)
+            .views
+            .iter()
+            .find(|v| v.dispatched_by.as_deref() == Some("w1:p3"))
+            .cloned()
+            .expect("the fixture needs an orchestrator-dispatched row");
+        for w in [80, 120] {
+            let m = metadata(&v, false, w);
+            assert!(m.contains("via w1:p3"), "{m:?}");
+        }
+    }
+
+    /// Detail says the same thing it says for a parent it can name by issue:
+    /// an agent released this, not you.
+    #[test]
+    fn the_detail_view_names_an_orchestrator_by_its_pane() {
+        let mut app = fixtures::app(fixtures::POPULATED);
+        let id = app
+            .views
+            .iter()
+            .find(|v| v.dispatched_by.as_deref() == Some("w1:p3"))
+            .map(|v| v.id().to_string())
+            .unwrap();
+        app.screen = Screen::Detail;
+        app.selected_id = Some(id);
+        let buf = draw(&mut app, 80, 24);
+        let all: String = (0..24).map(|y| line(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("w1:p3  ·  agent, not you"), "{all}");
+    }
+
     #[test]
     fn an_operator_row_never_mentions_provenance() {
         // Only the case worth noticing is called out; `you` is the default and

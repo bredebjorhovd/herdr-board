@@ -4,7 +4,7 @@ use crate::config::{Route, RoutingConfig, herdr_kind_for_runtime, interpolate};
 use crate::db::{Db, NewAttempt};
 use crate::herdr::{Herdr, agent_name};
 use crate::log::Logger;
-use crate::model::{AgentStatus, Outcome, Task};
+use crate::model::{AgentStatus, Dispatcher, Outcome, Task};
 use crate::sync::{SyncEngine, route_context};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -27,7 +27,9 @@ pub struct Overrides {
     pub runtime: Option<String>,
     pub branch: Option<String>,
     /// Parent task id, when an agent is releasing this task rather than the
-    /// operator. Normally left `None` and resolved from the calling pane.
+    /// operator. Normally left `None`: the calling pane already identifies the
+    /// agent, and this only adds the *task* to name it by — which an
+    /// orchestrator the board never dispatched does not have.
     pub via: Option<String>,
 }
 
@@ -37,26 +39,73 @@ pub struct Overrides {
 /// `herdr-board dispatch --task <id>` from its own pane, and the row lands on
 /// the board within a tick. Rows therefore appear in `working` that the operator
 /// never released, routinely — so every dispatch records its origin.
-pub fn resolve_dispatcher(db: &Db, explicit: Option<&str>) -> Option<String> {
-    // A command running inside a herdr pane carries that pane's id.
+///
+/// Reads the environment and asks herdr what is in the calling pane; the
+/// decision itself is [`dispatcher_from`].
+pub fn resolve_dispatcher(db: &Db, herdr: &Herdr, explicit: Option<&str>) -> Dispatcher {
+    // A command running inside a herdr pane carries that pane's id — every
+    // pane, not only the ones the board dispatched.
     let pane = std::env::var("HERDR_PANE_ID").ok().filter(|p| !p.is_empty());
-    dispatcher_from(db, explicit, pane.as_deref())
+    // The board records its own pane so the link handler can focus it; here it
+    // is what separates a keypress from an agent.
+    let board = db
+        .meta_get(crate::ui::app::BOARD_PANE)
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    // Only herdr can say whether a pane holds an agent at all. A pane it does
+    // not know — a popup already torn down — is not claimed as one.
+    //
+    // Asked only when it is the deciding fact: the board's own pane and a pane
+    // the board already has a live attempt for are settled without a
+    // subprocess, which keeps it off the picker's keystroke path.
+    let undecided = pane
+        .as_deref()
+        .filter(|p| Some(*p) != board.as_deref())
+        .filter(|p| !matches!(db.live_attempt_for_pane(p), Ok(Some(_))));
+    let has_agent = undecided.is_some_and(|p| {
+        herdr
+            .pane_get(p)
+            .ok()
+            .flatten()
+            .is_some_and(|info| info.agent.is_some())
+    });
+    dispatcher_from(db, explicit, pane.as_deref(), board.as_deref(), has_agent)
 }
 
 /// The provenance decision, without reading the environment.
 ///
-/// If a live attempt owns the calling pane, the agent in it is the parent. The
-/// board pane and the picker popup own no attempt — and a popup gets no pane id
-/// at all — so an operator dispatch resolves to `None` on its own, with no flag
-/// to remember.
-pub fn dispatcher_from(db: &Db, explicit: Option<&str>, pane: Option<&str>) -> Option<String> {
-    if let Some(v) = explicit {
-        return Some(v.to_string());
-    }
-    db.live_attempt_for_pane(pane?)
-        .ok()
-        .flatten()
-        .map(|a| a.task_id)
+/// The pane is the identity. `pane_has_agent` is herdr's answer for the calling
+/// pane, and a live attempt owning that pane is the same answer arrived at from
+/// the board's own records — either one makes this an agent, and the attempt
+/// additionally names its task.
+///
+/// The operator is then the narrow case it should be: a keypress on the board
+/// (which dispatches from the board's own pane), the picker popup (which gets
+/// no pane id at all), or a CLI run from a pane with no agent in it. Not merely
+/// "no attempt owns this pane" — that was true of every orchestrator pane, and
+/// it is why provenance never fired (AGE-24).
+pub fn dispatcher_from(
+    db: &Db,
+    explicit: Option<&str>,
+    pane: Option<&str>,
+    board_pane: Option<&str>,
+    pane_has_agent: bool,
+) -> Dispatcher {
+    // The board dispatching from its own pane is the operator pressing a key,
+    // whatever herdr reports is running there.
+    let pane = pane.filter(|p| !p.is_empty() && Some(*p) != board_pane);
+    let live = pane.and_then(|p| db.live_attempt_for_pane(p).ok().flatten());
+    let task = explicit
+        .map(str::to_string)
+        .or_else(|| live.as_ref().map(|a| a.task_id.clone()));
+    // `--via` names a parent; it does not turn the shell it was typed in into
+    // an agent, and recording that pane would give the follow-up notifier a
+    // wrong address to deliver to.
+    let pane = pane
+        .filter(|_| pane_has_agent || live.is_some())
+        .map(str::to_string);
+    Dispatcher::agent(task, pane)
 }
 
 /// Everything resolved for a dispatch, before anything is created. The picker
@@ -76,8 +125,8 @@ pub struct Plan {
     /// Live attempts already in the target workspace, and the cap.
     pub live_in_workspace: usize,
     pub max_concurrent: usize,
-    /// Parent task id when an agent released this task.
-    pub dispatched_by: Option<String>,
+    /// Who is releasing this task.
+    pub dispatcher: Dispatcher,
 }
 
 impl Plan {
@@ -135,8 +184,13 @@ pub fn resolve_branch(cfg: &RoutingConfig, route: &Route, task: &Task) -> String
 }
 
 /// Build a dispatch plan without creating anything.
+///
+/// Takes `herdr` because provenance does: whether the calling pane holds an
+/// agent is herdr's to answer, and the picker shows the answer before anything
+/// is created.
 pub fn plan(
     db: &Db,
+    herdr: &Herdr,
     cfg: &RoutingConfig,
     paths: &crate::config::Paths,
     task: &Task,
@@ -192,7 +246,7 @@ pub fn plan(
         attempt_no,
         live_in_workspace: db.live_count_in_workspace(&workspace)?,
         max_concurrent: cfg.max_concurrent(route),
-        dispatched_by: resolve_dispatcher(db, ov.via.as_deref()),
+        dispatcher: resolve_dispatcher(db, herdr, ov.via.as_deref()),
     })
 }
 
@@ -208,7 +262,7 @@ pub fn dispatch(
     task: &Task,
     ov: &Overrides,
 ) -> Result<Plan> {
-    let p = plan(&engine.db, &engine.cfg, &engine.paths, task, ov)?;
+    let p = plan(&engine.db, herdr, &engine.cfg, &engine.paths, task, ov)?;
 
     if p.at_cap() {
         bail!(
@@ -243,7 +297,8 @@ pub fn dispatch(
         runtime: p.runtime.clone(),
         worktree: Some(p.worktree.to_string_lossy().into_owned()),
         branch: Some(p.branch.clone()),
-        dispatched_by: p.dispatched_by.clone(),
+        dispatched_by: p.dispatcher.task().map(str::to_string),
+        dispatched_by_pane: p.dispatcher.pane().map(str::to_string),
         base_sha,
     })?;
 
@@ -297,14 +352,14 @@ pub fn dispatch(
                 pane_id,
                 p.runtime,
                 p.attempt_no,
-                p.dispatched_by.as_deref().unwrap_or("operator"),
+                dispatcher_phrase(&engine.db, &p.dispatcher),
             ));
             engine.enqueue_dispatch(
                 task,
                 &p.runtime,
                 &p.workspace,
                 p.attempt_no,
-                p.dispatched_by.as_deref(),
+                dispatcher_name(&engine.db, &p.dispatcher).as_deref(),
             )?;
             Ok(p)
         }
@@ -421,6 +476,42 @@ fn started(herdr: &Herdr, name: &str, ticks: u32) -> bool {
     false
 }
 
+/// A parent task's issue identifier, falling back to the raw task id when the
+/// row has been reaped — the id is still the truth we have, and naming it beats
+/// saying nothing.
+fn identifier_for(db: &Db, task_id: &str) -> String {
+    db.get_task(task_id)
+        .ok()
+        .flatten()
+        .map(|t| t.identifier)
+        .unwrap_or_else(|| task_id.to_string())
+}
+
+/// The short name for a dispatcher: the parent's issue identifier when the
+/// board dispatched it too, the pane it is running in otherwise. `None` is the
+/// operator, who is named by the surrounding copy rather than by this.
+pub fn dispatcher_name(db: &Db, d: &Dispatcher) -> Option<String> {
+    match d {
+        Dispatcher::Operator => None,
+        Dispatcher::Agent { task, pane } => task
+            .as_deref()
+            .map(|id| identifier_for(db, id))
+            .or_else(|| pane.clone()),
+    }
+}
+
+/// The same, in prose. A bare pane id needs saying what it is.
+pub fn dispatcher_phrase(db: &Db, d: &Dispatcher) -> String {
+    match d {
+        Dispatcher::Operator => "you".to_string(),
+        Dispatcher::Agent { task: Some(id), .. } => identifier_for(db, id),
+        Dispatcher::Agent { pane: Some(p), .. } => format!("the agent in {p}"),
+        // `Dispatcher::agent` collapses "neither" to `Operator`, so this arm is
+        // unreachable — but not worth a panic if it ever stops being.
+        Dispatcher::Agent { .. } => "an agent".to_string(),
+    }
+}
+
 /// The agent that released a task, as the operator would recognise it.
 ///
 /// Cancelling is the one board action with a consequence off the board: it can
@@ -430,38 +521,52 @@ fn started(herdr: &Herdr, name: &str, ticks: u32) -> bool {
 /// parent, and that only works if the board says a parent exists.
 #[derive(Debug, Clone)]
 pub struct Parent {
-    /// The parent's issue identifier, e.g. `LIN-138`. Falls back to the raw task
-    /// id if the row is not on the board.
-    pub identifier: String,
-    /// The parent still holds a live attempt, so it is plausibly waiting. A
-    /// parent that has already finished is named without the claim.
+    /// The parent's issue identifier, e.g. `LIN-138` — or the pane it is
+    /// running in, which is all there is to go on for an orchestrator the board
+    /// never dispatched.
+    pub name: String,
+    /// The parent still holds a live attempt, or its pane is still open, so it
+    /// is plausibly waiting. A parent that has already finished is named
+    /// without the claim.
     pub live: bool,
+    /// Where the parent is, when the dispatch recorded a pane. This is the
+    /// address the operator would go to — and, in time, the one a notifier
+    /// would deliver to.
+    pub pane: Option<String>,
 }
 
 impl Parent {
     /// The clause appended to a cancel confirmation.
     pub fn phrase(&self) -> String {
         if self.live {
-            format!("released by {}, which may be waiting on it", self.identifier)
+            format!("released by {}, which may be waiting on it", self.name)
         } else {
-            format!("released by {}", self.identifier)
+            format!("released by {}", self.name)
         }
     }
 }
 
-/// Resolve a `dispatched_by` task id into something worth showing.
-fn parent_of(db: &Db, task_id: &str) -> Parent {
-    match db.get_task(task_id) {
-        Ok(Some(p)) => Parent {
-            identifier: p.identifier.clone(),
-            live: p.live_attempt().is_some(),
-        },
-        // The parent's row may have been reaped; the id is still the truth we
-        // have, and naming it beats saying nothing.
-        _ => Parent {
-            identifier: task_id.to_string(),
-            live: false,
-        },
+/// Resolve a recorded dispatcher into something worth showing.
+///
+/// `pane_live` is whether herdr still knows the pane; it stands in for "is the
+/// parent still there" when there is no attempt to read that off.
+fn parent_of(db: &Db, d: &Dispatcher, pane_live: bool) -> Option<Parent> {
+    match d {
+        Dispatcher::Operator => None,
+        Dispatcher::Agent { task, pane } => Some(Parent {
+            name: dispatcher_phrase(db, d),
+            live: match task.as_deref() {
+                Some(id) => db
+                    .get_task(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.live_attempt().is_some()),
+                // Nothing on the board to read; the pane still being open is
+                // the whole of what we know.
+                None => pane_live,
+            },
+            pane: pane.clone(),
+        }),
     }
 }
 
@@ -484,10 +589,14 @@ pub fn cancel(
     };
     // Read the parent off the attempt before closing it: afterwards there is no
     // live attempt to read it from.
-    let parent = attempt
-        .dispatched_by
-        .as_deref()
-        .map(|id| parent_of(&engine.db, id));
+    let dispatcher = attempt.dispatcher();
+    // Only asked when the answer is load-bearing — a parent known only by its
+    // pane has nothing else to say whether it is still running.
+    let pane_live = dispatcher.task().is_none()
+        && dispatcher
+            .pane()
+            .is_some_and(|p| herdr.pane_get(p).ok().flatten().is_some());
+    let parent = parent_of(&engine.db, &dispatcher, pane_live);
     if let Some(pane) = attempt.pane_id.as_deref()
         && let Err(e) = herdr.pane_close(pane)
     {
@@ -595,10 +704,17 @@ branch_template = "board/{identifier_lower}"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();
         db.set_attempt_pane(a, pane).unwrap();
+    }
+
+    /// herdr is only consulted about the calling pane; in tests there is
+    /// nothing for it to find, so discovery failing is the point.
+    fn herdr() -> Herdr {
+        Herdr::discover(std::sync::Arc::new(Logger::new("", false)))
     }
 
     fn engine_with(db: Db) -> SyncEngine {
@@ -630,6 +746,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-138".into()),
+            dispatched_by_pane: Some("w1:p4".into()),
             base_sha: None,
         })
         .unwrap();
@@ -638,8 +755,10 @@ branch_template = "board/{identifier_lower}"
         let h = Herdr::discover(engine.log.clone());
         let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
         // Named by identifier, not the raw task id — that is what is on screen.
-        assert_eq!(parent.identifier, "LIN-138");
+        assert_eq!(parent.name, "LIN-138");
         assert!(parent.live, "LIN-138 still holds its own attempt");
+        // And reachable: the pane the dispatch came from is the address.
+        assert_eq!(parent.pane.as_deref(), Some("w1:p4"));
         assert_eq!(
             parent.phrase(),
             "released by LIN-138, which may be waiting on it"
@@ -663,6 +782,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-138".into()),
+            dispatched_by_pane: Some("w1:p4".into()),
             base_sha: None,
         })
         .unwrap();
@@ -685,6 +805,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: None,
+            dispatched_by_pane: None,
             base_sha: None,
         })
         .unwrap();
@@ -708,6 +829,7 @@ branch_template = "board/{identifier_lower}"
             worktree: None,
             branch: None,
             dispatched_by: Some("linear:LIN-999".into()),
+            dispatched_by_pane: None,
             base_sha: None,
         })
         .unwrap();
@@ -715,31 +837,81 @@ branch_template = "board/{identifier_lower}"
         let t = engine.db.get_task(&t.id).unwrap().unwrap();
         let h = Herdr::discover(engine.log.clone());
         let parent = cancel(&engine, &h, &engine.log, &t).unwrap().unwrap();
-        assert_eq!(parent.identifier, "linear:LIN-999");
+        assert_eq!(parent.name, "linear:LIN-999");
         assert!(!parent.live);
     }
 
+    /// The case that broke provenance for every attempt ever recorded: a
+    /// long-lived orchestrator pane the operator started and keeps around. It
+    /// owns no attempt — it is a session, not a dispatch — so the old test
+    /// answered "no agent here" and the operator got the credit (AGE-24).
+    #[test]
+    fn a_dispatch_from_an_orchestrator_pane_records_that_pane() {
+        let db = Db::open_in_memory().unwrap();
+        task(&db);
+        // No attempt owns w7:p1; herdr says there is an agent sitting in it.
+        let d = dispatcher_from(&db, None, Some("w7:p1"), Some("w9:p1"), true);
+        assert_eq!(
+            d,
+            Dispatcher::Agent {
+                task: None,
+                pane: Some("w7:p1".into())
+            }
+        );
+        assert!(d.is_agent());
+        assert_eq!(dispatcher_phrase(&db, &d), "the agent in w7:p1");
+    }
+
+    /// A board-dispatched agent keeps the richer label — the pane is recorded
+    /// as well, but the row can still say `via LIN-138`.
     #[test]
     fn a_dispatch_from_an_agents_pane_records_that_agent_as_the_parent() {
-        // The primary agent-initiated path: no flag, just the pane it ran in.
         let db = Db::open_in_memory().unwrap();
         task(&db);
         working_agent(&db, "linear:LIN-138", "w1:p4");
-        assert_eq!(
-            dispatcher_from(&db, None, Some("w1:p4")).as_deref(),
-            Some("linear:LIN-138")
-        );
+        let d = dispatcher_from(&db, None, Some("w1:p4"), Some("w9:p1"), true);
+        assert_eq!(d.task(), Some("linear:LIN-138"));
+        assert_eq!(d.pane(), Some("w1:p4"));
+        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("LIN-138"));
     }
 
+    /// The board's own attempt records survive herdr not answering — a pane
+    /// with a live attempt is an agent whether or not herdr says so.
+    #[test]
+    fn a_live_attempt_makes_it_an_agent_even_if_herdr_says_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        task(&db);
+        working_agent(&db, "linear:LIN-138", "w1:p4");
+        let d = dispatcher_from(&db, None, Some("w1:p4"), None, false);
+        assert_eq!(d.task(), Some("linear:LIN-138"));
+        assert_eq!(d.pane(), Some("w1:p4"));
+    }
+
+    /// "The operator" means a keypress on the board or a CLI run from a pane
+    /// with no agent in it — not merely "no attempt owns this pane".
     #[test]
     fn a_dispatch_from_the_board_or_picker_is_the_operators() {
         let db = Db::open_in_memory().unwrap();
         task(&db);
         working_agent(&db, "linear:LIN-138", "w1:p4");
-        // The board pane owns no attempt...
-        assert_eq!(dispatcher_from(&db, None, Some("w9:p1")), None);
-        // ...and a popup gets no pane id at all.
-        assert_eq!(dispatcher_from(&db, None, None), None);
+        // The board dispatches from its own pane, which herdr does report an
+        // agent for on some setups. It is still a keypress.
+        assert_eq!(
+            dispatcher_from(&db, None, Some("w9:p1"), Some("w9:p1"), true),
+            Dispatcher::Operator
+        );
+        // A popup gets no pane id at all.
+        assert_eq!(
+            dispatcher_from(&db, None, None, Some("w9:p1"), false),
+            Dispatcher::Operator
+        );
+        // And a plain shell the operator typed into is nobody's agent.
+        assert_eq!(
+            dispatcher_from(&db, None, Some("w3:p9"), Some("w9:p1"), false),
+            Dispatcher::Operator
+        );
+        assert_eq!(dispatcher_phrase(&db, &Dispatcher::Operator), "you");
+        assert_eq!(dispatcher_name(&db, &Dispatcher::Operator), None);
     }
 
     #[test]
@@ -748,27 +920,51 @@ branch_template = "board/{identifier_lower}"
         task(&db);
         working_agent(&db, "linear:LIN-138", "w1:p4");
         assert_eq!(
-            dispatcher_from(&db, Some("linear:LIN-999"), Some("w1:p4")).as_deref(),
+            dispatcher_from(&db, Some("linear:LIN-999"), Some("w1:p4"), None, true).task(),
             Some("linear:LIN-999")
         );
     }
 
+    /// `--via` names a parent; it does not turn the shell it was typed in into
+    /// that parent's pane. Recording it would give the operator — and, later, a
+    /// notifier — an address that answers for somebody else.
     #[test]
-    fn a_pane_whose_attempt_has_ended_is_no_longer_a_parent() {
+    fn an_explicit_via_from_a_plain_shell_records_no_pane() {
+        let db = Db::open_in_memory().unwrap();
+        task(&db);
+        let d = dispatcher_from(&db, Some("linear:LIN-138"), Some("w3:p9"), None, false);
+        assert_eq!(d.task(), Some("linear:LIN-138"));
+        assert_eq!(d.pane(), None);
+    }
+
+    /// An agent whose *task* has finished may still be sitting in its pane,
+    /// waiting on what it released. It is no longer named by that task — but it
+    /// is still an agent, and still reachable.
+    #[test]
+    fn a_pane_whose_attempt_has_ended_is_still_the_agent_in_it() {
         let db = Db::open_in_memory().unwrap();
         task(&db);
         working_agent(&db, "linear:LIN-138", "w1:p4");
         let live = db.live_attempts().unwrap();
         db.close_attempt(live[0].id, Outcome::Done).unwrap();
-        assert_eq!(dispatcher_from(&db, None, Some("w1:p4")), None);
+        let d = dispatcher_from(&db, None, Some("w1:p4"), None, true);
+        assert_eq!(d.task(), None);
+        assert_eq!(d.pane(), Some("w1:p4"));
+        // With no agent left in the pane either, it is the operator's.
+        assert_eq!(
+            dispatcher_from(&db, None, Some("w1:p4"), None, false),
+            Dispatcher::Operator
+        );
     }
 
     #[test]
     fn the_plan_carries_provenance_into_the_attempt() {
         let db = Db::open_in_memory().unwrap();
         let t = task(&db);
+        let h = Herdr::discover(std::sync::Arc::new(Logger::new("", false)));
         let p = plan(
             &db,
+            &h,
             &cfg(),
             &paths(),
             &t,
@@ -778,14 +974,14 @@ branch_template = "board/{identifier_lower}"
             },
         )
         .unwrap();
-        assert_eq!(p.dispatched_by.as_deref(), Some("linear:LIN-138"));
+        assert_eq!(p.dispatcher.task(), Some("linear:LIN-138"));
     }
 
     #[test]
     fn plan_resolves_route_branch_and_runtime_kind() {
         let db = Db::open_in_memory().unwrap();
         let t = task(&db);
-        let p = plan(&db, &cfg(), &paths(), &t, &Overrides::default()).unwrap();
+        let p = plan(&db, &herdr(), &cfg(), &paths(), &t, &Overrides::default()).unwrap();
         assert_eq!(p.workspace, "offhand");
         assert_eq!(p.branch, "board/lin-145");
         assert_eq!(p.runtime, "claude-code");
@@ -834,7 +1030,7 @@ runtime = "claude-code"
     fn the_resolved_prompt_is_interpolated_not_the_template() {
         let db = Db::open_in_memory().unwrap();
         let t = task(&db);
-        let p = plan(&db, &cfg(), &paths(), &t, &Overrides::default()).unwrap();
+        let p = plan(&db, &herdr(), &cfg(), &paths(), &t, &Overrides::default()).unwrap();
         assert!(p.prompt.contains("Add retry to Altinn poller (LIN-145)"));
         assert!(p.prompt.contains("The poller gives up on the first 502."));
         assert!(p.prompt.contains("Branch board/lin-145 is prepared."));
@@ -847,6 +1043,7 @@ runtime = "claude-code"
         let t = task(&db);
         let p = plan(
             &db,
+            &herdr(),
             &cfg(),
             &paths(),
             &t,
@@ -883,7 +1080,7 @@ runtime = "claude-code"
         })
         .unwrap();
         let t = db.get_task("gh:o/r#91").unwrap().unwrap();
-        let err = plan(&db, &cfg(), &paths(), &t, &Overrides::default())
+        let err = plan(&db, &herdr(), &cfg(), &paths(), &t, &Overrides::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("no route for gh#91"), "{err}");
@@ -919,11 +1116,12 @@ runtime = "claude-code"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();
         }
-        let p = plan(&db, &c, &paths(), &t, &Overrides::default()).unwrap();
+        let p = plan(&db, &herdr(), &c, &paths(), &t, &Overrides::default()).unwrap();
         assert_eq!(p.live_in_workspace, 2);
         assert_eq!(p.max_concurrent, 2);
         assert!(p.at_cap());
@@ -942,12 +1140,13 @@ runtime = "claude-code"
                 worktree: None,
                 branch: None,
                 dispatched_by: None,
+                dispatched_by_pane: None,
                 base_sha: None,
             })
             .unwrap();
         db.close_attempt(a, Outcome::Cancelled).unwrap();
         let t = db.get_task("linear:LIN-145").unwrap().unwrap();
-        let p = plan(&db, &cfg(), &paths(), &t, &Overrides::default()).unwrap();
+        let p = plan(&db, &herdr(), &cfg(), &paths(), &t, &Overrides::default()).unwrap();
         assert_eq!(p.attempt_no, 2);
         assert!(p.worktree.to_string_lossy().ends_with("lin-145-2"));
         // A retry reuses the same branch, so the work is not stranded.

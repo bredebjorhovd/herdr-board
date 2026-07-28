@@ -80,9 +80,15 @@ impl Db {
               ended_at     TEXT,
               outcome      TEXT,
               missing_ticks INTEGER NOT NULL DEFAULT 0,
-              -- Task id of the parent that released this one, when an agent
-              -- dispatched it rather than the operator. NULL means "you".
+              -- Task id of the parent that released this one, when the board
+              -- dispatched that parent too. NULL on its own does not mean
+              -- "you": an orchestrator pane has no attempt and so no task id.
               dispatched_by TEXT,
+              -- The pane the dispatch ran from, when an agent was in it. Both
+              -- NULL is what "you" means; this one is set for every agent,
+              -- since HERDR_PANE_ID is carried whether or not the board
+              -- started the pane.
+              dispatched_by_pane TEXT,
               -- Last agent status herdr reported for this attempt's pane. The
               -- TUI reads it to render the dim `idle` marker without having to
               -- shell out to herdr itself.
@@ -147,6 +153,11 @@ impl Db {
                 ("missing_ticks", "INTEGER NOT NULL DEFAULT 0"),
                 ("agent_status", "TEXT"),
                 ("dispatched_by", "TEXT"),
+                // Provenance's actual answer for the common case: the pane the
+                // dispatch came from. Existing rows keep NULL — they were
+                // recorded when only board-dispatched parents could be seen at
+                // all, so their "released by you" was never checked (AGE-24).
+                ("dispatched_by_pane", "TEXT"),
                 // The commit the attempt branched from. Without it, "did the
                 // agent produce anything" has to be measured against
                 // origin/HEAD, which counts the operator's own unpushed work
@@ -423,7 +434,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, base_sha, saw_working
+                    dispatched_by, dispatched_by_pane, base_sha, saw_working
              FROM attempts WHERE task_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -445,8 +456,9 @@ impl Db {
                     .get::<_, Option<String>>(11)?
                     .map(|s| AgentStatus::parse(&s)),
                 dispatched_by: r.get(12)?,
-                base_sha: r.get(13)?,
-                saw_working: r.get::<_, i64>(14)? != 0,
+                dispatched_by_pane: r.get(13)?,
+                base_sha: r.get(14)?,
+                saw_working: r.get::<_, i64>(15)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -459,8 +471,8 @@ impl Db {
         let res = self.conn.execute(
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
-                dispatched_by, started_at, base_sha)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                dispatched_by, dispatched_by_pane, started_at, base_sha)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -469,6 +481,7 @@ impl Db {
                 a.worktree,
                 a.branch,
                 a.dispatched_by,
+                a.dispatched_by_pane,
                 now(),
                 a.base_sha
             ],
@@ -531,7 +544,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, base_sha, saw_working
+                    dispatched_by, dispatched_by_pane, base_sha, saw_working
              FROM attempts WHERE outcome IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -551,8 +564,9 @@ impl Db {
                     .get::<_, Option<String>>(11)?
                     .map(|s| AgentStatus::parse(&s)),
                 dispatched_by: r.get(12)?,
-                base_sha: r.get(13)?,
-                saw_working: r.get::<_, i64>(14)? != 0,
+                dispatched_by_pane: r.get(13)?,
+                base_sha: r.get(14)?,
+                saw_working: r.get::<_, i64>(15)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -560,9 +574,10 @@ impl Db {
 
     /// The live attempt that owns a pane, if any.
     ///
-    /// This is how an agent dispatching from inside its own pane is identified:
-    /// its `HERDR_PANE_ID` resolves to the attempt, and the attempt names the
-    /// parent task.
+    /// This names a *board-dispatched* agent by its task. It is not how an
+    /// agent is recognised — an orchestrator pane owns no attempt and would
+    /// answer `None` here — only how one that has a task on the board gets the
+    /// richer label. See `dispatch::dispatcher_from`.
     pub fn live_attempt_for_pane(&self, pane_id: &str) -> Result<Option<Attempt>> {
         Ok(self
             .live_attempts()?
@@ -694,9 +709,12 @@ pub struct NewAttempt {
     pub runtime: String,
     pub worktree: Option<String>,
     pub branch: Option<String>,
-    /// Parent task id when an agent released this task; `None` means the
-    /// operator did.
+    /// Parent task id when the board dispatched the releasing agent too.
+    /// `None` here does not mean the operator — see `dispatched_by_pane`.
     pub dispatched_by: Option<String>,
+    /// The pane the dispatch ran from, when an agent was in it. Both fields
+    /// `None` is the operator.
+    pub dispatched_by_pane: Option<String>,
     /// The commit the attempt's branch was cut from, so "what did the agent
     /// produce" can be measured against the attempt's own starting point
     /// rather than against the remote.
@@ -765,6 +783,7 @@ mod tests {
             worktree: None,
             branch: Some("board/lin-142".into()),
             dispatched_by: None,
+            dispatched_by_pane: None,
             base_sha: None,
         }
     }

@@ -41,11 +41,14 @@ pub struct TaskView {
     /// Short repo name for a GitHub task. `gh#507` says nothing about which of
     /// several configured repos it came from.
     pub repo: Option<String>,
-    /// Identifier of the parent task that released this one, when an agent did.
-    /// `None` means the operator did.
+    /// How to name the agent that released this row. `None` means the operator
+    /// did — a keypress on the board, or a CLI run from a pane with no agent.
     ///
-    /// Provenance names the parent **task**, not the pane: the pane is
-    /// transient, the task is what you can navigate to.
+    /// The parent **task**'s identifier when the board dispatched that parent
+    /// too, because a task is what you can navigate to. Most dispatching agents
+    /// are orchestrators the board never dispatched, though, so this falls back
+    /// to the **pane** — transient, but it is what there is, and it is where
+    /// the agent actually is.
     pub dispatched_by: Option<String>,
 }
 
@@ -134,10 +137,14 @@ pub fn build_views(
                 elapsed_secs,
                 idle,
                 pane_id: live.and_then(|a| a.pane_id.clone()),
+                // The parent's identifier when the board dispatched it too,
+                // and the pane it is running in otherwise — which is what an
+                // orchestrator, the usual dispatcher, has instead of a task.
                 dispatched_by: live.or(last).and_then(|a| {
-                    a.dispatched_by.as_ref().map(|id| {
-                        identifiers.get(id).cloned().unwrap_or_else(|| id.clone())
-                    })
+                    a.dispatched_by
+                        .as_ref()
+                        .map(|id| identifiers.get(id).cloned().unwrap_or_else(|| id.clone()))
+                        .or_else(|| a.dispatched_by_pane.clone())
                 }),
                 branch,
                 resolved_prompt,

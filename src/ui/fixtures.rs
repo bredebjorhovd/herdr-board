@@ -60,7 +60,7 @@ fn task(identifier: &str, title: &str, state: BoardState) -> Task {
 }
 
 fn attempt(id: i64, runtime: &str, outcome: Option<Outcome>, age_secs: i64) -> Attempt {
-    attempt_by(id, runtime, outcome, age_secs, None)
+    attempt_by(id, runtime, outcome, age_secs, None, None)
 }
 
 fn attempt_by(
@@ -69,6 +69,7 @@ fn attempt_by(
     outcome: Option<Outcome>,
     age_secs: i64,
     dispatched_by: Option<&str>,
+    dispatched_by_pane: Option<&str>,
 ) -> Attempt {
     let started = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
     Attempt {
@@ -85,6 +86,7 @@ fn attempt_by(
         missing_ticks: 0,
         agent_status: None,
         dispatched_by: dispatched_by.map(str::to_string),
+        dispatched_by_pane: dispatched_by_pane.map(str::to_string),
         base_sha: Some("0000000000000000000000000000000000000000".into()),
         // Fixtures depict agents that have been running, not just-started ones.
         saw_working: true,
@@ -109,10 +111,13 @@ fn view(task: Task, elapsed: Option<i64>) -> TaskView {
         pane_id: Some("w3:p2".into()),
         branch: Some(format!("board/{}", task.identifier.to_lowercase())),
         repo: None,
+        // Fixtures already hold identifiers rather than task ids, so this is
+        // the same fallback `build_views` makes: the parent's identifier when
+        // the board dispatched it, the pane it is running in otherwise.
         dispatched_by: task
             .attempts
             .last()
-            .and_then(|a| a.dispatched_by.clone()),
+            .and_then(|a| a.dispatched_by.clone().or_else(|| a.dispatched_by_pane.clone())),
         resolved_prompt: Some(format!(
             "You are working on: {} ({})\n\n{}\n\nWork in this worktree. \
              Open a PR when done; branch is prepared.",
@@ -144,11 +149,20 @@ fn populated_views() -> Vec<TaskView> {
     v.idle = true;
     out.push(v);
 
-    // working, released by another agent rather than by the operator. This is a
-    // primary path, so the fixture treats it as ordinary.
+    // working, released by another agent the board itself dispatched — so the
+    // row can name the parent issue. This is a primary path, so the fixture
+    // treats it as ordinary.
     let mut t = task("LIN-152", "Extract the BRREG client into a package", BoardState::Working);
-    t.attempts = vec![attempt_by(6, "codex", None, 128, Some("LIN-138"))];
+    t.attempts = vec![attempt_by(6, "codex", None, 128, Some("LIN-138"), Some("w2:p1"))];
     out.push(view(t, Some(128)));
+
+    // working, released by an orchestrator — a long-lived pane the operator
+    // started, which owns no attempt and so has no issue to be named by. This
+    // is the *common* shape of agent dispatch, and the one that used to be
+    // recorded as the operator's (AGE-24).
+    let mut t = task("LIN-153", "Split the Altinn poller retry test", BoardState::Working);
+    t.attempts = vec![attempt_by(7, "claude-code", None, 96, None, Some("w1:p3"))];
+    out.push(view(t, Some(96)));
 
     // ready, routed
     out.push(view(

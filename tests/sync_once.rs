@@ -50,6 +50,16 @@ impl GraphQl for Recorded {
     }
 }
 
+/// Shares one [`Recorded`] between the engine, which owns its transport, and the
+/// test, which needs to read back what was sent.
+struct Shared(std::rc::Rc<Recorded>);
+
+impl GraphQl for Shared {
+    fn query(&self, body: &Value) -> Result<Value> {
+        self.0.query(body)
+    }
+}
+
 /// A transport that always fails, for the outage test.
 struct Offline;
 impl GraphQl for Offline {
@@ -329,6 +339,65 @@ fn a_full_lifecycle_runs_through_the_cycle() {
 
     // The Linear trail is queued exactly once.
     assert_eq!(e.db.pending_writebacks(10).unwrap().len(), 1);
+}
+
+/// AGE-21: a ticket whose work is finished and waiting on a human said
+/// "In Progress" in Linear for the whole review window, because dispatch was the
+/// last thing that ever moved it.
+#[test]
+fn work_that_is_waiting_on_a_human_is_moved_out_of_in_progress() {
+    let h = Harness::new("review-state");
+    let recorded = std::rc::Rc::new(Recorded::new(&[
+        "linear_board_page1.json",
+        "linear_board_page2.json",
+        // Resolving `In Review`, then moving the issue.
+        "linear_team_states.json",
+        "linear_issue_update_ok.json",
+    ]));
+    let mut e = h.engine(Box::new(Shared(recorded.clone())));
+    e.cfg.linear.review_state = Some("In Review".into());
+
+    e.sync_once(None).unwrap();
+
+    // OFF-129 is in review on the board *and* already In Review upstream, so
+    // there is nothing to say about it.
+    assert_eq!(
+        e.db.get_task("linear:OFF-129").unwrap().unwrap().state,
+        BoardState::Review
+    );
+    assert_eq!(
+        e.db.pending_writebacks(10).unwrap().len(),
+        0,
+        "a ticket already in the review state must not be written to"
+    );
+
+    // OFF-138 is the case that was broken: In Progress upstream, and its pull
+    // request has just landed.
+    e.db.set_pr(
+        "linear:OFF-138",
+        Some("https://github.com/offhand/tally/pull/293"),
+        Some(293),
+        true,
+    )
+    .unwrap();
+    e.rederive_all().unwrap();
+    assert_eq!(
+        e.db.get_task("linear:OFF-138").unwrap().unwrap().state,
+        BoardState::Review
+    );
+
+    e.drain_writebacks();
+    assert!(e.db.pending_writebacks(10).unwrap().is_empty(), "delivered");
+
+    let sent = recorded.sent.borrow();
+    let update = sent.last().expect("a mutation was sent");
+    assert_eq!(
+        update["variables"]["id"],
+        Value::from("b1d4c9e0-0000-4000-8000-000000000138")
+    );
+    // The configured state — not the lowest-position `started` one, which is
+    // In Progress and is where dispatch already put it.
+    assert_eq!(update["variables"]["stateId"], Value::from("state-review"));
 }
 
 #[test]

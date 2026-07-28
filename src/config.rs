@@ -190,6 +190,8 @@ pub struct RoutingConfig {
     pub defaults: Defaults,
     #[serde(default)]
     pub github: GithubConfig,
+    #[serde(default)]
+    pub linear: LinearConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,6 +353,27 @@ impl Default for GithubConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LinearConfig {
+    /// Name of the workflow state a task moves to when the board derives
+    /// `review` — typically `"In Review"`.
+    ///
+    /// Unset by default, and unset means no transition at all: the ticket stays
+    /// wherever dispatch left it, which is what the board did before this
+    /// existed.
+    ///
+    /// A *name*, unavoidably. Every other Linear state the board touches is
+    /// resolved by type, because teams rename these freely — but Linear has no
+    /// review type. `In Review` and `In Progress` are both `type: started`, so
+    /// the API cannot be asked which one means review, and the lowest-position
+    /// `started` state (what dispatch uses) is `In Progress` precisely because
+    /// review comes after it. Guessing the name would break a renamed or
+    /// non-English workflow silently; naming it here is the only mapping that
+    /// is explicit. `doctor` checks it resolves.
+    #[serde(default)]
+    pub review_state: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
@@ -459,6 +482,7 @@ impl RoutingConfig {
             routes: Vec::new(),
             defaults: Defaults::default(),
             github: GithubConfig::default(),
+            linear: LinearConfig::default(),
         })
     }
 
@@ -779,6 +803,32 @@ runtime = "claude"
         assert_eq!(slugify("Add retry to Altinn poller"), "add-retry-to-altinn-poller");
         assert_eq!(slugify("LIN-145"), "lin-145");
         assert_eq!(slugify("  weird///chars  "), "weird-chars");
+    }
+
+    /// The file people are told to copy has to be a file that loads.
+    #[test]
+    fn the_shipped_example_config_parses_and_validates() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing.example.toml");
+        let c = RoutingConfig::load(&path).unwrap();
+        assert_eq!(c.routes.len(), 2);
+        // `review_state` ships commented out: the example must not turn on a
+        // transition against a state the reader's workspace may not have.
+        assert!(c.linear.review_state.is_none());
+    }
+
+    #[test]
+    fn the_review_state_is_unset_unless_named() {
+        // Unset means no transition at all, which is what a workflow with no
+        // review state needs — so it cannot have a default.
+        assert!(cfg().linear.review_state.is_none());
+        let c: RoutingConfig = toml::from_str(
+            r#"
+[linear]
+review_state = "In Review"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.linear.review_state.as_deref(), Some("In Review"));
     }
 
     #[test]

@@ -252,28 +252,44 @@ impl<T: GraphQl> Linear<T> {
         self.state_id_of_type(team_key, "started")
     }
 
+    /// A workflow state resolved by **name**, case-insensitively.
+    ///
+    /// The one place the board matches a state by name, because Linear gives it
+    /// no choice: `In Review` and `In Progress` are both `type: started`, so
+    /// there is no review type to ask for. Which name means review is config
+    /// (`[linear] review_state`), never a guess — see [`crate::config::LinearConfig`].
+    ///
+    /// No such state comes back as `Err(every state the team has)`, so a caller
+    /// can say what the workflow actually offers rather than only that the name
+    /// did not resolve — the difference between a fixable message and a shrug.
+    pub fn state_id_named(
+        &self,
+        team_key: &str,
+        name: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
+        let states = self.team_states(team_key)?;
+        let found = states
+            .iter()
+            .find(|s| {
+                s.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(match found {
+            Some(id) => Ok(id),
+            None => Err(states
+                .iter()
+                .filter_map(|s| s.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()),
+        })
+    }
+
     fn state_id_of_type(&self, team_key: &str, want: &str) -> Result<Option<String>> {
-        let data = self.transport.query(&json!({
-            "query": r#"query Started($key: String!) {
-                teams(filter: { key: { eq: $key } }, first: 1) {
-                  nodes {
-                    id
-                    states { nodes { id name type position } }
-                  }
-                }
-              }"#,
-            "variables": { "key": team_key },
-        }))?;
-        let states = data
-            .get("teams")
-            .and_then(|t| t.get("nodes"))
-            .and_then(Value::as_array)
-            .and_then(|n| n.first())
-            .and_then(|t| t.get("states"))
-            .and_then(|s| s.get("nodes"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let states = self.team_states(team_key)?;
         let mut started: Vec<&Value> = states
             .iter()
             .filter(|s| s.get("type").and_then(Value::as_str) == Some(want))
@@ -288,6 +304,31 @@ impl<T: GraphQl> Linear<T> {
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string))
+    }
+
+    /// Every workflow state on a team, in the order Linear returned them.
+    fn team_states(&self, team_key: &str) -> Result<Vec<Value>> {
+        let data = self.transport.query(&json!({
+            "query": r#"query States($key: String!) {
+                teams(filter: { key: { eq: $key } }, first: 1) {
+                  nodes {
+                    id
+                    states { nodes { id name type position } }
+                  }
+                }
+              }"#,
+            "variables": { "key": team_key },
+        }))?;
+        Ok(data
+            .get("teams")
+            .and_then(|t| t.get("nodes"))
+            .and_then(Value::as_array)
+            .and_then(|n| n.first())
+            .and_then(|t| t.get("states"))
+            .and_then(|s| s.get("nodes"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Teams the key can see, for generating routes.
@@ -686,15 +727,43 @@ mod tests {
 
     #[test]
     fn started_state_is_chosen_by_type_and_position() {
-        let l = Linear::new(FixtureTransport::new(vec![json!({
+        // And `In Review`, the other `started` state, is exactly why dispatch
+        // landing on the lowest position is not enough on its own (AGE-21).
+        let l = Linear::new(FixtureTransport::new(vec![states_page()]));
+        assert_eq!(l.started_state_id("OFF").unwrap().as_deref(), Some("s-prog"));
+    }
+
+    fn states_page() -> Value {
+        json!({
             "teams": { "nodes": [ { "id": "team-1", "states": { "nodes": [
                 { "id": "s-done", "name": "Done",        "type": "completed", "position": 3.0 },
                 { "id": "s-rev",  "name": "In Review",   "type": "started",   "position": 2.0 },
                 { "id": "s-prog", "name": "In Progress", "type": "started",   "position": 1.0 },
                 { "id": "s-todo", "name": "Todo",        "type": "unstarted", "position": 0.0 }
             ] } } ] }
-        })]));
-        assert_eq!(l.started_state_id("OFF").unwrap().as_deref(), Some("s-prog"));
+        })
+    }
+
+    /// Linear has no review state *type* — `In Review` and `In Progress` are
+    /// both `started` — so this one lookup goes by name, from config.
+    #[test]
+    fn a_review_state_is_found_by_name_because_there_is_no_review_type() {
+        let l = Linear::new(FixtureTransport::new(vec![states_page(), states_page()]));
+        assert_eq!(l.state_id_named("OFF", "In Review").unwrap(), Ok("s-rev".into()));
+        // Case is not something an operator should have to get right.
+        assert_eq!(l.state_id_named("OFF", "in review").unwrap(), Ok("s-rev".into()));
+    }
+
+    #[test]
+    fn a_state_name_that_does_not_exist_comes_back_with_the_ones_that_do() {
+        // So the operator is told what to write instead of just that they were
+        // wrong — a renamed or non-English workflow is the likely case.
+        let l = Linear::new(FixtureTransport::new(vec![states_page()]));
+        let Err(have) = l.state_id_named("OFF", "Reviewing").unwrap() else {
+            panic!("`Reviewing` must not resolve");
+        };
+        assert!(have.contains(&"In Review".to_string()), "{have:?}");
+        assert_eq!(have.len(), 4);
     }
 
     #[test]

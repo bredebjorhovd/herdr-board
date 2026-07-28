@@ -47,8 +47,10 @@ pub enum Action {
     Cancel,
     /// Merge the pull request on a `review` row.
     Merge,
-    /// Write the config an unadopted repo is missing.
+    /// Ask what adopting an unadopted repo would pull, then write it.
     Adopt,
+    /// Pick or unpick the label under the cursor on the adoption screen.
+    Toggle,
     /// Stop offering an unadopted repo.
     Ignore,
     Sync,
@@ -80,6 +82,22 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         return match key.code {
             KeyCode::Char('y') => Action::ConfirmYes,
             KeyCode::Char('n') | KeyCode::Esc => Action::ConfirmNo,
+            _ => Action::None,
+        };
+    }
+
+    // The adoption screen is a picker, so the letters that mean things on the
+    // board mean nothing here. `a` in particular: it opened this screen, and
+    // re-firing it from inside would ask the question a second time.
+    if app.screen == Screen::Adopt {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::Move(1),
+            KeyCode::Char('k') | KeyCode::Up => Action::Move(-1),
+            KeyCode::Char(' ') => Action::Toggle,
+            KeyCode::Enter => Action::Enter,
+            KeyCode::Char('h') | KeyCode::Esc => Action::Back,
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('?') => Action::Help,
             _ => Action::None,
         };
     }
@@ -129,6 +147,7 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
                 'x' => Action::Cancel,
                 'm' => Action::Merge,
                 'a' => Action::Adopt,
+                ' ' => Action::Toggle,
                 'X' => Action::Ignore,
                 'r' => Action::Retry,
                 'd' => Action::MarkDone,
@@ -139,6 +158,19 @@ pub fn mouse_action(app: &mut App, m: MouseEvent, last_click: &mut Option<(u16, 
                 _ => Action::None,
             };
         }
+    }
+
+    // A label on the adoption screen. Clicking picks it outright rather than
+    // only selecting: nothing is written until `enter`, so there is no
+    // destructive click to guard against here.
+    if app.screen == Screen::Adopt {
+        let Some((_, ix)) = app.adopt_hits.iter().find(|(ry, _)| *ry == y).copied() else {
+            return Action::None;
+        };
+        if let Some(view) = &mut app.adopt {
+            view.cursor = ix;
+        }
+        return Action::Toggle;
     }
 
     let Some((_, row)) = app.rows.iter().find(|(ry, _)| *ry == y).cloned() else {
@@ -286,7 +318,17 @@ impl Board {
         match action {
             Action::None => {}
             Action::Quit => self.app.should_quit = true,
-            Action::Move(d) => self.app.select_delta(d),
+            Action::Move(d) => match &mut self.app.adopt {
+                Some(view) if self.app.screen == Screen::Adopt => view.move_cursor(d),
+                _ => self.app.select_delta(d),
+            },
+            Action::Toggle => {
+                if let Some(view) = &mut self.app.adopt
+                    && self.app.screen == Screen::Adopt
+                {
+                    view.toggle();
+                }
+            }
             Action::Help => self.app.screen = Screen::Help,
             Action::Stats => {
                 // Reads every attempt, and nothing on it moves second to
@@ -295,6 +337,10 @@ impl Board {
                 self.app.screen = Screen::Stats;
             }
             Action::Back => {
+                // Leaving the adoption screen writes nothing — the repo stays
+                // on the UNADOPTED list, which is the honest outcome of a
+                // question that was asked and not answered.
+                self.app.adopt = None;
                 self.app.screen = Screen::List;
             }
             Action::Detail => {
@@ -343,6 +389,9 @@ impl Board {
     }
 
     fn on_enter(&mut self) -> Result<()> {
+        if self.app.screen == Screen::Adopt {
+            return self.confirm_adopt();
+        }
         if self.app.on_unadopted_header() {
             self.app.collapsed_unadopted = !self.app.collapsed_unadopted;
             return Ok(());
@@ -496,16 +545,94 @@ impl Board {
         self.open_picker(v.id())
     }
 
-    /// `a` — write the config an unadopted repo is missing.
+    /// `a` — ask what adopting a repo would pull, then write the config it is
+    /// missing.
     ///
-    /// The whole point of adopting explicitly is that the operator sees what
-    /// was written, so this says so rather than flashing `✓ adopted` and
-    /// leaving them to diff the file.
+    /// Adoption used to write straight through, and `[github] labels = []`
+    /// means "every open issue" — so adopting a repo that keeps its roadmap as
+    /// open issues put 83 rows on the board in one poll. The repo is known at
+    /// this point and its issues carry the labels that would narrow it, so the
+    /// board asks instead of finding out afterwards.
     fn adopt(&mut self) -> Result<()> {
         let Some(u) = self.app.unadopted_selected().cloned() else {
             return Ok(());
         };
-        match crate::adopt::adopt(&self.paths.routing(), &u) {
+        // Already polled — the operator has decided what this repo contributes
+        // and the missing half is a route. Nothing to ask about.
+        if u.missing == crate::adopt::Missing::Route {
+            return self.write_adoption(&u, None);
+        }
+        // The screen opens before the answer arrives; [`Board::settle_adopt`]
+        // fills it in once the first frame is on screen.
+        self.app.adopt = Some(AdoptView::new(
+            u,
+            None,
+            self.engine.cfg.github.labels.clone(),
+        ));
+        self.app.screen = Screen::Adopt;
+        Ok(())
+    }
+
+    /// Answer the question a just-opened adoption screen is asking.
+    ///
+    /// Called from the event loop **after** the frame is drawn, on purpose: the
+    /// call blocks for as long as GitHub takes, and a board that freezes with
+    /// nothing on screen explaining why would be a fresh version of the
+    /// surprise this whole screen exists to remove.
+    pub fn settle_adopt(&mut self) {
+        let Some(slug) = self
+            .app
+            .adopt
+            .as_ref()
+            .filter(|v| v.pending())
+            .map(|v| v.repo.slug.clone())
+        else {
+            return;
+        };
+        let got = self.preview_repo(&slug);
+        if let Err(e) = &got {
+            self.log.warn(format!("could not preview {slug}: {e}"));
+        }
+        if let Some(view) = &mut self.app.adopt
+            && view.repo.slug == slug
+        {
+            view.preview = Some(got);
+        }
+    }
+
+    /// Ask GitHub what the repo would contribute.
+    ///
+    /// Builds its own client: the engine's is `None` until some repo is
+    /// configured, and a repo being unconfigured is the whole situation here.
+    fn preview_repo(&self, repo: &str) -> Result<crate::adopt::RepoPreview, String> {
+        use crate::sources::github::{Github, HttpRest};
+        let token = crate::config::github_token(&self.paths);
+        let rest = HttpRest::new(token).map_err(|e| e.to_string())?;
+        crate::adopt::preview(&Github::new(rest), repo).map_err(|e| format!("{e:#}"))
+    }
+
+    /// `enter` on the adoption screen — write it, with whatever filter was
+    /// picked.
+    fn confirm_adopt(&mut self) -> Result<()> {
+        let Some(view) = self.app.adopt.take() else {
+            return Ok(());
+        };
+        self.app.screen = Screen::List;
+        let labels = view.written_labels();
+        self.write_adoption(&view.repo, labels.as_deref())
+    }
+
+    /// The write itself.
+    ///
+    /// The whole point of adopting explicitly is that the operator sees what
+    /// was written, so this says so rather than flashing `✓ adopted` and
+    /// leaving them to diff the file.
+    fn write_adoption(
+        &mut self,
+        u: &crate::adopt::Unadopted,
+        labels: Option<&[String]>,
+    ) -> Result<()> {
+        match crate::adopt::adopt_with(&self.paths.routing(), u, labels) {
             Ok(done) => {
                 let wrote = match (done.wrote_route, done.wrote_repo) {
                     (true, true) => "route + polling",
@@ -513,12 +640,17 @@ impl Board {
                     (false, true) => "polling",
                     (false, false) => "nothing",
                 };
+                let filter = match done.labels.as_deref() {
+                    Some([]) => ", every open issue".to_string(),
+                    Some(l) => format!(", only {}", l.join(" + ")),
+                    None => String::new(),
+                };
                 self.log
-                    .info(format!("adopted {} ({wrote})", u.slug));
+                    .info(format!("adopted {} ({wrote}{filter})", u.slug));
                 // Naming the guess is the point: a git remote cannot tell you a
                 // Linear label, and a suggestion nobody reads is not one.
                 self.app.flash(format!(
-                    "✓ adopted {} — {wrote}. Linear label `{}` is only a suggestion, commented out in routing.toml",
+                    "✓ adopted {} — {wrote}{filter}. Linear label `{}` is only a suggestion, commented out in routing.toml",
                     u.slug, done.suggested_label
                 ));
             }
@@ -677,6 +809,10 @@ fn event_loop(term: &mut Term, board: &mut Board) -> Result<()> {
             board.app.last_height = area.height;
             render::render(f.buffer_mut(), area, &mut board.app);
         })?;
+
+        // After the draw, never before: this blocks on GitHub, and the frame
+        // just painted is the one that says so.
+        board.settle_adopt();
 
         // Elapsed counters tick once a second and are the only motion here.
         if event::poll(Duration::from_millis(250))? {
@@ -860,6 +996,103 @@ mod tests {
             Action::Ignore
         );
         assert_eq!(key_action(&app, key('x')), Action::Cancel, "`x` still cancels");
+    }
+
+    /// A board sitting on the adoption screen for the first unadopted repo.
+    fn adopting() -> App {
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        let repo = app.unadopted[0].clone();
+        app.adopt = Some(AdoptView::new(
+            repo,
+            Some(Ok(fixtures::repo_preview())),
+            Vec::new(),
+        ));
+        app.screen = Screen::Adopt;
+        app
+    }
+
+    #[test]
+    fn the_adoption_screen_takes_only_the_keys_that_mean_something_on_it() {
+        // `a` in particular: it opened this screen, and re-firing it from
+        // inside would ask the same question a second time. So would `d`, `x`
+        // and `m`, all of which act on a task that is not what is selected.
+        let app = adopting();
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Action::Toggle
+        );
+        assert_eq!(key_action(&app, key('j')), Action::Move(1));
+        assert_eq!(key_action(&app, key('k')), Action::Move(-1));
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Enter
+        );
+        assert_eq!(
+            key_action(&app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Back
+        );
+        for c in ['a', 'd', 'x', 'm', 'r', 'o', 'g', 's', 't', 'l', 'p'] {
+            assert_eq!(key_action(&app, key(c)), Action::None, "`{c}` was claimed");
+        }
+    }
+
+    #[test]
+    fn moving_on_the_adoption_screen_moves_its_cursor_not_the_boards() {
+        let mut app = adopting();
+        let selected = app.selected_id.clone();
+        app.adopt.as_mut().unwrap().move_cursor(1);
+        assert_eq!(app.adopt.as_ref().unwrap().cursor, 1);
+        assert_eq!(app.selected_id, selected, "the board's cursor moved too");
+        // And it stops at the ends rather than wrapping into nothing.
+        app.adopt.as_mut().unwrap().move_cursor(-9);
+        assert_eq!(app.adopt.as_ref().unwrap().cursor, 0);
+        app.adopt.as_mut().unwrap().move_cursor(99);
+        assert_eq!(
+            app.adopt.as_ref().unwrap().cursor,
+            fixtures::repo_preview().labels.len() - 1
+        );
+    }
+
+    #[test]
+    fn picking_nothing_leaves_the_repo_on_the_global_list() {
+        // Not answering the narrowing question is what every adoption did
+        // before this screen existed, and is right when the tracker is curated.
+        let app = adopting();
+        assert_eq!(app.adopt.as_ref().unwrap().written_labels(), None);
+        assert_eq!(app.adopt.as_ref().unwrap().would_pull(), Some(83));
+    }
+
+    #[test]
+    fn picking_a_label_narrows_what_would_arrive() {
+        let mut app = adopting();
+        let view = app.adopt.as_mut().unwrap();
+        view.toggle();
+        assert_eq!(view.written_labels(), Some(vec!["release-a".to_string()]));
+        assert_eq!(view.would_pull(), Some(68));
+        // Unpicking it puts the repo back on the global list.
+        view.toggle();
+        assert_eq!(view.written_labels(), None);
+    }
+
+    #[test]
+    fn a_pick_that_only_restates_the_global_list_writes_nothing() {
+        // A `[[github.repo]]` table repeating `[github] labels` is config that
+        // decides nothing, and the next reader has to diff two lists to know.
+        let mut app = adopting();
+        let view = app.adopt.as_mut().unwrap();
+        view.fallback = vec!["release-a".into()];
+        view.toggle();
+        assert_eq!(view.labels(), vec!["release-a".to_string()]);
+        assert_eq!(view.written_labels(), None);
+    }
+
+    #[test]
+    fn what_would_arrive_reflects_the_global_filter_when_nothing_is_picked() {
+        // With `[github] labels = ["release-a"]` the board would get 68 rows,
+        // not 83 — the screen must not promise the whole open set.
+        let mut app = adopting();
+        app.adopt.as_mut().unwrap().fallback = vec!["release-a".into()];
+        assert_eq!(app.adopt.as_ref().unwrap().would_pull(), Some(68));
     }
 
     #[test]

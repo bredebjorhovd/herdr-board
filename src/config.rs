@@ -339,8 +339,20 @@ pub struct GithubConfig {
     #[serde(default)]
     pub repos: Vec<String>,
     /// Only surface issues carrying one of these labels. Empty = all.
+    ///
+    /// The *fallback*, not the law: a repo with a `[[github.repo]]` table of its
+    /// own answers from that instead. See [`GithubConfig::labels_for`].
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Per-repo overrides, keyed by the same `owner/repo` that `repos` lists.
+    ///
+    /// One global `labels` asks every repo the same question, and repos want
+    /// different answers: a curated backlog means `labels = []` correctly says
+    /// "everything", while a repo carrying its whole roadmap as open issues
+    /// needs "only what is current" — and its issues already say which those
+    /// are. Without this the board had no way to be told.
+    #[serde(default, rename = "repo")]
+    pub per_repo: Vec<RepoConfig>,
     /// Show open pull requests as their own `review` rows.
     ///
     /// A PR raised by a board dispatch attaches to its task instead; this is
@@ -369,9 +381,48 @@ impl Default for GithubConfig {
         GithubConfig {
             repos: Vec::new(),
             labels: Vec::new(),
+            per_repo: Vec::new(),
             pull_requests: true,
             writeback: false,
         }
+    }
+}
+
+/// Settings for one repo, overriding the `[github]` defaults.
+///
+/// ```toml
+/// [[github.repo]]
+/// name = "bredebjorhovd/itsm-agent"
+/// labels = ["release-a"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoConfig {
+    /// `owner/repo`. Must also appear in `[github] repos` — see
+    /// [`RoutingConfig::validate`].
+    pub name: String,
+    /// Only surface issues carrying one of these labels.
+    ///
+    /// Absent — not empty — is what falls back to `[github] labels`. The
+    /// difference is the whole point: `labels = []` on a repo is an operator
+    /// saying "everything, and I mean it here" over a global filter, which no
+    /// single global list can express.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+}
+
+impl GithubConfig {
+    /// The settings written for one repo, if any.
+    pub fn settings_for(&self, repo: &str) -> Option<&RepoConfig> {
+        self.per_repo
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(repo))
+    }
+
+    /// Which labels to poll one repo for, falling back to the global list.
+    pub fn labels_for(&self, repo: &str) -> &[String] {
+        self.settings_for(repo)
+            .and_then(|r| r.labels.as_deref())
+            .unwrap_or(&self.labels)
     }
 }
 
@@ -528,6 +579,33 @@ impl RoutingConfig {
                     r.display_name(),
                     r.runtime,
                     HERDR_AGENT_KINDS.join(", ")
+                );
+            }
+        }
+        // `[github] repos` stays the one list of what is polled, so a
+        // `[[github.repo]]` naming anything else is settings that apply to
+        // nothing — silently, which is the failure this table exists to fix.
+        for (i, r) in self.github.per_repo.iter().enumerate() {
+            if !self
+                .github
+                .repos
+                .iter()
+                .any(|listed| listed.eq_ignore_ascii_case(&r.name))
+            {
+                bail!(
+                    "[[github.repo]] name = \"{}\" is not in `[github] repos`, so nothing \
+                     would ever use it. Add it to `repos`, or correct the name.",
+                    r.name
+                );
+            }
+            if self.github.per_repo[..i]
+                .iter()
+                .any(|earlier| earlier.name.eq_ignore_ascii_case(&r.name))
+            {
+                bail!(
+                    "[[github.repo]] name = \"{}\" appears twice; only the first would \
+                     be used, so the second is settings that do nothing",
+                    r.name
                 );
             }
         }
@@ -848,6 +926,104 @@ review_state = "In Review"
         )
         .unwrap();
         assert_eq!(c.linear.review_state.as_deref(), Some("In Review"));
+    }
+
+    // ---- per-repo github settings --------------------------------------
+
+    fn github(text: &str) -> RoutingConfig {
+        let c: RoutingConfig = toml::from_str(text).unwrap();
+        c.validate().unwrap();
+        c
+    }
+
+    #[test]
+    fn a_repo_can_be_polled_for_less_than_the_global_list() {
+        // The bug: one global `labels` asks every repo the same question.
+        // Adopting a repo whose whole roadmap is open issues put 83 rows on a
+        // board that had 26 — because `labels = []` means "every open issue".
+        let c = github(
+            r#"
+[github]
+repos = ["Florin-AS/Tally", "bredebjorhovd/itsm-agent"]
+labels = []
+
+[[github.repo]]
+name = "bredebjorhovd/itsm-agent"
+labels = ["release-a"]
+"#,
+        );
+        assert_eq!(c.github.labels_for("bredebjorhovd/itsm-agent"), ["release-a"]);
+        // The repo that wanted "everything" still gets it.
+        assert!(c.github.labels_for("Florin-AS/Tally").is_empty());
+    }
+
+    #[test]
+    fn an_absent_repo_table_falls_back_and_an_empty_list_does_not() {
+        // Absent and empty are different answers, and both are needed: a global
+        // filter has to be widenable per repo as well as narrowable.
+        let c = github(
+            r#"
+[github]
+repos = ["o/curated", "o/backlog", "o/everything"]
+labels = ["herd"]
+
+[[github.repo]]
+name = "o/backlog"
+labels = ["release-a", "release-b"]
+
+[[github.repo]]
+name = "o/everything"
+labels = []
+"#,
+        );
+        assert_eq!(c.github.labels_for("o/curated"), ["herd"], "falls back");
+        assert_eq!(c.github.labels_for("o/backlog"), ["release-a", "release-b"]);
+        assert!(
+            c.github.labels_for("o/everything").is_empty(),
+            "an empty list is `everything`, not `fall back to herd`"
+        );
+    }
+
+    #[test]
+    fn a_repo_table_is_matched_however_it_is_cased() {
+        // `[github] repos` is matched case-insensitively everywhere else, and a
+        // filter that silently missed on `Tally` vs `tally` would be the same
+        // class of bug all over again.
+        let c = github(
+            "[github]\nrepos = [\"Florin-AS/Tally\"]\n\n[[github.repo]]\nname = \"florin-as/tally\"\nlabels = [\"herd\"]\n",
+        );
+        assert_eq!(c.github.labels_for("Florin-AS/Tally"), ["herd"]);
+    }
+
+    #[test]
+    fn a_repo_table_for_a_repo_that_is_not_polled_is_refused() {
+        // Settings that apply to nothing, silently, is precisely what the table
+        // was added to stop.
+        let c: RoutingConfig = toml::from_str(
+            "[github]\nrepos = [\"o/a\"]\n\n[[github.repo]]\nname = \"o/typo\"\nlabels = [\"x\"]\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("not in `[github] repos`"), "{err}");
+        assert!(err.contains("o/typo"), "it has to name the offender: {err}");
+    }
+
+    #[test]
+    fn two_tables_for_one_repo_are_refused() {
+        let c: RoutingConfig = toml::from_str(
+            "[github]\nrepos = [\"o/a\"]\n\n[[github.repo]]\nname = \"o/a\"\nlabels = [\"x\"]\n\n[[github.repo]]\nname = \"o/a\"\nlabels = [\"y\"]\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("appears twice"), "{err}");
+    }
+
+    #[test]
+    fn a_config_with_no_repo_tables_at_all_behaves_as_it_always_did() {
+        let c = github("[github]\nrepos = [\"o/a\"]\nlabels = [\"herd\"]\n");
+        assert!(c.github.per_repo.is_empty());
+        assert_eq!(c.github.labels_for("o/a"), ["herd"]);
+        assert_eq!(c.github.labels_for("o/never-heard-of-it"), ["herd"]);
     }
 
     #[test]

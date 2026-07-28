@@ -311,7 +311,10 @@ impl SyncEngine {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for repo in &self.cfg.github.repos {
-            match gh.issues(repo, &self.cfg.github.labels) {
+            // Per repo, not one filter for all of them: `labels = []` is the
+            // right answer for a curated tracker and a backlog dump for a repo
+            // that keeps its roadmap as open issues.
+            match gh.issues(repo, self.cfg.github.labels_for(repo)) {
                 Ok(issues) => {
                     for i in issues {
                         seen.insert(i.task_id());
@@ -2026,6 +2029,66 @@ mod tests {
             BoardState::Done
         );
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    // ---- AGE-28: one label filter cannot answer for every repo -----------
+
+    /// Records the paths asked for, from outside the `Box<dyn Rest>` the engine
+    /// holds — which is the only place the label filter is observable.
+    struct Recorder(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Rest for Recorder {
+        fn get(&self, path: &str) -> Result<Value> {
+            self.0.lock().unwrap().push(path.to_string());
+            Ok(json!([]))
+        }
+        fn post(&self, _: &str, _: &Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        fn patch(&self, _: &str, _: &Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        fn put(&self, _: &str, _: &Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[test]
+    fn each_repo_is_polled_for_its_own_labels() {
+        // The bug: `[github] labels = []` is right for a curated tracker and a
+        // backlog dump for the repo next to it, and there was no way to say so.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut e = engine_with(
+            None,
+            Some(Github::new(
+                Box::new(Recorder(asked.clone())) as Box<dyn Rest>
+            )),
+        );
+        e.cfg.github.repos = vec!["Florin-AS/Tally".into(), "b/itsm-agent".into()];
+        e.cfg.github.labels = vec![];
+        e.cfg.github.per_repo = vec![crate::config::RepoConfig {
+            name: "b/itsm-agent".into(),
+            labels: Some(vec!["release-a".into()]),
+        }];
+        e.cfg
+            .check()
+            .expect("the config the operator would write must validate");
+
+        e.poll_github();
+
+        let asked = asked.lock().unwrap().clone();
+        let queries: Vec<&String> = asked.iter().filter(|p| p.contains("/issues?")).collect();
+        assert_eq!(queries.len(), 2, "{asked:?}");
+        assert!(
+            !queries[0].contains("labels="),
+            "Tally asked for a filter it never configured: {}",
+            queries[0]
+        );
+        assert!(
+            queries[1].contains("labels=release-a"),
+            "itsm-agent's whole backlog would arrive: {}",
+            queries[1]
+        );
     }
 
     // ---- AGE-21: Linear has to be told the work is waiting on a human ----

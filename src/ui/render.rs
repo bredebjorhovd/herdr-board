@@ -671,6 +671,18 @@ fn render_task_row(buf: &mut Buffer, area: Rect, y: u16, v: &TaskView, selected:
 pub fn footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     match app.screen {
         Screen::Help | Screen::Stats => vec![("esc", "back to the board", '\u{1b}')],
+        // How many rows `enter` would produce is on the body's right edge,
+        // where it moves as you pick; the footer only has to offer the keys.
+        Screen::Adopt => {
+            let mut v = Vec::new();
+            if !app.adopt.as_ref().is_none_or(|a| a.label_rows().is_empty()) {
+                v.push(("space", "pick a label", ' '));
+            }
+            v.push(("enter", "adopt", '\r'));
+            v.push(("esc", "cancel — nothing is written", '\u{1b}'));
+            v.push(("?", "help", '?'));
+            v
+        }
         Screen::Detail => {
             let mut v = vec![
                 ("h", "back", 'h'),
@@ -1109,7 +1121,9 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "unadopted",
         &[
-            ("a", "adopt — write its route and poll its issues"),
+            ("a", "adopt — asks what the repo would put on the board"),
+            ("space", "pick a label to poll, on that screen"),
+            ("enter", "adopt with what is picked; esc writes nothing"),
             ("X", "ignore — a repo you are only reading"),
         ],
     ),
@@ -1233,7 +1247,193 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) {
         Screen::Prompt => render_prompt(buf, area, app),
         Screen::Help => render_help(buf, area, app),
         Screen::Stats => render_stats(buf, area, app),
+        Screen::Adopt => render_adopt(buf, area, app),
     }
+}
+
+// ---- adopt -------------------------------------------------------------
+
+/// Picked and not picked. A filled/hollow pair rather than colour, so the
+/// distinction survives `NO_COLOR` and a monochrome terminal.
+pub const PICKED: &str = "●";
+pub const UNPICKED: &str = "○";
+
+/// What adopting a repo would put on the board, before it does.
+///
+/// The whole screen is one question — "83 rows, or which of these?" — so it
+/// answers it in the first two lines and spends the rest on the labels.
+pub fn render_adopt(buf: &mut Buffer, area: Rect, app: &mut App) {
+    app.footer_hits.clear();
+    app.adopt_hits.clear();
+    let last = area.height.saturating_sub(1);
+    let right = area.width.saturating_sub(2);
+    let Some(view) = app.adopt.clone() else {
+        rule(buf, area, 1, right, last.saturating_sub(1), theme::dim());
+        render_footer(buf, area, last, app);
+        return;
+    };
+
+    let mut x = 1;
+    x += put(buf, area, x, 0, "board ", theme::dim());
+    put(
+        buf,
+        area,
+        x,
+        0,
+        &format!("▸ adopt {}", view.repo.slug),
+        theme::fg_default(),
+    );
+    let scale = match &view.preview {
+        Some(Ok(p)) => p.count_phrase(),
+        Some(Err(_)) => "github could not be asked".to_string(),
+        None => "asking github…".to_string(),
+    };
+    put_right(buf, area, right, 0, &scale, theme::dim());
+    rule(buf, area, 1, right, 1, theme::dim());
+
+    // Line one says what happens if you just press enter, because that is what
+    // most adoptions will do and it is the outcome that surprised somebody.
+    let opening = match &view.preview {
+        None => format!(
+            "Asking GitHub how many open issues {} holds, and what they are \
+             labelled.",
+            view.repo.slug
+        ),
+        Some(Ok(p)) if p.open_issues == 0 => {
+            "No open issues. Adopting costs nothing; rows arrive when issues do."
+                .to_string()
+        }
+        Some(Ok(p)) if p.labels.is_empty() => format!(
+            "{} would become rows. Its issues carry no labels, so there is \
+             nothing to narrow it by here.",
+            p.count_phrase()
+        ),
+        Some(Ok(p)) => format!(
+            "{} would become rows. A board is a queue of work in play, and a \
+             repo's whole backlog is not that — pick the labels that are current.",
+            p.count_phrase()
+        ),
+        Some(Err(e)) => format!(
+            "Could not ask GitHub what this repo holds: {e}. Adopting still \
+             works; it polls whatever `[github] labels` lets through."
+        ),
+    };
+    let mut y = 3;
+    for line in wrap(&opening, right.saturating_sub(1) as usize) {
+        if y >= last.saturating_sub(3) {
+            break;
+        }
+        put(buf, area, 1, y, &line, theme::dim());
+        y += 1;
+    }
+    y += 1;
+
+    let rows = view.label_rows();
+    if !rows.is_empty() && y < last.saturating_sub(3) {
+        put(buf, area, 1, y, "poll only issues labelled", theme::dim());
+        // The number that moves as you pick: this is the board you would get.
+        if let Some(n) = view.would_pull() {
+            put_right(
+                buf,
+                area,
+                right,
+                y,
+                &format!("{n} row{}", if n == 1 { "" } else { "s" }),
+                theme::fg_default(),
+            );
+        }
+        y += 1;
+
+        // Windowed on the cursor: a repo can carry more labels than a short
+        // pane has lines, and a pick you cannot scroll to is not offered.
+        let bottom = last.saturating_sub(3);
+        let height = bottom.saturating_sub(y) as usize;
+        let start = adopt_scroll(view.cursor, rows.len(), height);
+        for (ix, (label, count)) in rows.iter().enumerate().skip(start).take(height) {
+            put(
+                buf,
+                area,
+                COL_GUTTER,
+                y,
+                if view.is_chosen(ix) { PICKED } else { UNPICKED },
+                if view.is_chosen(ix) {
+                    theme::fg_default()
+                } else {
+                    theme::dim()
+                },
+            );
+            let width = right.saturating_sub(COL_ID + 6);
+            put(
+                buf,
+                area,
+                COL_ID,
+                y,
+                &truncate(label, width as usize),
+                theme::fg_default(),
+            );
+            put_right(buf, area, right, y, &count.to_string(), theme::dim());
+            if ix == view.cursor {
+                reverse_row(buf, area, y, COL_GUTTER);
+            }
+            app.adopt_hits.push((y, ix));
+            y += 1;
+        }
+        if rows.len() > start + height {
+            put_right(
+                buf,
+                area,
+                right,
+                bottom,
+                &format!("{} more ↓", rows.len() - start - height),
+                theme::dim(),
+            );
+        }
+    }
+
+    // What the choice means in the file, since the file is what it becomes.
+    let note = match view.written_labels() {
+        Some(labels) => format!(
+            "writes `[[github.repo]] labels = [{}]` · delete it later to widen",
+            labels
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // Picking nothing leaves the repo on the global list — which is what
+        // every adoption did before this screen, and is right whenever the
+        // repo's tracker is already curated.
+        None if view.fallback.is_empty() => {
+            "nothing picked · every open issue, as `[github] labels = []` already says"
+                .to_string()
+        }
+        None => format!(
+            "nothing picked · falls back to `[github] labels = [{}]`",
+            view.fallback
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    put(
+        buf,
+        area,
+        1,
+        last.saturating_sub(2),
+        &truncate(&note, right as usize),
+        theme::dim(),
+    );
+    rule(buf, area, 1, right, last.saturating_sub(1), theme::dim());
+    render_footer(buf, area, last, app);
+}
+
+/// Keep the cursor inside a window of `height` label rows.
+pub fn adopt_scroll(cursor: usize, len: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    cursor.saturating_sub(height - 1).min(len - height)
 }
 
 /// Throughput, in the same plain language as everything else. No charts: the
@@ -1463,6 +1663,184 @@ mod tests {
             body.iter().any(|l| l.contains("routed, not polled")),
             "{body:?}"
         );
+    }
+
+    // ---- AGE-28: the adoption screen -----------------------------------
+
+    fn adopting() -> App {
+        let mut app = fixtures::app(fixtures::UNADOPTED);
+        let repo = app.unadopted[0].clone();
+        app.adopt = Some(AdoptView::new(
+            repo,
+            Some(Ok(fixtures::repo_preview())),
+            Vec::new(),
+        ));
+        app.screen = Screen::Adopt;
+        app
+    }
+
+    #[test]
+    fn adopting_says_how_much_of_the_board_the_repo_would_become() {
+        // The bug: adoption wrote `[github] repos` with no filter and 83 rows
+        // arrived on the next poll — 76% of everything not done — with nothing
+        // having said so beforehand.
+        let mut app = adopting();
+        let buf = draw(&mut app, 80, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        let all = body.join("\n");
+        assert!(all.contains("83 open issues"), "{all}");
+        assert!(
+            all.contains("Florin-AS/tripletex-mcp"),
+            "the repo being decided about is not named:\n{all}"
+        );
+        // And the labels that would narrow it, largest first.
+        let a = all.find("release-a").expect("no labels offered");
+        let b = all.find("release-b").expect("no labels offered");
+        assert!(a < b, "labels are not commonest-first:\n{all}");
+        assert!(all.contains("68"), "counts are what make a label worth picking");
+    }
+
+    #[test]
+    fn the_row_count_tracks_what_is_picked() {
+        let mut app = adopting();
+        let before = (0..24)
+            .map(|y| line(&draw(&mut app, 80, 24), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(before.contains("83 rows"), "{before}");
+
+        // Pick `release-a`, which the fixture says 68 issues carry.
+        app.adopt.as_mut().unwrap().toggle();
+        let after = (0..24)
+            .map(|y| line(&draw(&mut app, 80, 24), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(after.contains("68 rows"), "{after}");
+        // ...and it says what that becomes in the file, since the file is what
+        // it becomes.
+        assert!(
+            after.contains("[[github.repo]] labels = [\"release-a\"]"),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn a_repo_github_could_not_be_asked_about_is_still_adoptable() {
+        // The preview is a courtesy, not a gate: a 404, a missing token or a
+        // rate limit must not make a repo un-adoptable.
+        let mut app = adopting();
+        app.adopt.as_mut().unwrap().preview = Some(Err("github HTTP 404".into()));
+        let buf = draw(&mut app, 80, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        let all = body.join("\n");
+        // Wrapped across rows, so the prose is checked unwrapped.
+        let flat = body.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("404"), "the reason is not shown:\n{all}");
+        assert!(
+            flat.contains("Adopting still works"),
+            "it reads as a dead end:\n{all}"
+        );
+        assert!(all.contains("enter"), "no way forward is offered:\n{all}");
+    }
+
+    #[test]
+    fn the_wait_for_github_is_drawn_rather_than_frozen() {
+        // The screen opens before the answer arrives, and the board blocks on
+        // that call — so the frame in between has to say what it is waiting on
+        // rather than looking hung.
+        let mut app = adopting();
+        app.adopt.as_mut().unwrap().preview = None;
+        let buf = draw(&mut app, 80, 24);
+        let body: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        let flat = body.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("asking github"), "{flat}");
+        assert!(
+            flat.contains("Asking GitHub how many open issues"),
+            "it does not say what it is waiting for:\n{}",
+            body.join("\n")
+        );
+        // Nothing to pick yet, so nothing is offered to pick.
+        assert!(app.adopt_hits.is_empty());
+    }
+
+    #[test]
+    fn the_screen_offers_a_way_out_that_writes_nothing() {
+        // Every other confirmation on this board can be declined, and this one
+        // is the only screen that appears on the way to a file write.
+        let mut app = adopting();
+        let buf = draw(&mut app, 80, 24);
+        let footer = line(&buf, 23);
+        assert!(footer.contains("esc"), "{footer}");
+        assert!(footer.contains("nothing is written"), "{footer}");
+    }
+
+    #[test]
+    fn more_labels_than_fit_are_reachable_rather_than_clipped() {
+        // A pick you cannot scroll to is a pick that is not offered.
+        let mut app = adopting();
+        let many: Vec<(String, usize)> =
+            (0..40).map(|i| (format!("label-{i:02}"), 40 - i)).collect();
+        app.adopt.as_mut().unwrap().preview = Some(Ok(crate::adopt::RepoPreview {
+            open_issues: 83,
+            truncated: false,
+            labels: many,
+        }));
+        for _ in 0..39 {
+            app.adopt.as_mut().unwrap().move_cursor(1);
+        }
+        let buf = draw(&mut app, 80, 24);
+        let all: Vec<String> = (0..24).map(|y| line(&buf, y)).collect();
+        assert!(
+            all.iter().any(|l| l.contains("label-39")),
+            "the last label is unreachable:\n{}",
+            all.join("\n")
+        );
+        // And the cursor did not run past the end.
+        assert_eq!(app.adopt.as_ref().unwrap().cursor, 39);
+    }
+
+    #[test]
+    fn the_adoption_screen_obeys_the_boards_rules_at_every_size() {
+        // The same three the rest of the board is held to: herdr owns pane
+        // chrome, nothing paints a background, and every row is exactly as
+        // wide as the pane.
+        for (w, h) in [(80u16, 24u16), (120, 40), (160, 38), (60, 20), (60, 8)] {
+            let mut app = adopting();
+            let buf = draw(&mut app, w, h);
+            for y in 0..h {
+                let l: String = (0..w)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                assert_eq!(l.chars().count() as u16, w, "{w}x{h} row {y}");
+                assert!(
+                    !l.contains('│') && !l.contains('|') && !l.contains('┌'),
+                    "{w}x{h} row {y} drew pane chrome: {l:?}"
+                );
+                for x in 0..w {
+                    assert_eq!(buf[(x, y)].bg, Color::Reset, "{w}x{h} ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_label_row_is_clickable() {
+        // herdr is mouse-first, and a picker you cannot click is half a picker.
+        let mut app = adopting();
+        let _ = draw(&mut app, 80, 24);
+        let (y, ix) = app.adopt_hits[1];
+        let mut last_click = None;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert_eq!(
+            super::super::app::mouse_action(&mut app, click, &mut last_click),
+            super::super::app::Action::Toggle
+        );
+        assert_eq!(app.adopt.as_ref().unwrap().cursor, ix);
     }
 
     #[test]

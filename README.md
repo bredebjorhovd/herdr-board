@@ -694,6 +694,11 @@ the board would otherwise be misinformed:
 | the attempt settles with work waiting | `[linear] review_state`, if you set one |
 | the pull request merges | first `completed`-type state (**Done**) |
 
+The last one does not care how the merge happened. `m` on the board sends it,
+and so does the poll that first sees a pull request merged with `gh pr merge` or
+on github.com — the ticket is closed either way, rather than being held at In
+Review by a route the board did not watch.
+
 The middle one is opt-in because Linear leaves no choice. Every other state here
 is resolved by *type*, so a renamed or non-English workflow keeps working — but
 there is no review type: `In Review` and `In Progress` are both `type: started`,

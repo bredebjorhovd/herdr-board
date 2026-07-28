@@ -817,19 +817,47 @@ herdr-board new "Retry Altinn on 502" --source github --repo owner/repo --label 
 
 Reading is symmetric — both sources feed the board. Only authoring has to pick.
 
-**Nothing can wake a conversational orchestrator.** It only gets a turn when
-something prompts it, which is a property of the runtime rather than of the
-board — and pushing a prompt into its pane was considered and rejected (AGE-3):
-delivery into a running agent is unreliable by construction, the pane is often
-gone by then, and one keystroke turning into a second agent talking unprompted
-is action at a distance.
+**A conversational orchestrator only gets a turn when something prompts it.**
+That is a property of the runtime rather than of the board, and it has one
+consequence: whoever released a task learns nothing about it unless somebody
+says so. The board tells two audiences, and they are different people.
 
-So the operator is the one who has to notice, and the board tells them: a herdr
-notification when released work settles — and when an agent becomes `blocked`,
-which is the more urgent of the two, because a blocked agent is burning
-wall-clock right now. On those transitions only, never on every state change. `[defaults] notify = false` turns it off. An orchestrator
-picking work back up reads `last_outcome` and `last_outcome_at` to see what
-happened while it was away.
+The operator gets a herdr notification when released work settles — and when an
+agent becomes `blocked`, which is the more urgent of the two, because a blocked
+agent is burning wall-clock right now. On those transitions only, never on every
+state change. `[defaults] notify = false` turns it off.
+
+The agent that released the work gets prompted in its own pane, once that work
+settles (AGE-25). This is `herdr agent prompt`, the same mechanism every dispatch
+uses to deliver a brief, pointed back at the pane the dispatch came from — waking
+an idle pane costs it nothing, and unlike `wait` it does not freeze the
+orchestrator, which can keep answering you and starting other work in the
+meantime. It says the identifier, how the attempt ended and the PR url, so there
+is nothing to go and look up.
+
+Pushing a prompt into an orchestrator's pane was considered and rejected once
+(AGE-3), on three grounds. Each has since stopped being true, which is why this
+exists now and did not then:
+
+- *Delivery into a running agent is unreliable by construction.* It was.
+  Nudge-and-verify fixed it, and every dispatch and every delivered review now
+  goes through the same code.
+- *The pane is often gone by then.* It may be — so the pane is verified to still
+  exist and still hold the agent that dispatched, and the notice is dropped
+  rather than typed into whoever is there now. It also needed the *pane* to be
+  recorded at all: keyed on `dispatched_by` this could never have fired, because
+  an orchestrator pane owns no attempt (AGE-24).
+- *An agent talking unprompted is action at a distance.* Which is why it is off
+  by default. `[defaults] notify_dispatcher = true` is you asking for it, and the
+  reason to leave it off is real: an orchestrator woken by every child it
+  released cannot hold a train of thought.
+
+Only the three ends of an attempt count — finished, its pane exited, its agent
+never started. `blocked` does not: that work is waiting on a *human*, and there
+is nothing the dispatcher can do about it. Work you released yourself has no
+dispatcher to tell, and the notification was always the right answer for it.
+Either way, an orchestrator picking work back up reads `last_outcome` and
+`last_outcome_at` to see what happened while it was away.
 
 `list --json` returns one object per row: `id`, `identifier`, `title`, `state`,
 `source`, `url`, `labels`, `route`, `workspace`, `runtime`, `pane_id`, `pr_url`,

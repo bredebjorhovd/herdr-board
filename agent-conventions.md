@@ -53,6 +53,12 @@ Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `pane_id`, `pr_url`, `pr_number`, `branch`,
 `dispatched_by`, `attempts`, `dispatchable`.
 
+**You may be told instead of having to wait.** If `dispatch` answers `you will be
+prompted in <pane> when it settles`, the board will prompt you right here when
+that work ends, with the identifier, how it ended and the PR url. Then do not
+block on `wait`: carry on, stay available, and act on the message when it
+arrives. Without that line nothing will tell you, and rule 7 applies.
+
 States: `blocked` (agent waiting on input) → `working` → `ready` (nothing
 running) → `review` (finished or PR open) → `failed` → `done` (issue closed).
 Note `done` means the *issue* is closed; herdr's own `done` is this board's
@@ -78,10 +84,10 @@ Note `done` means the *issue* is closed; herdr's own `done` is this board's
 6. **Staleness.** `list` reports what the daemon last wrote, up to 30s old. Run
    `herdr-board sync --once` first when freshness matters more than latency.
    `wait` reconciles as it goes, so it does not lag behind that way.
-7. **After releasing work, wait for it.** Dispatching and then falling silent
-   leaves the human to notice the agent finished and to prompt you. Either
-   `wait` for it, or say plainly that you are leaving it running and that
-   nothing will tell you when it is done.
+7. **After releasing work, do not fall silent about it.** That leaves the human
+   to notice the agent finished and to prompt you. Either the board will prompt
+   you when it settles (see above), or `wait` for it, or say plainly that you
+   are leaving it running and that nothing will tell you when it is done.
 8. **Never dispatch speculatively.** Releasing work starts a real agent in a real
    repo that commits and opens PRs. A human keypress — or an explicit
    instruction — releases tasks. Reading the board is always safe; dispatching is

@@ -6,6 +6,7 @@ use crate::db::{Db, NewWriteback, Reaped};
 use crate::herdr::{Herdr, PaneInfo};
 use crate::log::Logger;
 use crate::model::*;
+use crate::settled::Settled;
 use crate::sources::github::{Github, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, Linear};
 use anyhow::Result;
@@ -580,10 +581,10 @@ impl SyncEngine {
     /// Tell the operator that released work has settled.
     ///
     /// Only when an attempt *ends* — not on every state change — because a
-    /// notification that fires constantly is one nobody reads. The operator is
-    /// the only actor that can usefully be interrupted: a conversational
-    /// orchestrator cannot be woken, so somebody has to notice, and it should
-    /// not have to be by watching the board.
+    /// notification that fires constantly is one nobody reads. This is the
+    /// audience that can always be interrupted, and until AGE-25 it was the only
+    /// one the board had: see [`SyncEngine::wake_dispatcher`] for the agent that
+    /// released the work, which is told separately and only if asked for.
     fn notify_settled(&self, herdr: Option<&Herdr>, task: &Task, what: &str) {
         if !self.cfg.defaults.notify {
             return;
@@ -593,6 +594,33 @@ impl SyncEngine {
             &format!("{} {what}", task.identifier),
             &truncate_for_toast(&task.title),
         );
+    }
+
+    /// End an attempt, and tell everyone waiting on it.
+    ///
+    /// The three ends an attempt can come to all pass through here, so the two
+    /// audiences — the operator's notification and the dispatching agent's
+    /// prompt — cannot drift apart by somebody adding a fourth and remembering
+    /// only one of them.
+    ///
+    /// Order matters. The close and the writeback are durable and instant; the
+    /// wake takes seconds and talks to a pane that may refuse. Recording first
+    /// means a crash inside the wake loses a notice, which is exactly what the
+    /// board did before AGE-25; waking first would re-settle the attempt on the
+    /// next tick and tell the dispatcher twice.
+    fn settle(
+        &self,
+        herdr: Option<&Herdr>,
+        task: &Task,
+        attempt: &Attempt,
+        settled: Settled,
+        pr_url: Option<&str>,
+    ) -> Result<()> {
+        self.notify_settled(herdr, task, settled.toast());
+        self.db.close_attempt(attempt.id, settled.outcome())?;
+        self.enqueue_outcome(task, settled.outcome(), pr_url)?;
+        self.wake_dispatcher(herdr, task, attempt, settled, pr_url);
+        Ok(())
     }
 
     pub fn reconcile(&self, panes: &[PaneInfo]) -> Result<()> {
@@ -623,9 +651,7 @@ impl SyncEngine {
                             "{} pane {} gone for {} ticks — orphaned",
                             task.identifier, pane_id, ticks
                         ));
-                        self.notify_settled(herdr, &task, "failed — its pane exited");
-                        self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
-                        self.enqueue_outcome(&task, Outcome::Orphaned, None)?;
+                        self.settle(herdr, &task, &attempt, Settled::PaneExited, None)?;
                     } else {
                         self.log.info(format!(
                             "{} pane {} missing (tick {}/2)",
@@ -666,9 +692,7 @@ impl SyncEngine {
                              working — orphaned",
                             task.identifier, pane_id, ticks
                         ));
-                        self.notify_settled(herdr, &task, "failed — its agent never started");
-                        self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
-                        self.enqueue_outcome(&task, Outcome::Orphaned, None)?;
+                        self.settle(herdr, &task, &attempt, Settled::NeverStarted, None)?;
                     } else {
                         self.log.info(format!(
                             "{} pane {} has no agent (tick {}/2)",
@@ -754,9 +778,13 @@ impl SyncEngine {
                 task.identifier,
                 status.as_str()
             ));
-            self.notify_settled(herdr, task, "finished");
-            self.db.close_attempt(attempt.id, Outcome::Done)?;
-            self.enqueue_outcome(task, Outcome::Done, task.pr_url.as_deref())?;
+            self.settle(
+                herdr,
+                task,
+                attempt,
+                Settled::Finished,
+                task.pr_url.as_deref(),
+            )?;
         }
         Ok(())
     }
@@ -1443,6 +1471,11 @@ mod tests {
     }
 
     fn dispatch(e: &SyncEngine, task: &str, pane_id: &str) -> i64 {
+        dispatch_by(e, task, pane_id, None)
+    }
+
+    /// `from` is the pane that released it — `None` is the operator.
+    fn dispatch_by(e: &SyncEngine, task: &str, pane_id: &str, from: Option<&str>) -> i64 {
         let a = e
             .db
             .insert_attempt(&crate::db::NewAttempt {
@@ -1453,7 +1486,7 @@ mod tests {
                 worktree: None,
                 branch: Some("board/lin-142".into()),
                 dispatched_by: None,
-                dispatched_by_pane: None,
+                dispatched_by_pane: from.map(str::to_string),
                 base_sha: None,
             })
             .unwrap();
@@ -1547,6 +1580,39 @@ mod tests {
             Some(Outcome::Done)
         );
         // And the outcome is queued for Linear.
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 1);
+    }
+
+    /// Telling the dispatcher is a second audience, not a second gate. Whatever
+    /// it decides — off, nobody to tell, a pane that will not take a prompt —
+    /// the attempt is still closed and the outcome still queued, because those
+    /// are what the rest of the board reads.
+    #[test]
+    fn waking_the_dispatcher_cannot_hold_up_the_settle_itself() {
+        let mut e = engine(None);
+        assert!(
+            !e.cfg.defaults.notify_dispatcher,
+            "off by default: an agent woken by every child cannot hold a thought"
+        );
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_by(&e, "linear:LIN-142", "w1:p9", Some("w1:p4"));
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/291"),
+            Some(291),
+            true,
+        )
+        .unwrap();
+
+        // There is no herdr here to carry the prompt — the same position the
+        // daemon is in when herdr is not reachable.
+        e.reconcile(&[pane("w1:p9", AgentStatus::Done)]).unwrap();
+
+        assert_eq!(
+            e.db.attempts_for("linear:LIN-142").unwrap()[0].outcome,
+            Some(Outcome::Done)
+        );
         assert_eq!(e.db.pending_writeback_count().unwrap(), 1);
     }
 

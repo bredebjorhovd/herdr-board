@@ -444,6 +444,11 @@ labels = ["herd"]
 [defaults]
 max_concurrent_per_workspace = 3
 branch_template = "board/{{identifier_lower}}"
+# When an agent releases work through the board, prompt it in its own pane once
+# that work settles, instead of only raising a notification at you. Off, because
+# an orchestrator woken by every child it released cannot hold a train of
+# thought. Turn it on if you dispatch from orchestrators rather than by hand.
+# notify_dispatcher = true
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves
@@ -1187,6 +1192,21 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                 } else {
                     "off — a review reaches nobody until you go and tell the agent \
                      (`[github] deliver_reviews = true` to enable)"
+                        .into()
+                },
+            });
+
+            checks.push(Check {
+                name: "settle notice".into(),
+                ok: true,
+                detail: if cfg.defaults.notify_dispatcher {
+                    "on — an agent that released work is prompted in its own pane \
+                     when that work settles"
+                        .into()
+                } else {
+                    "off — only you are notified when released work settles; the agent \
+                     that released it waits to be asked (`[defaults] notify_dispatcher \
+                     = true` to enable)"
                         .into()
                 },
             });

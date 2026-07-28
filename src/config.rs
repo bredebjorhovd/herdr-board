@@ -293,6 +293,19 @@ pub struct Defaults {
     /// Off means noticing is entirely on you.
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Also tell the *agent* that released a task when its work settles, by
+    /// prompting the pane it dispatched from (AGE-25).
+    ///
+    /// Off by default, and that is the whole design constraint rather than
+    /// caution: an orchestrator woken by every child it released is one that
+    /// cannot hold a train of thought. Turn it on when the panes you dispatch
+    /// from are orchestrators that want to act on outcomes, not when they are
+    /// you at a prompt — [`notify`](Self::notify) already covers that.
+    ///
+    /// Independent of `notify`, because they are different audiences: this one
+    /// never fires for operator-released work, which has no dispatcher.
+    #[serde(default)]
+    pub notify_dispatcher: bool,
     /// Which tracker `herdr-board new` writes to: `linear` or `github`.
     ///
     /// Not inferable from a label — a label routes work to a repo and says
@@ -326,6 +339,7 @@ impl Default for Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
             branch_template: default_branch_template(),
             notify: true,
+            notify_dispatcher: false,
             new_source: default_new_source(),
             split_direction: None,
             max_panes_per_tab: default_max_panes_per_tab(),

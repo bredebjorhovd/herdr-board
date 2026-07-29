@@ -451,15 +451,19 @@ fn main() -> Result<()> {
                     println!("removed");
                 }
                 IntegrationAction::Status => {
-                    if integration::installed() {
-                        println!(
+                    match integration::status() {
+                        integration::Status::Current => println!(
                             "installed ({})",
                             integration::override_path()?.display()
-                        );
-                    } else {
-                        println!(
+                        ),
+                        integration::Status::Stale => println!(
+                            "out of date ({}) — reinstall: the rule it carries misses the \
+                             first seconds of a turn",
+                            integration::override_path()?.display()
+                        ),
+                        integration::Status::Missing => println!(
                             "not installed — a working or blocked Claude pane reports `idle`"
-                        );
+                        ),
                     }
                     for agent in conventions::AGENTS {
                         let path = conventions::instruction_path(agent)?;

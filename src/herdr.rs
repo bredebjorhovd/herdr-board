@@ -441,6 +441,21 @@ impl Herdr {
             .map(AgentStatus::parse)
     }
 
+    /// An agent's visible screen.
+    ///
+    /// Takes any agent target rather than a pane id, because the callers that
+    /// need it are the ones holding a name. Quiet on failure: a screen we could
+    /// not read is a question left open, not an error.
+    pub fn agent_read_visible(&self, target: &str) -> Option<String> {
+        let out = Command::new(&self.bin)
+            .args(["agent", "read", target, "--source", "visible", "--format", "text"])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// The pane's visible screen, for detecting that *something* changed.
     pub fn pane_read_visible(&self, pane_id: &str) -> Option<String> {
         let out = Command::new(&self.bin)

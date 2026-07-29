@@ -99,6 +99,9 @@ fn attempt_by(
         base_sha: Some("0000000000000000000000000000000000000000".into()),
         // Fixtures depict agents that have been running, not just-started ones.
         saw_working: true,
+        // Nothing renders these; they are reconciliation's own bookkeeping.
+        screen_print: None,
+        screen_at: None,
     }
 }
 

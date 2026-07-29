@@ -137,6 +137,7 @@ fn pane(id: &str, status: AgentStatus) -> PaneInfo {
         focused: false,
         label: None,
         cwd: None,
+        scroll_offset: 0,
     }
 }
 

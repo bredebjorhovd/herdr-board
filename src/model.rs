@@ -462,6 +462,12 @@ pub struct Attempt {
     /// an attempt mid-turn (gh#18). The mirror image of `missing_ticks`; a PR
     /// bypasses it entirely.
     pub settled_ticks: i64,
+    /// Digest of this pane's screen the last time it changed, and when that was
+    /// — see [`crate::screen::fingerprint`]. Together they answer the one
+    /// question a detection manifest cannot: whether the spinner it matched is
+    /// live, or a line left in scrollback by a turn that died (gh#32).
+    pub screen_print: Option<String>,
+    pub screen_at: Option<String>,
 }
 
 impl Attempt {

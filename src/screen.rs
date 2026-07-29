@@ -28,6 +28,29 @@
 //! calling a pane untouched when it is holding our prompt, because that leads
 //! to sending the prompt twice, and an agent handed the same brief twice reads
 //! it twice and says so.
+//!
+//! ## What one sample cannot answer (gh#32)
+//!
+//! Everything above reads a *single* screen, and there is a question no single
+//! screen can settle: whether a spinner on it is live. Claude Code leaves
+//! spinner-glyph lines in scrollback — a stale `✳ Tinkering…` from a turn that
+//! died, and past-tense summaries like `✻ Crunched for 3m 19s` — and the
+//! manifest's detection region reaches 20 non-empty lines up, far enough to
+//! find them. Three attempts sat `working` for over an hour on the strength of
+//! lines like those, holding concurrency slots, unable ever to settle.
+//!
+//! What separates a live spinner from a frozen one is *change over time*.
+//! [`vitals`] is that reading: Claude Code's spinner carries an elapsed timer
+//! that ticks every second and a frame that rotates every 300ms, so a live turn
+//! physically cannot hold a screen still. Sampled 14s apart on three genuinely
+//! working panes, every one differed — and in exactly those two places:
+//!
+//! ```text
+//! -  ✢ Tomfoolering… (17m 40s · ↓ 28.4k tokens)
+//! +  ✢ Tomfoolering… (17m 54s · ↓ 28.4k tokens)
+//! -  ✻ Tinkering… (44m 40s · ↓ 178.1k tokens)
+//! +  ✽ Tinkering… (44m 54s · ↓ 179.2k tokens)
+//! ```
 
 /// The spinner's animation frames. Six of them, cycling roughly every 300ms:
 /// `·` `✢` `✳` `✶` `✻` `✽`.
@@ -173,6 +196,130 @@ fn fragment(prompt: &str) -> Option<String> {
 /// equal to the text it was wrapped from.
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ---- is anything actually happening? (gh#32) ----------------------------
+
+/// How long a screen has to hold still before it counts as frozen.
+///
+/// The spinner's elapsed timer ticks every second, so one second would do in
+/// principle. Ten leaves room for a slow redraw, a pane read that raced a
+/// repaint, and a terminal that coalesced a frame — and it is well inside the
+/// 30s sync interval, so consecutive daemon cycles clear it easily.
+pub const STALL_SECS: i64 = 10;
+
+/// The marker Claude Code prints when a request to Anthropic fails.
+const API_ERROR: &str = "API Error";
+
+/// A screen read earlier, to compare the current one against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample<'a> {
+    /// [`fingerprint`] of that screen.
+    pub fingerprint: &'a str,
+    /// How long ago it was *first* seen — not when it was last compared. The
+    /// difference is the whole point: a screen resampled every few seconds must
+    /// still age, or it never reaches [`STALL_SECS`].
+    pub age_secs: i64,
+}
+
+/// What a pane's screen says about a `working` status herdr is reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vitals {
+    /// The screen has changed since the last sample. Something is running, and
+    /// herdr's `working` is corroborated.
+    Alive,
+    /// Byte-identical to a screen first seen at least [`STALL_SECS`] ago.
+    /// Nothing has drawn to this pane in that window, so no turn is running —
+    /// whatever the manifest matched.
+    Frozen {
+        /// The API error on screen, when one names the cause outright.
+        api_error: Option<String>,
+    },
+    /// Nothing concluded: no earlier sample to compare against, or one too
+    /// recent for holding still to mean anything.
+    Watching,
+}
+
+/// Read a screen against the last one taken from the same pane.
+///
+/// Pure, so the rule is testable without a herdr or a clock. The caller owns the
+/// storage and the clock; this owns the decision.
+pub fn vitals(previous: Option<Sample<'_>>, screen: &str) -> Vitals {
+    let Some(prev) = previous else {
+        return Vitals::Watching;
+    };
+    if prev.fingerprint != fingerprint(screen) {
+        return Vitals::Alive;
+    }
+    if prev.age_secs < STALL_SECS {
+        return Vitals::Watching;
+    }
+    Vitals::Frozen {
+        api_error: api_error(screen).map(str::to_string),
+    }
+}
+
+/// The Anthropic API error on screen, if one is.
+///
+/// ```text
+/// ⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary
+/// ```
+///
+/// Deliberately narrow. A **5xx** is Anthropic's own side, unambiguous, and
+/// unstickable only by a human retrying — which is what makes it worth naming
+/// rather than reporting a bare stall. A 4xx can be a request the agent recovers
+/// from by itself, and no captured screen shows one, so this does not guess.
+///
+/// The retry line is excluded on purpose: `API Error (529 …) · Retrying in 8
+/// seconds…` is a request still in flight. An agent counting down a retry is
+/// working, and its countdown changes every second, so [`vitals`] would not call
+/// it frozen either — this only keeps the two readings from disagreeing.
+pub fn api_error(pane: &str) -> Option<&str> {
+    // Last first: a pane that hit an error, was retried, and hit another shows
+    // both, and the one at the bottom is the current one.
+    pane.lines().rev().find_map(|line| {
+        let at = line.find(API_ERROR)?;
+        let text = line[at..].trim_end();
+        if text.contains("Retrying") {
+            return None;
+        }
+        is_server_error(text).then_some(text)
+    })
+}
+
+/// Does an `API Error …` carry a 5xx status?
+///
+/// The status is whatever number opens the tail — `API Error: 529 …`,
+/// `API Error (500 …)`. Only the opening number: the prose after it carries
+/// numbers of its own (`attempt 1/10`, byte counts) and none of them is a
+/// status.
+fn is_server_error(text: &str) -> bool {
+    let tail = text[API_ERROR.len()..].trim_start_matches([':', ' ', '(']);
+    let code: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    code.len() == 3 && code.starts_with('5')
+}
+
+/// A short, stable digest of a screen, for telling "the same screen" from "a
+/// different one" across reconciles.
+///
+/// FNV-1a rather than [`std::collections::hash_map::DefaultHasher`]: this value
+/// is written to the database and compared against on a later tick, possibly by
+/// a later build of the daemon, and `DefaultHasher`'s output is explicitly not
+/// stable across Rust versions. A hash that changed on upgrade would read as
+/// "the screen moved" and quietly disable the check.
+///
+/// A digest rather than the screen itself because the comparison is all anybody
+/// needs, and a few KB of somebody's source code per live attempt is not
+/// something the board should be keeping.
+pub fn fingerprint(screen: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in screen.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // The length too: a hash collision would read as a frozen screen, and the
+    // consequence of that is telling the operator an agent is stuck.
+    format!("{h:016x}-{}", screen.len())
 }
 
 #[cfg(test)]
@@ -384,5 +531,176 @@ mod tests {
         assert_eq!(fragment("hi"), None);
         assert!(untouched(WELCOME, "hi"));
         assert!(!untouched(IDLE_DONE, "hi"));
+    }
+
+    // ---- gh#32: the screen that stopped moving ---------------------------
+
+    /// A dead agent, in the shape all three attempts in gh#32 were found in:
+    /// the idle welcome state with a Tip, and a spinner line from the turn that
+    /// died still sitting in scrollback above it. `board_working_spinner`
+    /// matches that stale line, so herdr reports `working` forever.
+    const DEAD_ON_A_529: &str = "\
+⏺ Calling claude-in-chrome 5 times, running 8 shell commands…
+  ⎿  $ pnpm --filter @itsm/ui run build 2>&1 | tail -5
+
+✳ Tinkering… (31m 25s · ↓ 129.0k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary
+──────────────────────────────────────────
+❯
+──────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    /// The other shape from the report: no error line, just a finished turn's
+    /// past-tense summary within reach of a 20-line region.
+    const DEAD_WITHOUT_A_REASON: &str = "\
+⏺ 111
+✻ Crunched for 3m 19s
+  ⎿  Tip: Ask Claude to create subagents for specific tasks.
+──────────────────────────────────────────
+❯
+──────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    #[test]
+    fn a_screen_that_has_not_moved_in_ten_seconds_is_not_a_running_turn() {
+        // The whole of gh#32. herdr says `working` because of the `✳ Tinkering…`
+        // line; the screen says nothing has been drawn for half a minute.
+        let print = fingerprint(DEAD_ON_A_529);
+        let v = vitals(
+            Some(Sample {
+                fingerprint: &print,
+                age_secs: 31,
+            }),
+            DEAD_ON_A_529,
+        );
+        assert_eq!(
+            v,
+            Vitals::Frozen {
+                api_error: Some(
+                    "API Error: 529 Overloaded. This is a server-side issue, usually temporary"
+                        .into()
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn a_working_pane_is_alive_because_its_timer_ticks() {
+        // Captured 14s apart from a genuinely working pane. The elapsed timer is
+        // the difference, and it is enough — which is what makes the whole check
+        // safe to run against agents that are fine.
+        let before = "✢ Tomfoolering… (17m 40s · ↓ 28.4k tokens)\n❯\n";
+        let after = "✢ Tomfoolering… (17m 54s · ↓ 28.4k tokens)\n❯\n";
+        let print = fingerprint(before);
+        assert_eq!(
+            vitals(
+                Some(Sample {
+                    fingerprint: &print,
+                    age_secs: 14
+                }),
+                after
+            ),
+            Vitals::Alive
+        );
+        // ...and the rotating frame alone would have done it too.
+        let framed = "✽ Tomfoolering… (17m 40s · ↓ 28.4k tokens)\n❯\n";
+        assert_eq!(
+            vitals(
+                Some(Sample {
+                    fingerprint: &print,
+                    age_secs: 14
+                }),
+                framed
+            ),
+            Vitals::Alive
+        );
+    }
+
+    #[test]
+    fn nothing_is_concluded_from_the_first_sample_or_a_fresh_one() {
+        // Two reconciles some seconds apart is the claim; one sample is not it.
+        assert_eq!(vitals(None, DEAD_ON_A_529), Vitals::Watching);
+        let print = fingerprint(DEAD_ON_A_529);
+        // `pane.agent_status_changed` fires reconcile back to back, and two
+        // reads a second apart being equal proves nothing: the frame only
+        // rotates every 300ms and the timer only ticks each second.
+        assert_eq!(
+            vitals(
+                Some(Sample {
+                    fingerprint: &print,
+                    age_secs: STALL_SECS - 1
+                }),
+                DEAD_ON_A_529
+            ),
+            Vitals::Watching
+        );
+    }
+
+    #[test]
+    fn a_frozen_screen_with_no_error_on_it_still_reads_as_frozen() {
+        // The stall is the general answer; the API error only names a cause.
+        let print = fingerprint(DEAD_WITHOUT_A_REASON);
+        assert_eq!(
+            vitals(
+                Some(Sample {
+                    fingerprint: &print,
+                    age_secs: 45
+                }),
+                DEAD_WITHOUT_A_REASON
+            ),
+            Vitals::Frozen { api_error: None }
+        );
+    }
+
+    #[test]
+    fn a_five_hundred_is_named_and_a_retry_countdown_is_not() {
+        assert_eq!(
+            api_error("⏺ API Error: 529 Overloaded. This is a server-side issue"),
+            Some("API Error: 529 Overloaded. This is a server-side issue")
+        );
+        assert!(api_error("⏺ API Error: 500 {\"type\":\"error\"}").is_some());
+        assert!(api_error("  API Error (503 Service Unavailable)").is_some());
+        // Still in flight: the agent is retrying, which is working.
+        assert!(
+            api_error("API Error (529 Overloaded) · Retrying in 8 seconds… (attempt 2/10)")
+                .is_none()
+        );
+        // Not a 5xx, and not guessed at.
+        assert!(api_error("⏺ API Error: 400 invalid_request_error").is_none());
+        // Prose that happens to mention one. An agent *discussing* the failure
+        // it just recovered from must not be read as suffering it.
+        assert!(api_error("⏺ It spent the hour on API Error: overload and retries").is_none());
+        assert!(api_error(WELCOME).is_none());
+    }
+
+    #[test]
+    fn the_number_that_counts_is_the_status_not_the_prose() {
+        // `attempt 1/10` and byte counts sit further along the same line.
+        assert!(api_error("API Error: 529 Overloaded after 400 tokens").is_some());
+        assert!(api_error("API Error: bad gateway, 502 upstream").is_none());
+    }
+
+    #[test]
+    fn the_bottom_most_error_is_the_current_one() {
+        let two = "⏺ API Error: 500 internal\n⏺ ok\n⏺ API Error: 529 Overloaded\n❯\n";
+        assert_eq!(api_error(two), Some("API Error: 529 Overloaded"));
+    }
+
+    #[test]
+    fn a_fingerprint_separates_screens_and_survives_the_round_trip() {
+        assert_eq!(fingerprint(DEAD_ON_A_529), fingerprint(DEAD_ON_A_529));
+        assert_ne!(fingerprint(DEAD_ON_A_529), fingerprint(DEAD_WITHOUT_A_REASON));
+        // A one-second tick of the timer has to be visible in it, since that is
+        // the only thing distinguishing a live turn from a dead one.
+        assert_ne!(
+            fingerprint("✢ Whirring… (3m 11s · ↓ 10.5k tokens)"),
+            fingerprint("✢ Whirring… (3m 12s · ↓ 10.5k tokens)")
+        );
+        // Stable across builds, so an upgraded daemon does not read every pane
+        // as having just moved. Pinned by value, not by construction.
+        assert_eq!(fingerprint(""), "cbf29ce484222325-0");
+        assert_eq!(fingerprint("a"), "af63dc4c8601ec8c-1");
     }
 }

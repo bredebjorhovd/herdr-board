@@ -334,6 +334,8 @@ mod tests {
             dispatched_by_pane: pane.map(str::to_string),
             base_sha: None,
             saw_working: true,
+            screen_print: None,
+            screen_at: None,
         }
     }
 
@@ -347,6 +349,7 @@ mod tests {
             focused: false,
             label: None,
             cwd: cwd.map(str::to_string),
+            scroll_offset: 0,
         }
     }
 

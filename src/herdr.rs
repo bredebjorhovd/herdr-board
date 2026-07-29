@@ -49,6 +49,13 @@ pub struct PaneInfo {
     /// hold a pane sitting inside a checkout, which is the only thing that says
     /// what repo the operator is actually working in.
     pub cwd: Option<String>,
+    /// How far the pane is scrolled up from the bottom, in rows.
+    ///
+    /// Nonzero means somebody is reading this pane's history, and `pane read
+    /// --source visible` returns *that* view — which does not move while a turn
+    /// runs. The stall check has to skip a pane in that state or it would blame
+    /// the agent for the operator's scrollback (gh#32).
+    pub scroll_offset: u64,
 }
 
 /// A pane's position and size within its tab.
@@ -457,9 +464,15 @@ impl Herdr {
     }
 
     /// The pane's visible screen, for detecting that *something* changed.
+    ///
+    /// Takes a pane id rather than an agent target, because the caller —
+    /// reconciliation — holds pane ids and wants an answer even for a pane whose
+    /// agent herdr has lost track of. `--format text` explicitly, so a change in
+    /// herdr's default cannot start feeding escape sequences into a comparison
+    /// that is supposed to be about what the screen says.
     pub fn pane_read_visible(&self, pane_id: &str) -> Option<String> {
         let out = Command::new(&self.bin)
-            .args(["pane", "read", pane_id, "--source", "visible"])
+            .args(["pane", "read", pane_id, "--source", "visible", "--format", "text"])
             .output()
             .ok()?;
         out.status
@@ -804,6 +817,11 @@ fn parse_pane(p: &Value) -> Option<PaneInfo> {
             .get("cwd")
             .and_then(Value::as_str)
             .map(str::to_string),
+        scroll_offset: p
+            .get("scroll")
+            .and_then(|s| s.get("offset_from_bottom"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -852,6 +870,7 @@ mod tests {
             focused,
             label: None,
             cwd: None,
+            scroll_offset: 0,
         }
     }
 

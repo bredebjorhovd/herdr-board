@@ -80,10 +80,21 @@ const RULE: &str = r#"
 # won, and an agent running a shell command reported `idle`. Widened to cover a
 # long todo list plus the four lines of prompt-box chrome beneath it.
 #
-# Safe to widen because the spinner is *ephemeral*: it is removed when a turn
-# ends. Checked across six genuinely idle panes — none carried a spinner or a
-# token-counter line at all — so a larger window cannot resurrect a finished
-# turn.
+# The widening was justified with "safe, because the spinner is ephemeral: it is
+# removed when a turn ends", checked against six idle panes that carried no
+# spinner line at all. That was wrong, and gh#32 is the bill. Claude Code does
+# leave spinner-glyph lines in scrollback — a stale `✳ Tinkering…` from a turn
+# that died on an Anthropic 5xx, and past-tense summaries like `✻ Crunched for
+# 3m 19s` — and 20 non-empty lines reaches them. Three attempts reported
+# `working` for over an hour with nothing running in them, holding concurrency
+# slots, unable ever to settle.
+#
+# The region is still 20, deliberately. Narrowing it only trades this failure for
+# the todo-list one it was widened to fix, and no width fixes either: the fact
+# that separates a live spinner from a frozen one is *change over time*, which a
+# rule matching one screenshot does not contain. So the backstop is not here —
+# `crate::screen::vitals` resamples the pane across reconciles and overrules a
+# `working` whose screen has stopped moving.
 id = "board_working_spinner"
 state = "working"
 priority = 976
@@ -313,6 +324,20 @@ mod tests {
         assert!(
             region >= 16,
             "region {region} leaves no room for a todo list above the prompt box"
+        );
+    }
+
+    #[test]
+    fn the_rule_admits_that_a_region_this_wide_needs_a_backstop() {
+        // gh#32: the comment above the rule used to argue the widening was safe
+        // because a finished turn leaves no spinner behind. It does, in
+        // scrollback, and three attempts sat `working` for an hour on the
+        // strength of it. Whoever narrows this region next should find out here
+        // why that is not the fix, and what is.
+        assert!(RULE.contains("gh#32"));
+        assert!(
+            RULE.contains("crate::screen::vitals"),
+            "the rule has to point at what actually catches a frozen spinner"
         );
     }
 

@@ -102,6 +102,11 @@ pull_requests = true
 # outcome, and close the issue on done. Needs a token with `repo` scope.
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
+#
+# The fallback, not the law — repos differ here more than anything else does. A
+# comment on a project of your own is provenance nobody minds; the same comment
+# on a production repo lands on an issue other people read. Override per repo
+# below, and `doctor` names the repos it will write to.
 writeback = false
 # Deliver review comments back into the pane that wrote the pull request.
 #
@@ -122,12 +127,22 @@ deliver_reviews = true
 # and `doctor` refuses it rather than letting it sit there looking effective.
 #
 # Omit `labels` to fall back to `[github] labels`; `labels = []` is every open
-# issue, said out loud. The board writes one of these for you when you adopt a
-# repo and pick labels on the way in.
+# issue, said out loud. Omit `writeback` to fall back to `[github] writeback`.
+# The board writes one of these for you when you adopt a repo and pick labels on
+# the way in.
 #
 # [[github.repo]]
 # name = "bredebjorhovd/itsm-agent"
 # labels = ["release-a"]
+#
+# The repo you turned the global flag off for. With `writeback = true` above,
+# the board comments and closes everywhere except here — which is the whole
+# reason the flag is per repo: one global answer gets set by its riskiest repo,
+# so it stays off and the board can close nothing anywhere.
+#
+# [[github.repo]]
+# name = "Florin-AS/Tally"
+# writeback = false
 
 # The board lists git repos that have a herdr workspace but no config here, in
 # an UNADOPTED section: `a` writes the route and the [github] repos entry, `X`

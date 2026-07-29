@@ -464,6 +464,15 @@ branch_template = "board/{{identifier_lower}}"
 repos = [{repo_list}]
 labels = []
 writeback = true
+
+# The fallback, not the law: a repo can answer for itself. Worth doing for any
+# repo whose issues other people read — comments on a project of your own are
+# provenance nobody minds, the same comments on a production repo are not.
+# `doctor` names the repos it will write to.
+#
+# [[github.repo]]
+# name = "owner/production-repo"
+# writeback = false
 "#
     )
 }
@@ -1174,12 +1183,7 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
             checks.push(Check {
                 name: "github writeback".into(),
                 ok: true,
-                detail: if cfg.github.writeback {
-                    "ON — dispatch comments on real issues and closes them on done".into()
-                } else {
-                    "off — the board only reads GitHub (`[github] writeback = true` to enable)"
-                        .into()
-                },
+                detail: writeback_detail(&cfg.github),
             });
 
             checks.push(Check {
@@ -1237,6 +1241,21 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                     (false, []) => " · [github] labels = []: every open issue".to_string(),
                     (false, l) => format!(" · [github] labels: {}", l.join(" + ")),
                 };
+                // And whether the board writes here, on the same line as the
+                // repo it is about, so the summary above has a per-repo answer
+                // to be checked against.
+                let writes = match (
+                    cfg.github
+                        .settings_for(repo)
+                        .is_some_and(|r| r.writeback.is_some()),
+                    cfg.github.writeback_for(repo),
+                ) {
+                    (true, true) => " · writeback: on, its own",
+                    (true, false) => " · read-only, its own",
+                    (false, true) => " · writeback: on, from [github]",
+                    (false, false) => " · read-only, from [github]",
+                };
+                let filter = format!("{filter}{writes}");
                 let (ok, detail) = match reachable {
                     Some(Ok(_)) => (true, format!("reachable{filter}")),
                     Some(Err(e)) if e.to_string().contains("404") => (
@@ -1342,6 +1361,35 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
     });
 
     Ok(checks)
+}
+
+/// Which repos the board will write to, by name.
+///
+/// Named repos, not a posture. A global `ON` was enough while one flag answered
+/// for every repo; once a repo can answer for itself, the operator's question is
+/// about one repo in particular — and reading it off two keys in `routing.toml`
+/// is exactly what `doctor` is for.
+fn writeback_detail(github: &crate::config::GithubConfig) -> String {
+    let writes = github.writeback_repos();
+    let reads = github.read_only_repos();
+    match (writes.as_slice(), reads.as_slice()) {
+        ([], []) => "no repos under [github] to write to".into(),
+        ([], _) => format!(
+            "off for every repo — the board only reads GitHub (`[github] writeback \
+             = true`, or per repo, to enable). Read-only: {}",
+            reads.join(", ")
+        ),
+        (_, []) => format!(
+            "ON for every repo — dispatch comments on real issues and closes them \
+             on done: {}",
+            writes.join(", ")
+        ),
+        _ => format!(
+            "ON — comments and closes on: {}. Read-only: {}",
+            writes.join(", "),
+            reads.join(", ")
+        ),
+    }
 }
 
 /// Does `[linear] review_state` name a state the configured teams actually have?
@@ -1719,6 +1767,45 @@ mod tests {
                 .as_deref(),
             Some("In Review"),
         );
+    }
+
+    /// AGE-23. A global `ON` is not an answer once the answer differs per repo:
+    /// the operator's question is whether *Tally* is on the list, and the whole
+    /// point is to see that without opening routing.toml.
+    #[test]
+    fn doctor_names_the_repos_it_will_write_to() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[github]\nrepos = [\"bredebjorhovd/OIOS\", \"Florin-AS/Tally\"]\n\
+             writeback = true\n\n\
+             [[github.repo]]\nname = \"Florin-AS/Tally\"\nwriteback = false\n",
+        )
+        .unwrap();
+        let detail = writeback_detail(&cfg.github);
+        assert!(detail.contains("bredebjorhovd/OIOS"), "{detail}");
+        assert!(
+            detail.contains("Read-only: Florin-AS/Tally"),
+            "the repo it will not write to has to be named as such: {detail}"
+        );
+    }
+
+    #[test]
+    fn doctor_still_names_them_when_every_repo_answers_the_same_way() {
+        // Both uniform cases still list names — "ON" and "off" were the two
+        // answers that stopped being enough.
+        let on: RoutingConfig =
+            toml::from_str("[github]\nrepos = [\"o/a\", \"o/b\"]\nwriteback = true\n").unwrap();
+        let detail = writeback_detail(&on.github);
+        assert!(detail.contains("o/a") && detail.contains("o/b"), "{detail}");
+
+        let off: RoutingConfig =
+            toml::from_str("[github]\nrepos = [\"o/a\"]\n").unwrap();
+        let detail = writeback_detail(&off.github);
+        assert!(detail.contains("off for every repo"), "{detail}");
+        assert!(detail.contains("o/a"), "{detail}");
+
+        // And with nothing configured it says so rather than listing nothing.
+        let none: RoutingConfig = toml::from_str("[github]\nrepos = []\n").unwrap();
+        assert!(writeback_detail(&none.github).contains("no repos"));
     }
 
     #[test]

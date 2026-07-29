@@ -382,6 +382,11 @@ pub struct GithubConfig {
     /// wanted. `d mark done` stays honest without it: the local override moves
     /// the row and survives re-derivation, it just does not close the issue
     /// upstream.
+    ///
+    /// The *fallback*, not the law, for the same reason `labels` is: a board
+    /// spanning a personal project and a production repo wants the trail on one
+    /// and not the other, and a single flag can only be set by its riskiest
+    /// repo. See [`GithubConfig::writeback_for`].
     #[serde(default)]
     pub writeback: bool,
     /// Wake the agent that wrote a pull request when somebody reviews it.
@@ -420,6 +425,7 @@ impl Default for GithubConfig {
 /// [[github.repo]]
 /// name = "bredebjorhovd/itsm-agent"
 /// labels = ["release-a"]
+/// writeback = false
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
@@ -434,6 +440,16 @@ pub struct RepoConfig {
     /// single global list can express.
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// Whether the board writes to this repo's issues, overriding
+    /// `[github] writeback`.
+    ///
+    /// Absent falls back to the global flag. Set it where the answer differs:
+    /// comments on a repo of your own are provenance nobody minds, and the same
+    /// comments on a production repo land on issues other people read. One
+    /// global flag makes that choice once for every repo, so it gets set by the
+    /// riskiest one — off, and the board can close nothing anywhere.
+    #[serde(default)]
+    pub writeback: Option<bool>,
 }
 
 impl GithubConfig {
@@ -449,6 +465,42 @@ impl GithubConfig {
         self.settings_for(repo)
             .and_then(|r| r.labels.as_deref())
             .unwrap_or(&self.labels)
+    }
+
+    /// Whether the board writes to one repo's issues, falling back to the
+    /// global flag.
+    ///
+    /// A repo that is not in `repos` at all answers from the global flag too.
+    /// That is the safe reading for the only caller that can ask about one — a
+    /// writeback queued for a repo since removed from the config — because the
+    /// flag it falls back to is the one the operator set for repos in general.
+    pub fn writeback_for(&self, repo: &str) -> bool {
+        self.settings_for(repo)
+            .and_then(|r| r.writeback)
+            .unwrap_or(self.writeback)
+    }
+
+    /// The configured repos the board will write to, in `repos` order.
+    ///
+    /// `doctor` reports these by name. Once the answer differs per repo, a
+    /// global `ON` says nothing about the repo the operator is actually worried
+    /// about — the point is to see, without reading config, which list it is in.
+    pub fn writeback_repos(&self) -> Vec<&str> {
+        self.repos
+            .iter()
+            .map(String::as_str)
+            .filter(|r| self.writeback_for(r))
+            .collect()
+    }
+
+    /// The configured repos the board only reads. The complement of
+    /// [`GithubConfig::writeback_repos`].
+    pub fn read_only_repos(&self) -> Vec<&str> {
+        self.repos
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !self.writeback_for(r))
+            .collect()
     }
 }
 
@@ -1065,6 +1117,90 @@ labels = []
         assert!(c.github.per_repo.is_empty());
         assert_eq!(c.github.labels_for("o/a"), ["herd"]);
         assert_eq!(c.github.labels_for("o/never-heard-of-it"), ["herd"]);
+    }
+
+    // ---- AGE-23: one writeback flag cannot answer for every repo ---------
+
+    #[test]
+    fn a_repo_can_be_read_only_while_the_rest_are_written_to() {
+        // The bug: one global flag is set by its riskiest repo. Off, and the
+        // board closes nothing anywhere; on, and it comments on production.
+        let c = github(
+            r#"
+[github]
+repos = ["bredebjorhovd/OIOS", "Florin-AS/Tally"]
+writeback = true
+
+[[github.repo]]
+name = "Florin-AS/Tally"
+writeback = false
+"#,
+        );
+        assert!(c.github.writeback_for("bredebjorhovd/OIOS"));
+        assert!(!c.github.writeback_for("Florin-AS/Tally"));
+        assert_eq!(c.github.writeback_repos(), ["bredebjorhovd/OIOS"]);
+        assert_eq!(c.github.read_only_repos(), ["Florin-AS/Tally"]);
+    }
+
+    #[test]
+    fn a_repo_can_opt_in_while_the_global_flag_stays_off() {
+        // The override has to go both ways, or the safe global default can only
+        // be escaped by making every repo writable at once.
+        let c = github(
+            r#"
+[github]
+repos = ["o/mine", "o/theirs"]
+
+[[github.repo]]
+name = "o/mine"
+writeback = true
+"#,
+        );
+        assert!(!c.github.writeback, "the global flag is still off");
+        assert!(c.github.writeback_for("o/mine"));
+        assert!(!c.github.writeback_for("o/theirs"));
+        assert_eq!(c.github.writeback_repos(), ["o/mine"]);
+    }
+
+    #[test]
+    fn a_repo_table_without_writeback_falls_back_to_the_global_flag() {
+        // A table written for `labels` must not quietly turn writeback off for
+        // the repo it narrows — absent is "no answer here", not "no".
+        let c = github(
+            r#"
+[github]
+repos = ["o/a"]
+writeback = true
+
+[[github.repo]]
+name = "o/a"
+labels = ["release-a"]
+"#,
+        );
+        assert!(c.github.settings_for("o/a").is_some());
+        assert!(c.github.writeback_for("o/a"));
+        assert_eq!(c.github.writeback_repos(), ["o/a"]);
+    }
+
+    #[test]
+    fn a_repos_own_writeback_is_matched_however_it_is_cased() {
+        // The repo comes from a task id, which carries whatever casing GitHub
+        // returned; missing on `Tally` vs `tally` here would write to the one
+        // repo the operator excluded.
+        let c = github(
+            "[github]\nrepos = [\"Florin-AS/Tally\"]\nwriteback = true\n\n\
+             [[github.repo]]\nname = \"florin-as/tally\"\nwriteback = false\n",
+        );
+        assert!(!c.github.writeback_for("Florin-AS/Tally"));
+        assert!(c.github.writeback_repos().is_empty());
+    }
+
+    #[test]
+    fn writeback_defaults_to_off_for_every_repo() {
+        let c = github("[github]\nrepos = [\"o/a\", \"o/b\"]\n");
+        assert!(!c.github.writeback_for("o/a"));
+        assert!(c.github.writeback_repos().is_empty());
+        assert_eq!(c.github.read_only_repos(), ["o/a", "o/b"]);
     }
 
     #[test]

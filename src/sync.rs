@@ -900,10 +900,14 @@ impl SyncEngine {
             // upstream needs closing, or the next poll undoes it. `is_final`
             // rather than `!= Terminal`: an issue that is *gone* cannot be
             // closed, and asking would retry against a 404 forever.
+            //
+            // Per repo, not globally: closing an issue on a repo the board is
+            // only reading is the write this setting exists to prevent.
             if state == BoardState::Done
                 && task.source == Source::Github
                 && !task.upstream.is_final()
-                && self.cfg.github.writeback
+                && split_gh_task_id(&task.id)
+                    .is_some_and(|(repo, _)| self.cfg.github.writeback_for(&repo))
             {
                 self.db.enqueue_writeback(&NewWriteback {
                     task_id: task.id.clone(),
@@ -1171,17 +1175,21 @@ impl SyncEngine {
                 let Some(gh) = &self.github else {
                     anyhow::bail!("no GitHub client; writeback stays queued");
                 };
-                if !self.cfg.github.writeback {
-                    return Ok(Sent::Dropped(format!(
-                        "github writeback disabled in routing.toml ({})",
-                        task.identifier
-                    )));
-                }
                 let Some((repo, number)) = split_gh_task_id(&task.id) else {
                     self.log
                         .warn(format!("cannot parse a repo out of {}", task.id));
                     return Ok(Sent::Dropped(format!("no repo in {}", task.id)));
                 };
+                // Config decides at delivery, and it decides per repo: the
+                // queue holds effects aimed at several repos at once, and the
+                // repo is what says whether this one may land. Turning it off
+                // for a repo must also stop what is already queued for it.
+                if !self.cfg.github.writeback_for(&repo) {
+                    return Ok(Sent::Dropped(format!(
+                        "writeback is off for {repo} in routing.toml ({})",
+                        task.identifier
+                    )));
+                }
                 match w.kind.as_str() {
                     "dispatch" => {
                         let via = match payload["via"].as_str() {
@@ -2091,11 +2099,18 @@ mod tests {
     }
 
     fn seed_gh(e: &SyncEngine) {
+        seed_gh_in(e, "gh:o/r#87");
+    }
+
+    /// A GitHub row whose id names the repo it belongs to — which is what
+    /// per-repo settings are looked up by, so a test about them needs to choose.
+    fn seed_gh_in(e: &SyncEngine, id: &str) {
+        let number = id.rsplit('#').next().unwrap_or("0").to_string();
         e.db.upsert_task(&UpsertTask {
-            id: "gh:o/r#87".into(),
+            id: id.into(),
             source: Source::Github,
-            source_id: "n1".into(),
-            identifier: "gh#87".into(),
+            source_id: format!("n{number}"),
+            identifier: format!("gh#{number}"),
             title: "Bug".into(),
             body: None,
             url: "u".into(),
@@ -2295,6 +2310,111 @@ mod tests {
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
     }
 
+    // ---- AGE-23: one writeback flag cannot answer for every repo ---------
+
+    /// Writeback on globally, off for the production repo — the config the
+    /// ticket asks to be possible.
+    fn engine_with_one_read_only_repo() -> SyncEngine {
+        let mut e = engine_with(None, Some(gh_client()));
+        e.cfg.github.repos = vec!["bredebjorhovd/OIOS".into(), "Florin-AS/Tally".into()];
+        e.cfg.github.writeback = true;
+        e.cfg.github.per_repo = vec![crate::config::RepoConfig {
+            name: "Florin-AS/Tally".into(),
+            labels: None,
+            writeback: Some(false),
+        }];
+        e.cfg
+            .check()
+            .expect("the config the operator would write must validate");
+        e
+    }
+
+    #[test]
+    fn a_read_only_repo_queues_no_close_while_the_others_still_do() {
+        // The bug: the flag was set by its riskiest repo, so wanting the trail
+        // on OIOS meant accepting it on Tally, and refusing it on Tally meant
+        // the board could close nothing anywhere.
+        let e = engine_with_one_read_only_repo();
+        seed_gh_in(&e, "gh:bredebjorhovd/OIOS#12");
+        seed_gh_in(&e, "gh:Florin-AS/Tally#34");
+        e.db.set_local_done("gh:bredebjorhovd/OIOS#12", true).unwrap();
+        e.db.set_local_done("gh:Florin-AS/Tally#34", true).unwrap();
+        e.rederive_all().unwrap();
+
+        // Both rows still move locally: the board's own view is not what the
+        // setting is about.
+        for id in ["gh:bredebjorhovd/OIOS#12", "gh:Florin-AS/Tally#34"] {
+            assert_eq!(
+                e.db.get_task(id).unwrap().unwrap().state,
+                BoardState::Done,
+                "{id} did not reach done locally"
+            );
+        }
+        let queued: Vec<String> = e
+            .db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind == "close")
+            .map(|w| w.task_id)
+            .collect();
+        assert_eq!(queued, ["gh:bredebjorhovd/OIOS#12"], "{queued:?}");
+    }
+
+    #[test]
+    fn a_comment_aimed_at_a_read_only_repo_is_dropped_at_delivery() {
+        // Config decides at delivery, and now it decides per repo: a dispatch
+        // comment queued while the flag was global must not land on Tally once
+        // the repo says otherwise.
+        let e = engine_with_one_read_only_repo();
+        seed_gh_in(&e, "gh:Florin-AS/Tally#34");
+        let task = e.db.get_task("gh:Florin-AS/Tally#34").unwrap().unwrap();
+        e.enqueue_outcome(&task, Outcome::Done, None).unwrap();
+
+        let w = e.db.pending_writebacks(1).unwrap().remove(0);
+        match e.deliver(&w).unwrap() {
+            Sent::Dropped(why) => assert!(
+                why.contains("Florin-AS/Tally"),
+                "the reason has to name the repo that refused it: {why}"
+            ),
+            other => panic!("it was not dropped: {other:?}"),
+        }
+
+        e.drain_writebacks();
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "a dropped writeback leaves the queue rather than backing off"
+        );
+    }
+
+    #[test]
+    fn a_repo_can_be_written_to_while_the_global_flag_stays_off() {
+        // The override goes both ways. Otherwise the safe global default can
+        // only be escaped by turning every repo on at once — the same bug.
+        let mut e = engine_with(None, Some(gh_client()));
+        e.cfg.github.repos = vec!["bredebjorhovd/herdr-board".into()];
+        e.cfg.github.per_repo = vec![crate::config::RepoConfig {
+            name: "bredebjorhovd/herdr-board".into(),
+            labels: None,
+            writeback: Some(true),
+        }];
+        e.cfg.check().unwrap();
+        assert!(!e.cfg.github.writeback, "the global flag is still off");
+
+        seed_gh_in(&e, "gh:bredebjorhovd/herdr-board#7");
+        e.db.set_local_done("gh:bredebjorhovd/herdr-board#7", true)
+            .unwrap();
+        e.rederive_all().unwrap();
+        assert!(
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "close"),
+            "the repo asked for the trail and did not get it"
+        );
+    }
+
     // ---- AGE-28: one label filter cannot answer for every repo -----------
 
     /// Records the paths asked for, from outside the `Box<dyn Rest>` the engine
@@ -2333,6 +2453,7 @@ mod tests {
         e.cfg.github.per_repo = vec![crate::config::RepoConfig {
             name: "b/itsm-agent".into(),
             labels: Some(vec!["release-a".into()]),
+            writeback: None,
         }];
         e.cfg
             .check()

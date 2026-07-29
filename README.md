@@ -74,7 +74,8 @@ exported in the shell still takes precedence over the file.
 
 The GitHub token needs `repo` scope: the board comments on dispatch and outcome
 and closes issues on done. Set `[github] writeback = false` if you would rather
-it only read, in which case read scope is enough.
+it only read, in which case read scope is enough — or leave it on and exclude
+the repos you would rather it kept out of, one `[[github.repo]]` table each.
 
 Create the Linear key at **Settings → Security & access → Personal API keys**.
 It is sent as a bare `Authorization` header (personal keys do not take `Bearer`).
@@ -553,6 +554,49 @@ is what is current in a repo whose issue list is also its roadmap.
 
 Adopting a repo through the board writes this table for you; see the screen
 above. Everything it writes is ordinary config you can edit or delete by hand.
+
+### Which repos the board writes to
+
+`[github] writeback` is the other setting that cannot have one answer for a
+board spanning a personal project and a production repo. A comment on dispatch
+and outcome is provenance nobody minds on a repo of your own; the same comment
+on a repo other people read is not. One global flag makes that choice once for
+every repo, so it gets set by its riskiest one — off, and the board can close
+nothing anywhere; on, and it writes to production. So the same table answers
+here too:
+
+```toml
+[github]
+repos = ["bredebjorhovd/OIOS", "Florin-AS/Tally"]
+writeback = true
+
+[[github.repo]]
+name = "Florin-AS/Tally"
+writeback = false
+```
+
+OIOS gets the trail. Tally is read: it appears on the board, its issues dispatch
+and its pull requests show up, and nothing is written to it — `d mark done`
+still moves the row locally, it just does not close the issue upstream.
+
+- Omit `writeback` to fall back to `[github] writeback`, which is itself off by
+  default. A table written to narrow `labels` does not quietly change it.
+- The override goes both ways: `writeback = true` on one repo while the global
+  flag stays off is the right shape for a board that writes to one repo only.
+- The repo decides at *delivery*, not when the effect is queued. Turning it off
+  stops the comments already sitting in the queue for that repo, which is what
+  you want from a setting you reach for after seeing one land.
+- `doctor` names the repos it will write to, and the repos it only reads:
+
+  ```
+  ok  github writeback  ON — comments and closes on: bredebjorhovd/OIOS.
+                        Read-only: Florin-AS/Tally
+  ```
+
+  A global `ON` was enough while one flag answered for every repo. Once the
+  answer differs, the question is about one repo in particular, and reading it
+  off two keys in `routing.toml` is what `doctor` is for. Each repo's own line
+  repeats it, and says whether the answer is the repo's or the global one.
 
 ## How it fits together
 
@@ -1107,6 +1151,17 @@ resolved here rather than guessed at repeatedly.
   `[github] writeback = false` to keep it strictly read-only. The loop guard
   carries across — there are two writers on one issue now, the board and the
   agent in the pane.
+- **And it is opt-in per repo, not per board.** One flag for every repo under
+  `[github] repos` is the wrong granularity for a board spanning a personal
+  project and a production repo, because it gets set by its riskiest one: off,
+  and the board closes nothing anywhere; on, and it comments on issues other
+  people read. `[[github.repo]] writeback` overrides it in both directions and
+  the global flag becomes the fallback — the same shape the label filter already
+  had, and for the same reason. The repo decides at delivery rather than at
+  enqueue, so turning it off stops what is already queued. `doctor` names the
+  repos it will write to instead of stating a posture: once the answer differs
+  per repo, the operator's question is whether one repo in particular is on the
+  list.
 - **The review state is named, not derived.** Linear writeback had two
   transitions and no third: dispatch moved the issue to In Progress and nothing
   moved it again until a merge, so a ticket read In Progress for the entire
@@ -1150,7 +1205,7 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 441 tests (420 unit, 21 integration)
+cargo test                 # 493 tests (472 unit, 21 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down

@@ -249,12 +249,7 @@ fn gh_task(repo: &str, number: u32, title: &str, state: BoardState) -> Task {
 
 /// The same task, routed somewhere other than the one workspace `view` assumes.
 fn routed(task: Task, route: &str, elapsed: Option<i64>) -> TaskView {
-    let repo = task
-        .id
-        .strip_prefix("gh:")
-        .and_then(|r| r.split(['#', '!']).next())
-        .and_then(|r| r.rsplit('/').next())
-        .map(str::to_string);
+    let repo = crate::model::gh_repo_name(&task.id).map(str::to_string);
     TaskView {
         route_name: Some(route.into()),
         workspace: Some(route.into()),

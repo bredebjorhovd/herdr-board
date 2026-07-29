@@ -322,14 +322,9 @@ pub fn build_views(
                     &wt,
                 )
             });
-            // `gh:Florin-AS/Tally#507` → `Tally`. The owner is noise when you
-            // only work with a handful of repos; the name is the part you read.
-            let repo = task
-                .id
-                .strip_prefix("gh:")
-                .and_then(|r| r.split(['#', '!']).next())
-                .and_then(|r| r.rsplit('/').next())
-                .map(str::to_string);
+            // `gh:Florin-AS/Tally#507` → `Tally`, because `gh#507` says nothing
+            // about which of several configured repos it came from.
+            let repo = crate::model::gh_repo_name(&task.id).map(str::to_string);
 
             TaskView {
                 repo,

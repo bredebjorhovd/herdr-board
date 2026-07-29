@@ -401,6 +401,26 @@ impl Task {
     }
 }
 
+/// The `owner/repo` a GitHub task id names — `gh:Florin-AS/tripletex-mcp#2` →
+/// `Florin-AS/tripletex-mcp`. `None` for a Linear id, which names no repo.
+///
+/// GitHub numbers issues per repository, so the repo is the half of a task id
+/// that makes it unique. Anything keyed on the *identifier* alone — `gh#2`, and
+/// the `board/gh-2` branch that used to come from it — is keyed on something
+/// two repos can both answer to.
+pub fn gh_repo(task_id: &str) -> Option<&str> {
+    // `!` is the pull-request form of the id: `gh:owner/repo!508`.
+    task_id.strip_prefix("gh:")?.split(['#', '!']).next()
+}
+
+/// Just the repository's name — `Florin-AS/tripletex-mcp` → `tripletex-mcp`.
+///
+/// The owner is noise when you work with a handful of repos; the name is the
+/// part you read, and so the part that names branches and panes.
+pub fn gh_repo_name(task_id: &str) -> Option<&str> {
+    gh_repo(task_id)?.rsplit('/').next()
+}
+
 #[derive(Debug, Clone)]
 pub struct Attempt {
     pub id: i64,
@@ -512,6 +532,21 @@ mod tests {
 
     fn d() -> Derivation {
         Derivation::default()
+    }
+
+    #[test]
+    fn a_task_id_says_which_repo_a_github_number_belongs_to() {
+        assert_eq!(
+            gh_repo("gh:Florin-AS/tripletex-mcp#2"),
+            Some("Florin-AS/tripletex-mcp")
+        );
+        // The pull-request form of the id, which carries `!` instead.
+        assert_eq!(gh_repo("gh:bredebjorhovd/OIOS!10"), Some("bredebjorhovd/OIOS"));
+        assert_eq!(gh_repo_name("gh:bredebjorhovd/OIOS!10"), Some("OIOS"));
+        // A Linear id names no repo, and its identifier needs none: `LIN-142`
+        // is unique across every project the board watches.
+        assert_eq!(gh_repo("linear:LIN-142"), None);
+        assert_eq!(gh_repo_name("linear:LIN-142"), None);
     }
 
     #[test]

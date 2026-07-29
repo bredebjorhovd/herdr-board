@@ -796,8 +796,14 @@ fn parse_pane(p: &Value) -> Option<PaneInfo> {
 ///
 /// herdr requires `[a-z][a-z0-9_-]{0,31}` and uniqueness among live agents, so
 /// the attempt number is part of the name; a retry of LIN-142 is `lin-142-2`.
-pub fn agent_name(identifier: &str, attempt: usize) -> String {
-    let base = crate::config::slugify(identifier);
+///
+/// `base` is the task's branch slug — `dispatch::branch_slug`, which is
+/// repo-qualified for GitHub. Uniqueness is why: `gh#2` names an issue in two
+/// repos at once. The cap truncates the tail, and the slug puts the identifier
+/// first for exactly that reason: a long repo name loses characters, the issue
+/// number never does.
+pub fn agent_name(base: &str, attempt: usize) -> String {
+    let base = crate::config::slugify(base);
     let base = if base.starts_with(|c: char| c.is_ascii_lowercase()) {
         base
     } else {

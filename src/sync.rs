@@ -358,13 +358,15 @@ impl SyncEngine {
 
         // A PR whose branch belongs to an attempt is that task's PR, not a row
         // of its own — otherwise dispatched work would appear twice.
-        let attempt_branches: std::collections::HashSet<String> = self
-            .db
-            .load_tasks()
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|t| t.attempts.iter().filter_map(|a| a.branch.clone()))
-            .collect();
+        //
+        // Scoped by repository where the task names one: `board/gh-2` in OIOS is
+        // not the tripletex attempt's branch merely because the strings match,
+        // and suppressing it hides a real pull request behind a coincidence
+        // (AGE-20). New branches are repo-qualified, but attempts recorded
+        // before that still hold the ambiguous name, so the check carries the
+        // scope rather than trusting the string. A Linear task names no repo, so
+        // its branch is honoured in whichever repo the PR turns up in.
+        let attempt_branches = self.attempt_branches();
 
         if let Err(e) = self.link_pull_requests(&all_pulls) {
             self.log.error(format!("linking PRs: {e}"));
@@ -377,7 +379,7 @@ impl SyncEngine {
 
         if self.cfg.github.pull_requests {
             for pr in &all_pulls {
-                if attempt_branches.contains(&pr.head_ref) {
+                if attempt_branches.claims(pr) {
                     continue;
                 }
                 if let Err(e) = self.db.upsert_task(&pr.to_upsert()) {
@@ -422,6 +424,21 @@ impl SyncEngine {
         all_pulls
     }
 
+    /// Every branch the board has dispatched onto, with the repository it was
+    /// dispatched for when the task names one.
+    fn attempt_branches(&self) -> AttemptBranches {
+        let mut set = AttemptBranches::default();
+        for task in self.db.load_tasks().unwrap_or_default() {
+            for branch in task.attempts.iter().filter_map(|a| a.branch.clone()) {
+                match crate::model::gh_repo(&task.id) {
+                    Some(repo) => set.in_repo.entry(repo.to_string()).or_default().insert(branch),
+                    None => set.anywhere.insert(branch),
+                };
+            }
+        }
+        set
+    }
+
     /// Attach PRs to tasks by attempt branch (`board/<identifier>`), which is
     /// the link the dispatcher creates.
     pub fn link_pull_requests(&self, pulls: &[PullRequest]) -> Result<()> {
@@ -438,13 +455,15 @@ impl SyncEngine {
                 .collect();
             // A GitHub task owns a repo, and only that repo's pull requests can
             // be its own. Branch names are not unique across repos — `gh#2` in
-            // two repos both branch to `board/gh-2` — so matching on the branch
-            // alone attached another repo's merged PR to this task and derived
-            // it straight to review (AGE-20). Linear identifiers are globally
-            // unique, so Linear rows need no such scoping.
-            let own_repo = split_gh_task_id(&task.id).map(|(repo, _)| repo);
+            // two repos both branched to `board/gh-2` — so matching on the
+            // branch alone attached another repo's merged PR to this task and
+            // derived it straight to review (AGE-20). Branches carry their repo
+            // now, but the scope stays: attempts recorded before that do not,
+            // and `--branch` can name anything at all. Linear identifiers are
+            // globally unique, so Linear rows need no such scoping.
+            let own_repo = crate::model::gh_repo(&task.id);
             let Some(pr) = pulls.iter().find(|p| {
-                own_repo.as_ref().is_none_or(|r| &p.repo == r)
+                own_repo.is_none_or(|r| p.repo == r)
                     && branches.iter().any(|b| pr_matches_branch(p, b))
             }) else {
                 continue;
@@ -1362,12 +1381,36 @@ fn truncate_for_toast(s: &str) -> String {
     crate::ui::render::truncate(s, 78)
 }
 
+/// The branches the board has dispatched onto, and where.
+///
+/// A branch name alone is not an identity: the board watches several repos and
+/// `board/gh-2` can exist in all of them. A GitHub task's branch is claimed only
+/// within its own repository; a Linear task names no repo, so its branch is
+/// claimed wherever the pull request appears.
+#[derive(Default)]
+struct AttemptBranches {
+    in_repo: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    anywhere: std::collections::HashSet<String>,
+}
+
+impl AttemptBranches {
+    /// Is this pull request already some attempt's, rather than a row of its
+    /// own?
+    fn claims(&self, pr: &PullRequest) -> bool {
+        self.anywhere.contains(&pr.head_ref)
+            || self
+                .in_repo
+                .get(&pr.repo)
+                .is_some_and(|branches| branches.contains(&pr.head_ref))
+    }
+}
+
 /// `gh:owner/repo#87` → (`owner/repo`, 87). Also accepts the pull-request form
 /// `gh:owner/repo!508` — GitHub's issues endpoints serve pull requests too, so
 /// comments and closing work the same for both.
 pub fn split_gh_task_id(id: &str) -> Option<(String, i64)> {
-    let rest = id.strip_prefix("gh:")?;
-    let (repo, number) = rest.rsplit_once(['#', '!'])?;
+    let repo = crate::model::gh_repo(id)?;
+    let (_, number) = id.rsplit_once(['#', '!'])?;
     Some((repo.to_string(), number.parse().ok()?))
 }
 
@@ -1389,12 +1432,7 @@ pub fn route_context(task: &Task) -> RouteContext {
         Source::Github => RouteContext {
             linear_team: None,
             linear_project: None,
-            // `gh:owner/repo#87` and `gh:owner/repo!508` → `owner/repo`.
-            gh_repo: task
-                .id
-                .strip_prefix("gh:")
-                .and_then(|r| r.split(['#', '!']).next())
-                .map(str::to_string),
+            gh_repo: crate::model::gh_repo(&task.id).map(str::to_string),
             labels: task.labels.clone(),
         },
     }
@@ -1480,6 +1518,22 @@ mod tests {
 
     fn dispatch(e: &SyncEngine, task: &str, pane_id: &str) -> i64 {
         dispatch_by(e, task, pane_id, None)
+    }
+
+    /// An attempt on a named branch, for the tests that care which one.
+    fn dispatch_on(e: &SyncEngine, task: &str, branch: &str) -> i64 {
+        e.db.insert_attempt(&crate::db::NewAttempt {
+            task_id: task.into(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: Some(branch.into()),
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+        })
+        .unwrap()
     }
 
     /// `from` is the pane that released it — `None` is the operator.
@@ -1688,6 +1742,54 @@ mod tests {
         let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
         assert_eq!(t.pr_url, None, "another repo's PR is not this task's PR");
         assert!(!t.pr_merged, "and must not mark it finished");
+    }
+
+    #[test]
+    fn another_repos_attempt_branch_does_not_swallow_a_pull_request() {
+        // The other side of the same ambiguity (AGE-20). A PR on a branch some
+        // attempt owns is that attempt's, not a row of its own — but `board/gh-2`
+        // in OIOS is not tripletex's attempt merely because the strings match,
+        // and treating it as one drops a real pull request off the board with no
+        // trace. New branches carry their repo; attempts recorded before this
+        // still hold the ambiguous name, which is the case here.
+        let mut e = engine_with(
+            None,
+            Some(Github::new(Box::new(crate::sources::github::FixtureRest::new(
+                vec![
+                    (
+                        "/repos/Florin-AS/tripletex-mcp/issues".into(),
+                        json!([{ "number": 2, "node_id": "n1", "title": "Ingest sweeps",
+                                 "html_url": "u", "state": "open", "updated_at": "t",
+                                 "labels": [] }]),
+                    ),
+                    ("/repos/Florin-AS/tripletex-mcp/pulls".into(), json!([])),
+                    ("/repos/bredebjorhovd/OIOS/issues".into(), json!([])),
+                    (
+                        "/repos/bredebjorhovd/OIOS/pulls".into(),
+                        json!([{ "number": 10, "title": "Row-capture sweeps",
+                                 "html_url": "https://github.com/bredebjorhovd/OIOS/pull/10",
+                                 "state": "closed", "merged_at": "t", "updated_at": "t",
+                                 "head": { "ref": "board/gh-2" } }]),
+                    ),
+                ],
+            )) as Box<dyn Rest>)),
+        );
+        e.cfg.github.repos = vec![
+            "Florin-AS/tripletex-mcp".into(),
+            "bredebjorhovd/OIOS".into(),
+        ];
+        seed(&e, "gh:Florin-AS/tripletex-mcp#2", "gh#2", UpstreamState::Started);
+        dispatch_on(&e, "gh:Florin-AS/tripletex-mcp#2", "board/gh-2");
+
+        e.poll_github();
+
+        let pr = e.db.get_task("gh:bredebjorhovd/OIOS!10").unwrap();
+        assert!(
+            pr.is_some(),
+            "OIOS's pull request is nobody's attempt and belongs on the board"
+        );
+        let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
+        assert_eq!(t.pr_url, None, "and is still not tripletex's");
     }
 
     /// A merged pull request that the board is only told about by a poll.

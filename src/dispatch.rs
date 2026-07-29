@@ -136,6 +136,30 @@ impl Plan {
     }
 }
 
+/// The branch-safe form of a task's identifier, and the value of
+/// `{identifier_lower}`.
+///
+/// Slugified, not merely lowercased: a GitHub identifier lowercases to `gh#506`,
+/// which makes a branch name that git tolerates and every shell does not.
+///
+/// **Repo-qualified for GitHub**, because `gh#2` is unique in its repository and
+/// nowhere else. Issue 2 of every watched repo rendered the same `board/gh-2`,
+/// and the board keys real decisions on that string: which pull request belongs
+/// to which task, and which polled pull request is already somebody's attempt.
+/// A merged PR in another repo attached itself to an untouched task and derived
+/// it straight to review (AGE-20) — the same ambiguity the display fix for
+/// `gh#507` named in the UI, in the data path. Linear identifiers carry their
+/// team and are globally unique, so they are unchanged: `LIN-145` → `lin-145`.
+///
+/// The identifier leads and the repo follows, so that the part which
+/// distinguishes two issues survives [`agent_name`]'s 32-character cap.
+pub fn branch_slug(task: &Task) -> String {
+    match crate::model::gh_repo_name(&task.id) {
+        Some(repo) => crate::config::slugify(&format!("{}-{repo}", task.identifier)),
+        None => crate::config::slugify(&task.identifier),
+    }
+}
+
 /// Build the interpolation variables for a task. Shared by the prompt view and
 /// the dispatcher so what you read is what gets sent.
 pub fn prompt_vars<'a>(
@@ -147,11 +171,7 @@ pub fn prompt_vars<'a>(
     let mut v = BTreeMap::new();
     v.insert("title", task.title.clone());
     v.insert("identifier", task.identifier.clone());
-    // Slugified, not merely lowercased: this feeds `branch_template`, and a
-    // GitHub identifier lowercases to `gh#506`, which makes a branch name that
-    // git tolerates and every shell does not. Linear ids are unaffected
-    // (`LIN-145` → `lin-145` either way).
-    v.insert("identifier_lower", crate::config::slugify(&task.identifier));
+    v.insert("identifier_lower", branch_slug(task));
     v.insert("body", task.body.clone().unwrap_or_default());
     v.insert("url", task.url.clone());
     v.insert("branch", branch.to_string());
@@ -231,7 +251,7 @@ pub fn plan(
     let attempt_no = task.attempt_count() + 1;
     let worktree = paths
         .worktree_root()
-        .join(format!("{}-{}", crate::config::slugify(&task.identifier), attempt_no));
+        .join(format!("{}-{}", branch_slug(task), attempt_no));
 
     Ok(Plan {
         identifier: task.identifier.clone(),
@@ -360,7 +380,10 @@ pub fn dispatch(
         let pane_id = wt.root_pane_id.clone();
         engine.db.set_attempt_pane(attempt_id, &pane_id)?;
 
-        let name = agent_name(&p.identifier, p.attempt_no);
+        // Named from the branch slug rather than the identifier: herdr requires
+        // agent names to be unique among live agents, and two repos releasing
+        // their issue 2 at once both asked it for `gh-2-1` (AGE-20).
+        let name = agent_name(&branch_slug(task), p.attempt_no);
         start_agent_when_ready(herdr, log, &name, p.herdr_kind, &pane_id)?;
 
         crate::wake::first_prompt(herdr, log, &name, &p.prompt);
@@ -947,14 +970,13 @@ branch_template = "board/{identifier_lower}"
         assert_eq!(p.attempt_no, 1);
     }
 
-    #[test]
-    fn a_github_identifier_makes_a_shell_safe_branch() {
-        let db = Db::open_in_memory().unwrap();
+    /// A GitHub issue, whose id carries the repo the number belongs to.
+    fn gh_task(db: &Db, id: &str, identifier: &str) -> Task {
         db.upsert_task(&crate::db::UpsertTask {
-            id: "gh:acme/widgets#506".into(),
+            id: id.into(),
             source: Source::Github,
             source_id: "n".into(),
-            identifier: "gh#506".into(),
+            identifier: identifier.into(),
             title: "t".into(),
             body: None,
             url: "u".into(),
@@ -966,7 +988,13 @@ branch_template = "board/{identifier_lower}"
             updated_at: crate::db::now(),
         })
         .unwrap();
-        let t = db.get_task("gh:acme/widgets#506").unwrap().unwrap();
+        db.get_task(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_github_identifier_makes_a_shell_safe_branch() {
+        let db = Db::open_in_memory().unwrap();
+        let t = gh_task(&db, "gh:acme/widgets#506", "gh#506");
         let c: RoutingConfig = toml::from_str(
             r#"
 [[route]]
@@ -979,8 +1007,39 @@ runtime = "claude-code"
         .unwrap();
         let route = c.resolve(&crate::sync::route_context(&t)).unwrap();
         let branch = resolve_branch(&c, route, &t);
-        assert_eq!(branch, "board/gh-506");
+        assert_eq!(branch, "board/gh-506-widgets");
         assert!(!branch.contains('#'), "{branch} is hostile in a shell");
+    }
+
+    /// AGE-20, seen live: `gh#2` exists in every repo that has two issues, and
+    /// `board/{identifier_lower}` gave them all one branch. The board keys real
+    /// decisions on that string — which pull request is whose — so OIOS's merged
+    /// `board/gh-2` attached itself to tripletex-mcp's untouched task.
+    #[test]
+    fn two_repos_issue_two_do_not_share_a_branch() {
+        let db = Db::open_in_memory().unwrap();
+        let tripletex = gh_task(&db, "gh:Florin-AS/tripletex-mcp#2", "gh#2");
+        let oios = gh_task(&db, "gh:bredebjorhovd/OIOS#2", "gh#2");
+
+        assert_eq!(branch_slug(&tripletex), "gh-2-tripletex-mcp");
+        assert_eq!(branch_slug(&oios), "gh-2-oios");
+        // The identifier leads so that the cap on herdr agent names truncates
+        // the repo rather than the number that tells two issues apart.
+        assert_eq!(agent_name(&branch_slug(&tripletex), 1), "gh-2-tripletex-mcp-1");
+        assert_ne!(
+            agent_name(&branch_slug(&tripletex), 1),
+            agent_name(&branch_slug(&oios), 1),
+            "two repos releasing their issue 2 must not ask herdr for one name"
+        );
+    }
+
+    /// Linear identifiers carry their team and are unique across every project
+    /// the board watches, so nothing about them changes — a branch an operator
+    /// has in a worktree today is the branch they get tomorrow.
+    #[test]
+    fn a_linear_branch_is_left_alone() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(branch_slug(&task(&db)), "lin-145");
     }
 
     #[test]

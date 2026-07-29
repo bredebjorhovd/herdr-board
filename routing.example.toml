@@ -54,6 +54,11 @@ runtime = "codex"
 
 [defaults]
 max_concurrent_per_workspace = 3
+# `{identifier_lower}` is the identifier made branch-safe: `LIN-145` →
+# `lin-145`. For GitHub it also carries the repo — `gh#2` in tripletex-mcp is
+# `gh-2-tripletex-mcp` — because GitHub numbers issues per repository, and every
+# watched repo's issue 2 sharing one branch name is how another repo's merged
+# pull request ends up attached to an untouched task.
 branch_template = "board/{identifier_lower}"
 # Which way panes split — the board's own and dispatched agents' alike.
 # "auto" (default): right into a tab with one pane, down once it holds two or

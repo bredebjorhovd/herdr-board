@@ -1360,16 +1360,27 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
     // herdr's stock Claude Code manifest has no working rule that can fire in a
     // pane, so a thinking or blocked agent reports `idle` and the board's
     // BLOCKED section never lights up for one.
-    let claude_ok = crate::integration::installed();
+    let claude = crate::integration::status();
     checks.push(Check {
         name: "claude state detection".into(),
-        ok: claude_ok,
-        detail: if claude_ok {
-            "manifest override installed — working and blocked are detected".into()
-        } else {
-            "stock manifest — a working or blocked Claude pane reports `idle`. \
-             Run `herdr-board integration install claude`"
-                .into()
+        ok: claude == crate::integration::Status::Current,
+        detail: match claude {
+            crate::integration::Status::Current => {
+                "manifest override installed — working and blocked are detected".into()
+            }
+            // An override from before gh#9 waits for the token counter, which
+            // does not exist for the first seconds of a turn — exactly the
+            // window dispatch checks delivery in.
+            crate::integration::Status::Stale => {
+                "manifest override is out of date — a turn's first seconds still report \
+                 `idle`. Run `herdr-board integration install claude` again"
+                    .into()
+            }
+            crate::integration::Status::Missing => {
+                "stock manifest — a working or blocked Claude pane reports `idle`. \
+                 Run `herdr-board integration install claude`"
+                    .into()
+            }
         },
     });
 

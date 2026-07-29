@@ -961,9 +961,32 @@ herdr-board integration install claude
 ```
 
 That writes a local agent-detection override — herdr's supported extension
-point, and local overrides always win — adding a rule that matches Claude Code's
-on-screen working line, whose token counter only appears mid-turn. It sits above
-`live_prompt_box` and below the blocked rules, so an approval prompt still wins.
+point, and local overrides always win — adding a rule that matches the spinner
+line Claude Code keeps just above the prompt box for the length of a turn. It
+sits above `live_prompt_box` and below the blocked rules, so an approval prompt
+still wins.
+
+What the rule matches is the ellipsis, not the timer:
+
+```
+✶ Sublimating…                                  ← working, and nothing else on screen
+✽ Composing… (2s · ↓ 2 tokens)                  ← working
+✻ Cogitated for 4s                              ← finished, same glyph, one line higher
+```
+
+The rule used to match the `· ↓ N tokens` counter, which Claude Code prints only
+once the first token arrives. Sampling a live pane every 300ms through a turn
+(gh#9) showed the counter appearing 2.7 seconds after the prompt landed and the
+pane reporting `idle` for every sample before that — which is exactly the window
+dispatch uses to decide whether its prompt was delivered. With the spinner rule
+the same pane reports `working` from 900ms. If `doctor` says the override is out
+of date, it is this: reinstall.
+
+A manifest is still a heuristic sampled on a tick, so delivery does not rely on
+it alone — `src/screen.rs` reads the pane directly and `src/wake.rs` answers
+each shape with the key that fits it: a running turn is done, text in the box
+wants Enter, and a pane still on its welcome screen wants the prompt again.
+That last one is the case three blind Enters could never fix.
 
 Two things it is not:
 

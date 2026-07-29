@@ -13,6 +13,7 @@ pub mod integration;
 pub mod log;
 pub mod model;
 pub mod review;
+pub mod screen;
 pub mod settled;
 pub mod sources;
 pub mod stats;

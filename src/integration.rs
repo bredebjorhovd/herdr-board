@@ -16,15 +16,24 @@
 //! `integration install claude` only reports session identity.
 //!
 //! What herdr does support is a local manifest override, which "always wins".
-//! So we ship one: the active manifest plus a rule matching Claude Code's
-//! on-screen working line, which prints a token counter only mid-turn.
+//! So we ship one: the active manifest plus a rule matching the spinner line
+//! Claude Code keeps on screen for the length of a turn.
+//!
+//! A manifest is still a heuristic sampled on a tick, and `crate::screen` reads
+//! the same pane directly for the callers that cannot afford to be wrong about
+//! a single sample.
 
 use crate::log::Logger;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 /// Marks the rule we append, so the override can be recognised and replaced.
-const RULE_ID: &str = "board_working_token_counter";
+const RULE_ID: &str = "board_working_spinner";
+
+/// The id this rule had before gh#9. An override carrying it is ours, and out
+/// of date: it waits for a token counter that the opening seconds of a turn do
+/// not have.
+const OLD_RULE_ID: &str = "board_working_token_counter";
 
 /// Above `live_prompt_box` (950) so working beats a live prompt box, and below
 /// the blocked rules (980) so an approval prompt still wins — being told an
@@ -39,11 +48,31 @@ const RULE: &str = r#"
 # live while it works, so `live_prompt_box` (950) wins and a thinking agent
 # reports idle.
 #
-# Its on-screen working line looks like `· Whirring… (3m 11s · ↓ 10.5k tokens)`.
-# The token counter is only printed mid-turn, which makes it the reliable part.
-#
 # Priority sits above `live_prompt_box` and below the blocked rules (980), so an
 # agent waiting on an approval still reports blocked.
+#
+# What this matches is the spinner line Claude Code keeps just above the prompt
+# box for the length of a turn: a rotating frame, a gerund, and an ellipsis,
+# with a timer once there is anything to report.
+#
+#     ✶ Sublimating…
+#     ✽ Composing… (2s · ↓ 2 tokens)
+#     ✳ Setting up monorepo root tooling… (6m 29s · ↓ 23.9k tokens)
+#
+# The ellipsis is the whole discriminator, because a *finished* turn leaves a
+# line of the same shape and the same glyph one line higher:
+#
+#     ✻ Cogitated for 4s
+#     ✻ Baked for 1m 32s · 1 shell still running
+#
+# Present participle versus past tense. The frames are `·` `✢` `✳` `✶` `✻` `✽`.
+#
+# This rule used to match the `· ↓ N tokens` counter instead, which is printed
+# only once the first token arrives. Sampling a real pane every 300ms through a
+# turn (gh#9) showed the counter appearing 2.7s after the prompt landed, and the
+# pane reporting `idle` for every sample before that — right across the window
+# where dispatch checks whether its prompt was delivered. The counter is kept as
+# a second alternative in case a future spinner drops the ellipsis.
 #
 # The region was 6, which is roughly where the spinner sits with nothing between
 # it and the prompt box — and a todo list goes exactly there. Five items pushed
@@ -52,14 +81,15 @@ const RULE: &str = r#"
 # long todo list plus the four lines of prompt-box chrome beneath it.
 #
 # Safe to widen because the spinner is *ephemeral*: it is removed when a turn
-# ends. Checked across six genuinely idle panes — none carried a token-counter
-# line at all — so a larger window cannot resurrect a finished turn.
-id = "board_working_token_counter"
+# ends. Checked across six genuinely idle panes — none carried a spinner or a
+# token-counter line at all — so a larger window cannot resurrect a finished
+# turn.
+id = "board_working_spinner"
 state = "working"
 priority = 976
 region = "bottom_non_empty_lines(20)"
 visible_working = true
-line_regex = ['\u{b7}\s*\u{2193}\s*[\d.]+[kKmM]?\s*tokens']
+line_regex = ['(?:^\s*[\x{b7}\x{2722}\x{2733}\x{2736}\x{273b}\x{273d}] +\S[^\n]*\x{2026}\s*(?:\(|$))|(?:\x{b7}\s*\x{2193}\s*[\d.]+[kKmM]?\s*tokens)']
 "#;
 
 fn config_home() -> Result<PathBuf> {
@@ -89,12 +119,37 @@ fn active_manifest() -> Result<String> {
     )
 }
 
-/// Is our override installed?
-pub fn installed() -> bool {
-    override_path()
+/// What is sitting at the override path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// No override of ours — herdr is reading the stock manifest, or one the
+    /// operator wrote.
+    Missing,
+    /// Ours, from before gh#9: it waits for a token counter, so it misses the
+    /// opening seconds of every turn.
+    Stale,
+    /// Ours, current.
+    Current,
+}
+
+/// What state our override is in.
+pub fn status() -> Status {
+    let text = override_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .is_some_and(|s| s.contains(RULE_ID))
+        .unwrap_or_default();
+    if text.contains(RULE_ID) {
+        Status::Current
+    } else if text.contains(OLD_RULE_ID) {
+        Status::Stale
+    } else {
+        Status::Missing
+    }
+}
+
+/// Is an override of ours installed at all, current or not?
+pub fn installed() -> bool {
+    status() != Status::Missing
 }
 
 /// Write the override: herdr's current manifest plus our rule.
@@ -120,9 +175,10 @@ pub fn uninstall(log: &Logger) -> Result<()> {
         return Ok(());
     }
     // Only ever remove a file we wrote: a hand-written override is the
-    // operator's, and herdr's docs encourage them.
+    // operator's, and herdr's docs encourage them. An override from before
+    // gh#9 is still one of ours.
     let text = std::fs::read_to_string(&path)?;
-    if !text.contains(RULE_ID) {
+    if !text.contains(RULE_ID) && !text.contains(OLD_RULE_ID) {
         bail!(
             "{} exists but is not ours — leaving it alone",
             path.display()
@@ -180,31 +236,58 @@ mod tests {
 
     #[test]
     fn the_rule_matches_claude_codes_working_line() {
-        let re = regex_lite_matches;
         // Real lines captured from Claude Code 2.1.220.
-        assert!(re("· Whirring… (3m 11s · ↓ 10.5k tokens)"));
-        assert!(re("✻ Effecting… (29s · ↓ 1.5k tokens · thinking with high effort)"));
-        assert!(re("· Topsy-turvying… (41s · ↓ 990 tokens)"));
+        assert!(matches("· Whirring… (3m 11s · ↓ 10.5k tokens)"));
+        assert!(matches(
+            "✻ Effecting… (29s · ↓ 1.5k tokens · thinking with high effort)"
+        ));
+        assert!(matches("· Topsy-turvying… (41s · ↓ 990 tokens)"));
+        // The one gh#9 is about: the first seconds of a turn, before the token
+        // counter exists.
+        assert!(matches("✶ Sublimating…"));
         // ...and not an idle prompt box, which is the whole point.
-        assert!(!re("❯"));
-        assert!(!re("  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"));
+        assert!(!matches("❯"));
+        assert!(!matches(
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+        ));
+        // ...nor the past-tense line a finished turn leaves behind.
+        assert!(!matches("✻ Cogitated for 4s"));
+        assert!(!matches("✻ Baked for 1m 32s · 1 shell still running"));
     }
 
-    /// The token-counter shape the rule's regex encodes: a middot, a down
-    /// arrow, a number, then `tokens`.
-    fn regex_lite_matches(line: &str) -> bool {
-        let Some(pos) = line.find('\u{2193}') else {
-            return false;
-        };
-        if !line[..pos].contains('\u{b7}') {
-            return false;
+    /// The rule's regex, evaluated. herdr owns the engine and this crate has no
+    /// regex dependency, so `crate::screen` is the executable copy of the
+    /// pattern and the two are asserted to agree below.
+    fn matches(line: &str) -> bool {
+        crate::screen::working(line)
+    }
+
+    #[test]
+    fn the_regex_and_the_screen_reader_encode_the_same_line() {
+        // Two readings of the same screen — herdr's, via this regex, and ours,
+        // via `screen::working`. They drift apart silently, so tie them
+        // together by construction: every frame and the ellipsis appear in both.
+        let pattern = RULE
+            .lines()
+            .find_map(|l| l.strip_prefix("line_regex = "))
+            .expect("the rule declares a line_regex");
+        for frame in [
+            '\u{b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
+        ] {
+            let escaped = format!("\\x{{{:x}}}", frame as u32);
+            assert!(
+                pattern.contains(&escaped),
+                "frame {frame} ({escaped}) is missing from the manifest regex"
+            );
+            assert!(
+                crate::screen::working(&format!("{frame} Sublimating…")),
+                "frame {frame} is missing from screen::working"
+            );
         }
-        let rest = line[pos + '\u{2193}'.len_utf8()..].trim_start();
-        let digits: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        !digits.is_empty() && rest.contains("tokens")
+        assert!(
+            pattern.contains("\\x{2026}"),
+            "the ellipsis is the discriminator; the regex has to require it"
+        );
     }
 
     #[test]
@@ -238,5 +321,15 @@ mod tests {
         // Someone will find this file in six months wondering why it exists.
         assert!(RULE.contains("osc_title_working"));
         assert!(RULE.contains("live_prompt_box"));
+    }
+
+    #[test]
+    fn an_override_from_before_gh9_reads_as_stale_not_missing() {
+        // The two ids are what tells "never installed" from "installed, and now
+        // wrong". Reinstalling is the fix for the second, and `doctor` can only
+        // say so if it can see the difference.
+        assert_ne!(RULE_ID, OLD_RULE_ID);
+        assert!(RULE.contains(RULE_ID));
+        assert!(!RULE.contains(OLD_RULE_ID));
     }
 }

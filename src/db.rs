@@ -80,6 +80,7 @@ impl Db {
               ended_at     TEXT,
               outcome      TEXT,
               missing_ticks INTEGER NOT NULL DEFAULT 0,
+              settled_ticks INTEGER NOT NULL DEFAULT 0,
               -- Task id of the parent that released this one, when the board
               -- dispatched that parent too. NULL on its own does not mean
               -- "you": an orchestrator pane has no attempt and so no task id.
@@ -166,6 +167,10 @@ impl Db {
                 // Has this attempt ever been observed working? An agent that
                 // was never seen working cannot have finished.
                 ("saw_working", "INTEGER NOT NULL DEFAULT 0"),
+                // Consecutive samples that would have settled this attempt on
+                // commits alone. `idle` flaps mid-turn, so one is not enough —
+                // the mirror image of `missing_ticks`, see gh#18.
+                ("settled_ticks", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )?;
         self.add_missing_columns(
@@ -434,7 +439,8 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, dispatched_by_pane, base_sha, saw_working
+                    dispatched_by, dispatched_by_pane, base_sha, saw_working,
+                    settled_ticks
              FROM attempts WHERE task_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -459,6 +465,7 @@ impl Db {
                 dispatched_by_pane: r.get(13)?,
                 base_sha: r.get(14)?,
                 saw_working: r.get::<_, i64>(15)? != 0,
+                settled_ticks: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -553,12 +560,23 @@ impl Db {
         Ok(())
     }
 
+    /// How many consecutive samples have looked finished on commits alone.
+    /// Cleared, not latched: an agent that goes back to work starts over.
+    pub fn set_settled_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET settled_ticks = ?2 WHERE id = ?1",
+            params![attempt_id, ticks],
+        )?;
+        Ok(())
+    }
+
     /// Live attempts across all tasks, for reconciliation and concurrency caps.
     pub fn live_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
                     started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, dispatched_by_pane, base_sha, saw_working
+                    dispatched_by, dispatched_by_pane, base_sha, saw_working,
+                    settled_ticks
              FROM attempts WHERE outcome IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -581,6 +599,7 @@ impl Db {
                 dispatched_by_pane: r.get(13)?,
                 base_sha: r.get(14)?,
                 saw_working: r.get::<_, i64>(15)? != 0,
+                settled_ticks: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

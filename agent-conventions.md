@@ -116,6 +116,12 @@ either an open PR or commits on the attempt branch. Work left uncommitted in the
 worktree when you stop reads as an agent that did nothing, and the row sits in
 `working` until a human notices. Commit even when you are not opening a PR.
 
+The two artifacts are not weighed the same. A pull request is your own statement
+that you are finished, so it settles the attempt on the first idle sample.
+Commits are not — you were told to make them mid-flight — so the board waits for
+two consecutive idle samples before settling on them, and any sample that says
+`working` starts that over. Open the PR when you want the row to move promptly.
+
 `herdr-board doctor` explains a board that looks wrong: missing keys, unreachable
 repos, routes pointing at workspaces that do not exist. Prefer it to guessing.
 

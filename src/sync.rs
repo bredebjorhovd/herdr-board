@@ -762,50 +762,89 @@ impl SyncEngine {
         if status == AgentStatus::Working && !attempt.saw_working {
             self.db.set_saw_working(attempt.id)?;
         }
-        // An agent that has settled *and* produced a PR is the only explicit
-        // done detection we have. Without a PR the attempt stays live and the
-        // row renders a dim `idle` marker.
+        // An agent that has settled *and* produced an artifact is the only
+        // explicit done detection we have. Without one the attempt stays live
+        // and the row renders a dim `idle` marker.
         let settled = matches!(
             status,
             AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown
         );
         if !settled {
-            return Ok(());
+            // Back at work: whatever the last samples said, they were not the
+            // end of the attempt.
+            return self.clear_settled_ticks(attempt);
         }
-        // A PR is the clearest evidence of finished work, but commits on the
-        // attempt branch are evidence too — and an agent that commits locally
-        // and stops would otherwise sit `working` forever.
+        // A PR is the agent's own declaration that it is finished, and it
+        // cannot exist unless something ran. Nothing to second-guess: settle on
+        // the first sample that sees one.
+        if task.pr_open {
+            return self.settle_now(herdr, task, attempt, status, "PR");
+        }
+        // Commits on the attempt branch are evidence too — an agent that
+        // commits locally and stops would otherwise sit `working` forever —
+        // but they are much weaker. `agent-conventions.md` tells dispatched
+        // agents to "commit even when you are not opening a PR", so the
+        // artifact is routinely there long before the work is done.
         //
         // Commits alone only count once the agent has been seen working. A
         // just-started Claude reports `idle` because it has not been handed its
         // prompt yet — several seconds pass between `agent start` and `agent
-        // prompt` — and reaping it there ends the attempt before it begins. A
-        // PR needs no such guard: it cannot exist unless something ran.
-        let why = if task.pr_open {
-            Some("PR")
-        } else if !attempt.saw_working {
-            None
-        } else if self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+        // prompt` — and reaping it there ends the attempt before it begins.
+        if !attempt.saw_working
+            || !self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
         {
-            Some("commits")
-        } else {
-            None
-        };
-        if let Some(why) = why {
+            return self.clear_settled_ticks(attempt);
+        }
+        // gh#18: and one settled sample is not "finished". `idle` is a screen
+        // classification that flaps mid-turn — the bottom of the pane loses the
+        // working line behind long bash output or a large diff — and
+        // `pane.agent_status_changed` invokes this path at the moment of the
+        // flap rather than waiting for the next 30s sweep. So the weak artifact
+        // gets the debounce the vanished pane already has above: two
+        // consecutive samples, and any sample that says `working` starts over.
+        let ticks = attempt.settled_ticks + 1;
+        if ticks < 2 {
             self.log.info(format!(
-                "{} agent {} with {why} — attempt done",
+                "{} agent {} with commits (tick {}/2)",
                 task.identifier,
-                status.as_str()
+                status.as_str(),
+                ticks
             ));
-            self.settle(
-                herdr,
-                task,
-                attempt,
-                Settled::Finished,
-                task.pr_url.as_deref(),
-            )?;
+            self.db.set_settled_ticks(attempt.id, ticks)?;
+            return Ok(());
+        }
+        self.settle_now(herdr, task, attempt, status, "commits")
+    }
+
+    /// Forget a run of settled-looking samples that did not end the attempt.
+    fn clear_settled_ticks(&self, attempt: &Attempt) -> Result<()> {
+        if attempt.settled_ticks != 0 {
+            self.db.set_settled_ticks(attempt.id, 0)?;
         }
         Ok(())
+    }
+
+    /// Close an attempt whose evidence has cleared whatever bar it had to.
+    fn settle_now(
+        &self,
+        herdr: Option<&Herdr>,
+        task: &Task,
+        attempt: &Attempt,
+        status: AgentStatus,
+        why: &str,
+    ) -> Result<()> {
+        self.log.info(format!(
+            "{} agent {} with {why} — attempt done",
+            task.identifier,
+            status.as_str()
+        ));
+        self.settle(
+            herdr,
+            task,
+            attempt,
+            Settled::Finished,
+            task.pr_url.as_deref(),
+        )
     }
 
     /// Refresh what the board *displays* from herdr, and nothing else.
@@ -1610,6 +1649,131 @@ mod tests {
                 .outcome
                 .is_none()
         );
+    }
+
+    /// An attempt in a real checkout that has committed since it started.
+    ///
+    /// This is the weak artifact, and the reason it is weak:
+    /// `agent-conventions.md` tells dispatched agents to "commit even when you
+    /// are not opening a PR", so it is routinely present while the agent is
+    /// still mid-turn. Returns the worktree so the caller can clean it up.
+    fn dispatch_with_commits(e: &SyncEngine, task: &str, pane_id: &str) -> std::path::PathBuf {
+        let work = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", &wt])
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        let base = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &wt, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let a = e
+            .db
+            .insert_attempt(&crate::db::NewAttempt {
+                task_id: task.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: Some(wt.clone()),
+                branch: Some("board/lin-142".into()),
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: Some(base),
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, pane_id).unwrap();
+        // The mid-flight commit the conventions ask for.
+        std::fs::write(work.join("wip"), "half a feature").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "wip"]);
+        work
+    }
+
+    fn live(e: &SyncEngine) -> Attempt {
+        e.db.attempts_for("linear:LIN-142").unwrap().remove(0)
+    }
+
+    #[test]
+    fn commits_alone_need_two_settled_samples_before_the_attempt_closes() {
+        // gh#18. `idle` is a screen classification that flaps while an agent
+        // works, so one sample of it is not "finished" — and the weak artifact
+        // is already there, because the agent was told to commit mid-flight.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let work = dispatch_with_commits(&e, "linear:LIN-142", "w1:p9");
+
+        e.reconcile(&[pane("w1:p9", AgentStatus::Working)]).unwrap();
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        let a = live(&e);
+        assert!(
+            a.outcome.is_none(),
+            "one idle sample must not close an attempt that is still being worked"
+        );
+        assert_eq!(a.settled_ticks, 1);
+
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_idle_flap_mid_turn_leaves_the_attempt_running() {
+        // The failure this fixes: `pane.agent_status_changed` runs reconcile at
+        // the moment of the flap, not on the next 30s sweep, so a working agent
+        // that reads as `idle` for one sample used to be declared finished.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let work = dispatch_with_commits(&e, "linear:LIN-142", "w1:p9");
+
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Idle,
+            AgentStatus::Working,
+            AgentStatus::Idle,
+            AgentStatus::Working,
+        ] {
+            e.reconcile(&[pane("w1:p9", status)]).unwrap();
+        }
+        let a = live(&e);
+        assert!(a.outcome.is_none(), "an agent still working must still be working");
+        assert_eq!(a.settled_ticks, 0, "going back to work starts the count over");
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "and nothing was written back upstream"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_pull_request_settles_on_the_first_sample_that_sees_it() {
+        // The artifacts are tiered. A PR is the agent's own declaration that it
+        // is finished and cannot exist unless something ran, so it skips the
+        // debounce the commit count has to clear.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let work = dispatch_with_commits(&e, "linear:LIN-142", "w1:p9");
+        e.reconcile(&[pane("w1:p9", AgentStatus::Working)]).unwrap();
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/291"),
+            Some(291),
+            true,
+        )
+        .unwrap();
+
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]

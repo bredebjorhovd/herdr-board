@@ -988,6 +988,38 @@ each shape with the key that fits it: a running turn is done, text in the box
 wants Enter, and a pane still on its welcome screen wants the prompt again.
 That last one is the case three blind Enters could never fix.
 
+### And the same rule reading `working` off a dead agent
+
+The rule's detection region covers 20 non-empty lines, because a todo list
+between the spinner and the prompt box pushes a live spinner out of a smaller
+one. That reaches into scrollback, where Claude Code leaves spinner-glyph lines
+behind: a stale `✳ Tinkering…` from a turn that died, and past-tense summaries
+like `✻ Crunched for 3m 19s`. Three attempts reported `working` for over an hour
+with nothing running in them, after their agents died on Anthropic 5xx errors —
+holding concurrency slots, unable ever to settle, and so reported to nobody
+(gh#32).
+
+No width fixes that, in either direction, and narrowing the region only trades
+one failure for the other. What separates a live spinner from a frozen one is
+*change over time*, which a rule matching one screenshot cannot contain: the
+spinner carries an elapsed timer that ticks every second and a frame that rotates
+every 300ms, so a running turn physically cannot hold a screen still.
+
+So reconciliation resamples the pane. A `working` attempt whose visible screen is
+byte-identical to one taken at least 10 seconds earlier is not working, and:
+
+- with a pull request or commits, it settles like any agent that stopped;
+- with an `API Error: 5xx` on screen, it is reported **blocked** naming the
+  error, because what unsticks a 529 is a person retrying;
+- with nothing to show for itself, it is reported **blocked** as a stall.
+
+`blocked` rather than `failed`: the pane is still there with its checkout and its
+history, so retrying it or `x cancel`-ing the attempt back to `ready` is the
+operator's call — and it keeps counting against `max_concurrent_per_workspace`,
+which is honest, because it really is still holding a slot. A pane somebody has
+scrolled back in is skipped entirely: its visible screen does not move either,
+and that is the operator's doing, not the agent's.
+
 Two things it is not:
 
 - **Not hooks.** herdr accepts `pane report-agent` from anyone, but Claude

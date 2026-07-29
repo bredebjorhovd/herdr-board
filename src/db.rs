@@ -12,6 +12,41 @@ pub struct Db {
     pub conn: Connection,
 }
 
+/// Every column [`read_attempt`] expects, in the order it expects them.
+const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktree, branch, \
+     started_at, ended_at, outcome, missing_ticks, agent_status, \
+     dispatched_by, dispatched_by_pane, base_sha, saw_working, \
+     settled_ticks, screen_print, screen_at";
+
+/// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
+fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
+    Ok(Attempt {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        pane_id: r.get(2)?,
+        workspace: r.get(3)?,
+        runtime: r.get(4)?,
+        worktree: r.get(5)?,
+        branch: r.get(6)?,
+        started_at: r.get(7)?,
+        ended_at: r.get(8)?,
+        outcome: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| Outcome::parse(&s)),
+        missing_ticks: r.get(10)?,
+        agent_status: r
+            .get::<_, Option<String>>(11)?
+            .map(|s| AgentStatus::parse(&s)),
+        dispatched_by: r.get(12)?,
+        dispatched_by_pane: r.get(13)?,
+        base_sha: r.get(14)?,
+        saw_working: r.get::<_, i64>(15)? != 0,
+        settled_ticks: r.get(16)?,
+        screen_print: r.get(17)?,
+        screen_at: r.get(18)?,
+    })
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         if let Some(parent) = path.parent() {
@@ -93,7 +128,12 @@ impl Db {
               -- Last agent status herdr reported for this attempt's pane. The
               -- TUI reads it to render the dim `idle` marker without having to
               -- shell out to herdr itself.
-              agent_status TEXT
+              agent_status TEXT,
+              -- Digest of this pane's screen, and when that screen was *first*
+              -- seen. A `working` status whose screen has not changed since is
+              -- not a running turn — see gh#32 and `crate::screen::vitals`.
+              screen_print TEXT,
+              screen_at    TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -171,6 +211,11 @@ impl Db {
                 // commits alone. `idle` flaps mid-turn, so one is not enough —
                 // the mirror image of `missing_ticks`, see gh#18.
                 ("settled_ticks", "INTEGER NOT NULL DEFAULT 0"),
+                // The pane's screen last time we looked, and when that screen
+                // first appeared. Together they answer the question a manifest
+                // cannot: whether a spinner it matched is live (gh#32).
+                ("screen_print", "TEXT"),
+                ("screen_at", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -434,40 +479,17 @@ impl Db {
     }
 
     // ---- attempts -------------------------------------------------------
+    //
+    // Two queries read attempt rows and they must agree on the column order, so
+    // both share [`ATTEMPT_COLUMNS`] and [`read_attempt`]. They used to carry a
+    // copy each, which is a standing invitation for a column added to one and
+    // forgotten in the other.
 
     pub fn attempts_for(&self, task_id: &str) -> Result<Vec<Attempt>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
-                    started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, dispatched_by_pane, base_sha, saw_working,
-                    settled_ticks
-             FROM attempts WHERE task_id = ?1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![task_id], |r| {
-            Ok(Attempt {
-                id: r.get(0)?,
-                task_id: r.get(1)?,
-                pane_id: r.get(2)?,
-                workspace: r.get(3)?,
-                runtime: r.get(4)?,
-                worktree: r.get(5)?,
-                branch: r.get(6)?,
-                started_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                outcome: r
-                    .get::<_, Option<String>>(9)?
-                    .and_then(|s| Outcome::parse(&s)),
-                missing_ticks: r.get(10)?,
-                agent_status: r
-                    .get::<_, Option<String>>(11)?
-                    .map(|s| AgentStatus::parse(&s)),
-                dispatched_by: r.get(12)?,
-                dispatched_by_pane: r.get(13)?,
-                base_sha: r.get(14)?,
-                saw_working: r.get::<_, i64>(15)? != 0,
-                settled_ticks: r.get(16)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE task_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![task_id], read_attempt)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -560,6 +582,20 @@ impl Db {
         Ok(())
     }
 
+    /// Record the screen this pane is showing, and that it is showing it *now*.
+    ///
+    /// Only called when the screen has changed, which is what makes `screen_at`
+    /// mean "first seen": a screen resampled every few seconds has to keep
+    /// ageing, or it never reaches `screen::STALL_SECS` and a frozen pane is
+    /// watched forever (gh#32).
+    pub fn set_screen_sample(&self, attempt_id: i64, fingerprint: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET screen_print = ?2, screen_at = ?3 WHERE id = ?1",
+            params![attempt_id, fingerprint, now()],
+        )?;
+        Ok(())
+    }
+
     /// How many consecutive samples have looked finished on commits alone.
     /// Cleared, not latched: an agent that goes back to work starts over.
     pub fn set_settled_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {
@@ -572,36 +608,10 @@ impl Db {
 
     /// Live attempts across all tasks, for reconciliation and concurrency caps.
     pub fn live_attempts(&self) -> Result<Vec<Attempt>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, pane_id, workspace, runtime, worktree, branch,
-                    started_at, ended_at, outcome, missing_ticks, agent_status,
-                    dispatched_by, dispatched_by_pane, base_sha, saw_working,
-                    settled_ticks
-             FROM attempts WHERE outcome IS NULL ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Attempt {
-                id: r.get(0)?,
-                task_id: r.get(1)?,
-                pane_id: r.get(2)?,
-                workspace: r.get(3)?,
-                runtime: r.get(4)?,
-                worktree: r.get(5)?,
-                branch: r.get(6)?,
-                started_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                outcome: None,
-                missing_ticks: r.get(10)?,
-                agent_status: r
-                    .get::<_, Option<String>>(11)?
-                    .map(|s| AgentStatus::parse(&s)),
-                dispatched_by: r.get(12)?,
-                dispatched_by_pane: r.get(13)?,
-                base_sha: r.get(14)?,
-                saw_working: r.get::<_, i64>(15)? != 0,
-                settled_ticks: r.get(16)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE outcome IS NULL ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], read_attempt)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

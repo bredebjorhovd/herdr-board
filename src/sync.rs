@@ -6,6 +6,7 @@ use crate::db::{Db, NewWriteback, Reaped};
 use crate::herdr::{Herdr, PaneInfo};
 use crate::log::Logger;
 use crate::model::*;
+use crate::screen::{self, Vitals};
 use crate::settled::Settled;
 use crate::sources::github::{Github, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, Linear};
@@ -739,7 +740,28 @@ impl SyncEngine {
             // It came back — a handoff, not a death.
             self.db.set_missing_ticks(attempt.id, 0)?;
         }
-        let status = pane.agent_status.unwrap_or(AgentStatus::Unknown);
+        let reported = pane.agent_status.unwrap_or(AgentStatus::Unknown);
+        // gh#32: `working` is the one status herdr can hold long after the turn
+        // it was reported for ended. The detection region reaches 20 non-empty
+        // lines up the screen — it has to, or a todo list hides a live spinner —
+        // and Claude Code leaves spinner-glyph lines in scrollback: a stale
+        // `✳ Tinkering…` from a turn that died on an Anthropic 5xx, or a
+        // past-tense `✻ Crunched for 3m 19s`. Three attempts sat `working` for
+        // over an hour on lines like those, holding slots, unable to settle,
+        // with nothing said to the operator or to the pane that released them.
+        //
+        // No manifest can fix it: it matches one screenshot, and the fact that
+        // separates a live spinner from a frozen one is change over time. So
+        // when herdr says `working`, ask the pane whether anything is moving.
+        let vitals = self.vitals(herdr, attempt, pane, reported);
+        // A frozen screen is not a running turn. Reading it as `idle` puts the
+        // attempt back on the ordinary settle path — a pull request or commits
+        // end it, exactly as they would for an agent that stopped cleanly — and
+        // the dead ends below are where a stall gets named for what it is.
+        let status = match vitals {
+            Vitals::Frozen { .. } => AgentStatus::Idle,
+            Vitals::Alive | Vitals::Watching => reported,
+        };
         // An agent that has just started waiting on you is more urgent than one
         // that has finished: it is burning wall-clock right now, and nothing
         // else on screen says so unless you happen to be looking at the board.
@@ -755,7 +777,9 @@ impl SyncEngine {
             ));
         }
         // Persist it so the TUI can render the dim `idle` marker without
-        // shelling out to herdr on its own tick.
+        // shelling out to herdr on its own tick. A frozen pane is written `idle`
+        // here and refined to `blocked` by `report_stalled` further down, inside
+        // this same pass — nothing re-derives in between.
         self.db.set_attempt_status(attempt.id, status)?;
         // Latch that the agent actually got going, so a settled status can be
         // told apart from one that never started.
@@ -780,6 +804,18 @@ impl SyncEngine {
         if task.pr_open {
             return self.settle_now(herdr, task, attempt, status, "PR");
         }
+        // gh#32: an `API Error: 5xx` on a frozen screen is the cause named
+        // outright, and it outranks the commits below. Commits mean the agent
+        // got somewhere, not that it finished — `agent-conventions.md` tells
+        // dispatched agents to commit even without a PR — and settling one that
+        // died mid-task as `finished` would tell the operator the opposite of
+        // what happened. A human retrying is what unsticks a 529, so say so.
+        if let Vitals::Frozen {
+            api_error: Some(err),
+        } = &vitals
+        {
+            return self.report_stalled(herdr, task, attempt, Some(err));
+        }
         // Commits on the attempt branch are evidence too — an agent that
         // commits locally and stops would otherwise sit `working` forever —
         // but they are much weaker. `agent-conventions.md` tells dispatched
@@ -793,6 +829,14 @@ impl SyncEngine {
         if !attempt.saw_working
             || !self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
         {
+            // Nothing to settle on. This is where an attempt used to disappear:
+            // herdr said `working`, so it never got here at all, and the row sat
+            // in the WORKING section with no agent behind it and no end in sight.
+            // A frozen screen with nothing to show for it is not a finished
+            // attempt either — it is one that needs a person (gh#32).
+            if matches!(vitals, Vitals::Frozen { .. }) {
+                return self.report_stalled(herdr, task, attempt, None);
+            }
             return self.clear_settled_ticks(attempt);
         }
         // gh#18: and one settled sample is not "finished". `idle` is a screen
@@ -814,6 +858,115 @@ impl SyncEngine {
             return Ok(());
         }
         self.settle_now(herdr, task, attempt, status, "commits")
+    }
+
+    /// Ask a pane herdr calls `working` whether anything is actually moving.
+    ///
+    /// The rule itself is [`crate::screen::vitals`], which is pure. This is the
+    /// clock and the storage around it: read the screen, compare it against the
+    /// one recorded for this attempt, and record the new one when it differs so
+    /// that `screen_at` keeps meaning *first seen*.
+    ///
+    /// Costs one `herdr pane read` per live `working` attempt per reconcile —
+    /// bounded by `max_concurrent_per_workspace`, which is 3 by default, and only
+    /// paid for attempts whose status is the one that can lie. Not rate-limited
+    /// on purpose: `pane.agent_status_changed` fires reconciliation between
+    /// daemon cycles, and skipping the read on those ticks would hand back
+    /// [`Vitals::Watching`] for a pane already known to be frozen — which reads
+    /// as `working`, and clears the settled-tick run gh#18 needs two of.
+    fn vitals(
+        &self,
+        herdr: Option<&Herdr>,
+        attempt: &Attempt,
+        pane: &PaneInfo,
+        reported: AgentStatus,
+    ) -> Vitals {
+        // Only `working` is in question. `blocked` is a dialog on screen, which
+        // is a thing one sample can see and which is *supposed* to hold still;
+        // the settled statuses already lead somewhere sensible.
+        if reported != AgentStatus::Working {
+            return Vitals::Watching;
+        }
+        // Somebody is reading this pane's scrollback, so the visible screen is
+        // not the live one and would not move even for a working agent.
+        if pane.scroll_offset > 0 {
+            return Vitals::Watching;
+        }
+        let Some(h) = herdr else {
+            return Vitals::Watching;
+        };
+        let Some(screen) = h.pane_read_visible(&pane.pane_id) else {
+            // A screen we could not read is a question left open, exactly as it
+            // is for delivery. Never an accusation.
+            return Vitals::Watching;
+        };
+        // Both halves or neither. A print that cannot be aged cannot conclude
+        // anything — and an attempt carrying one from before this check existed
+        // would otherwise be compared forever against a timestamp it never had,
+        // so it is treated as a first look and restamped below.
+        let previous = match (attempt.screen_print.as_deref(), attempt.screen_at.as_deref()) {
+            (Some(fingerprint), Some(at)) => chrono::DateTime::parse_from_rfc3339(at)
+                .ok()
+                .map(|t| screen::Sample {
+                    fingerprint,
+                    age_secs: (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds(),
+                }),
+            _ => None,
+        };
+        let vitals = screen::vitals(previous, &screen);
+        if previous.is_none() || vitals == Vitals::Alive {
+            // The screen moved (or this is the first look), so this is the
+            // moment it started showing what it shows. A frozen one is left
+            // alone deliberately: overwriting its timestamp would restart the
+            // clock every tick and it could never be called frozen again.
+            if let Err(e) = self
+                .db
+                .set_screen_sample(attempt.id, &screen::fingerprint(&screen))
+            {
+                self.log
+                    .warn(format!("recording {}'s screen: {e}", pane.pane_id));
+            }
+        }
+        vitals
+    }
+
+    /// Report an attempt whose pane has stopped moving, with the reason when the
+    /// screen names one.
+    ///
+    /// `blocked`, not `failed` and not settled. The work is not finished and the
+    /// attempt is not over: the pane is still there, holding its checkout and its
+    /// history, and what unsticks a 529 is a person — retrying it, or cancelling
+    /// the attempt back to `ready`. `blocked` is the state that says "needs you"
+    /// and that keeps counting against `max_concurrent_per_workspace`, which is
+    /// honest, because the pane really is still occupying a slot.
+    fn report_stalled(
+        &self,
+        herdr: Option<&Herdr>,
+        task: &Task,
+        attempt: &Attempt,
+        api_error: Option<&str>,
+    ) -> Result<()> {
+        let why = match api_error {
+            Some(err) => format!("stalled — {err}"),
+            None => format!(
+                "stalled — its screen has not changed in {}s",
+                screen::STALL_SECS
+            ),
+        };
+        // Once, on the way in. A pane can sit frozen for hours and the operator
+        // should not be told about it on every cycle.
+        if attempt.agent_status != Some(AgentStatus::Blocked) {
+            self.log.warn(format!(
+                "{} pane {} reports working but nothing is running — {why}",
+                task.identifier,
+                attempt.pane_id.as_deref().unwrap_or("?")
+            ));
+            self.notify_settled(herdr, task, &truncate_for_toast(&why));
+        }
+        self.db
+            .set_attempt_status(attempt.id, AgentStatus::Blocked)?;
+        // Whatever the last samples were counting towards, it was not this.
+        self.clear_settled_ticks(attempt)
     }
 
     /// Forget a run of settled-looking samples that did not end the attempt.
@@ -1552,6 +1705,7 @@ mod tests {
             focused: false,
             label: None,
             cwd: None,
+            scroll_offset: 0,
         }
     }
 

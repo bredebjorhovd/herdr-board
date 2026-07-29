@@ -2925,6 +2925,28 @@ mod tests {
     }
 
     #[test]
+    fn reconciling_without_a_herdr_handle_cannot_wake_anyone() {
+        // The event-driven reconcile passed `None` and therefore woke nobody,
+        // for a day, silently — while the 30s poll, which does pass a handle,
+        // almost never got there first. `pane.agent_status_changed` fires on
+        // exactly the transition that means "an agent finished".
+        //
+        // Pins the shape rather than the plumbing: the no-handle path must not
+        // be reachable from a caller that has one.
+        let src = include_str!("cli.rs");
+        let reconcile_once = src
+            .split("pub fn reconcile_once")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("reconcile_once exists");
+        assert!(
+            reconcile_once.contains("reconcile_with(&panes, Some(&herdr))"),
+            "reconcile_once has a herdr handle and must pass it, or a settle \
+             noticed here wakes nobody"
+        );
+    }
+
+    #[test]
     fn a_retry_does_not_inherit_the_cancelled_runs_commits() {
         // herdr-board#10, seen live on gh#71: cancelled after 10 minutes and
         // four commits, re-dispatched onto the same branch, marked `done` 62

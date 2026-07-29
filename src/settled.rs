@@ -211,7 +211,15 @@ impl SyncEngine {
             // The operator's notification already covers both of these.
             Notice::Disabled | Notice::NobodyToWake => return,
         };
-        let Some(h) = herdr else { return };
+        // A planned wake with no handle is a bug in the caller, not a decision
+        // — it is how the event-driven reconcile silently woke nobody for a day.
+        let Some(h) = herdr else {
+            self.log.warn(format!(
+                "{}: wanted to wake {pane_id} but this path has no herdr handle",
+                task.identifier
+            ));
+            return;
+        };
 
         // Asked fresh rather than read off the cycle's pane list: that list was
         // taken before reconciliation ran, and this is about to type into

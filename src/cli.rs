@@ -81,7 +81,13 @@ pub fn reconcile_once(paths: &Paths, log: Arc<Logger>) -> Result<()> {
     let engine = engine_from_paths(paths, log.clone())?;
     let herdr = Herdr::discover(log.clone());
     let panes = herdr.pane_list()?;
-    engine.reconcile(&panes)?;
+    // With the handle, not without it. This is what `pane.agent_status_changed`
+    // fires, and an agent finishing *is* a status change — so this path notices
+    // a settle before the 30s poll does, every time. Reconciling without herdr
+    // meant the settle that mattered most was the one that could not wake
+    // anybody: `wake_dispatcher` needs a handle to talk to the pane, and
+    // silently did nothing without one.
+    engine.reconcile_with(&panes, Some(&herdr))?;
     engine.rederive_all()?;
     // Also what `pane.created` fires: opening a pane in a repo the board has
     // never seen is the moment to notice it, rather than up to a poll interval
@@ -904,7 +910,9 @@ pub fn wait_for(
     loop {
         // Pane state only — no network, so this is cheap enough to run often.
         if let Ok(panes) = herdr.pane_list() {
-            let _ = engine.reconcile(&panes);
+            // Same reason as `reconcile_once`: an attempt can settle inside this
+            // loop, and settling is what wakes a dispatcher.
+            let _ = engine.reconcile_with(&panes, Some(&herdr));
         }
         engine.rederive_all()?;
 

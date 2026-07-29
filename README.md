@@ -1118,6 +1118,17 @@ resolved here rather than guessed at repeatedly.
   transition at all.
 - **Branch template follows the impl spec** (`board/{identifier_lower}` →
   `board/lin-145`), not the design fixtures. It is config either way.
+- **`{identifier_lower}` carries the repo for GitHub rows** — `gh#2` in
+  `Florin-AS/tripletex-mcp` renders `board/gh-2-tripletex-mcp`, not `board/gh-2`.
+  GitHub numbers issues per repository, so the identifier on screen is unique in
+  its repo and nowhere else, while the branch is a key the board makes real
+  decisions with: which pull request belongs to which task, and which polled
+  pull request is already somebody's attempt. Unqualified, a *merged* PR in one
+  repo attached itself to an untouched task in another and derived it straight to
+  review. The identifier leads and the repo follows so that herdr's 32-character
+  agent-name cap truncates the repo rather than the number telling two issues
+  apart. Linear identifiers carry their team and are globally unique, so
+  `board/lin-145` is unchanged.
 - **Daemon liveness and source freshness are separate clocks.** During an outage
   the daemon keeps cycling on time while the sources go stale, so the header
   shows a live daemon and `last synced 4m`. Conflating them would report a dead

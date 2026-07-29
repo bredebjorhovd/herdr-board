@@ -443,6 +443,9 @@ labels = ["herd"]
 {linear_routes}{routes}
 [defaults]
 max_concurrent_per_workspace = 3
+# The identifier made branch-safe: `LIN-145` → `lin-145`. GitHub numbers issues
+# per repository, so a GitHub identifier carries its repo as well — `gh#2` in
+# tripletex-mcp is `gh-2-tripletex-mcp`.
 branch_template = "board/{{identifier_lower}}"
 # When an agent releases work through the board, prompt it in its own pane once
 # that work settles, instead of only raising a notification at you. Off, because

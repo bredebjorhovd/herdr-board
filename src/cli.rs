@@ -150,6 +150,14 @@ pub fn running_pid(paths: &Paths) -> Option<u32> {
     if unsafe { libc::kill(pid as i32, 0) } != 0 {
         return None;
     }
+    // Existence is not liveness. A killed daemon whose parent has not reaped it
+    // stays in the process table as a zombie, and `kill(pid, 0)` succeeds on one
+    // — so `--ensure` saw "already running", started nothing, and `doctor`
+    // reported a daemon that had been dead for hours. The board kept looking
+    // healthy while nothing polled, reconciled, or woke anybody.
+    if process_state(pid).is_some_and(|s| s.starts_with('Z')) {
+        return None;
+    }
     // The pid may have been recycled by an unrelated process; compare the
     // process start time to be sure it is still ours.
     if !recorded_start.is_empty() {
@@ -165,6 +173,19 @@ fn write_pidfile(paths: &Paths, pid: u32) -> Result<()> {
     let start = process_start(pid).unwrap_or_default();
     std::fs::write(paths.pidfile(), format!("{pid} {start}"))?;
     Ok(())
+}
+
+/// Process state as `ps` reports it: `Z` for a zombie, `S`/`R` for a live one.
+///
+/// Read rather than inferred, because the difference between "in the process
+/// table" and "running" is exactly what a zombie erases.
+fn process_state(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Process start time, used to detect a recycled pid.

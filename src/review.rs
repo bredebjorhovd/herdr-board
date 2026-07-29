@@ -869,6 +869,7 @@ mod tests {
             ended_at: Some("2026-07-28T10:00:00Z".into()),
             outcome: Some(Outcome::Done),
             missing_ticks: 0,
+            settled_ticks: 0,
             agent_status: Some(AgentStatus::Idle),
             dispatched_by: None,
             dispatched_by_pane: None,

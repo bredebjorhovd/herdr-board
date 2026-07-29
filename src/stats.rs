@@ -245,6 +245,7 @@ mod tests {
                 .map(|_| crate::db::rfc3339(start + chrono::Duration::minutes(ran_for))),
             outcome,
             missing_ticks: 0,
+            settled_ticks: 0,
             agent_status: None,
             dispatched_by: by.map(str::to_string),
             dispatched_by_pane: pane.map(str::to_string),

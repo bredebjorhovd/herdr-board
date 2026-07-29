@@ -456,6 +456,12 @@ pub struct Attempt {
     /// stops a freshly-started `idle` agent from being reaped before its
     /// prompt has even been delivered.
     pub saw_working: bool,
+    /// Consecutive samples that looked finished on *commits alone*. Settling
+    /// waits for 2, because `idle` is a screen classification that flaps while
+    /// an agent works, not a stable fact — one badly-timed sample would close
+    /// an attempt mid-turn (gh#18). The mirror image of `missing_ticks`; a PR
+    /// bypasses it entirely.
+    pub settled_ticks: i64,
 }
 
 impl Attempt {

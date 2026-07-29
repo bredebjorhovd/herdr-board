@@ -328,6 +328,7 @@ mod tests {
             ended_at: None,
             outcome: None,
             missing_ticks: 0,
+            settled_ticks: 0,
             agent_status: None,
             dispatched_by: dispatched_by.map(str::to_string),
             dispatched_by_pane: pane.map(str::to_string),

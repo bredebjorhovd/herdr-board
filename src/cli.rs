@@ -1235,16 +1235,7 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
             checks.push(Check {
                 name: "settle notice".into(),
                 ok: true,
-                detail: if cfg.defaults.notify_dispatcher {
-                    "on — an agent that released work is prompted in its own pane \
-                     when that work settles"
-                        .into()
-                } else {
-                    "off — only you are notified when released work settles; the agent \
-                     that released it waits to be asked (`[defaults] notify_dispatcher \
-                     = true` to enable)"
-                        .into()
-                },
+                detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
             });
 
             // The one Linear state the board resolves by name, so the one that
@@ -1404,6 +1395,26 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
     });
 
     Ok(checks)
+}
+
+/// Whether a dispatching agent is told its released work settled.
+///
+/// The one setting whose failure is invisible: writeback failing leaves a ticket
+/// open, an unresolvable review state is reported by name, but a notice that
+/// never fires produces nothing at all — no error, no log line, no changed row.
+/// It reads as "nobody told me" rather than "the board is misconfigured", which
+/// is why it belongs in `doctor` next to the other two.
+fn settle_notice_detail(notify_dispatcher: bool) -> String {
+    if notify_dispatcher {
+        "on — an agent that released work is prompted in its own pane \
+         when that work settles"
+            .into()
+    } else {
+        "off — only you are notified when released work settles; the agent \
+         that released it waits to be asked (`[defaults] notify_dispatcher \
+         = true` to enable)"
+            .into()
+    }
 }
 
 /// Which repos the board will write to, by name.
@@ -1849,6 +1860,42 @@ mod tests {
         // And with nothing configured it says so rather than listing nothing.
         let none: RoutingConfig = toml::from_str("[github]\nrepos = []\n").unwrap();
         assert!(writeback_detail(&none.github).contains("no repos"));
+    }
+
+    /// gh#27. A notice that never fires is the one failure that produces
+    /// nothing to look at, so the line saying whether it is on has to be there
+    /// in both states — and has to name the key, since that is what the
+    /// operator has to go and change.
+    #[test]
+    fn doctor_says_whether_the_dispatcher_is_told() {
+        let on = settle_notice_detail(true);
+        assert!(on.starts_with("on —"), "{on}");
+        assert!(on.contains("released work is prompted"), "{on}");
+
+        let off = settle_notice_detail(false);
+        assert!(off.starts_with("off —"), "{off}");
+        assert!(
+            off.contains("notify_dispatcher"),
+            "off has to name the key to turn it on: {off}"
+        );
+    }
+
+    /// And the check itself stays in the report. The detail being right is no
+    /// use if nothing pushes it — which is the shape gh#27 was filed as.
+    #[test]
+    fn doctor_emits_the_settle_notice_check() {
+        let p = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
+        )
+        .unwrap();
+        let checks = doctor(&p).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "settle notice")
+            .expect("doctor is silent about notify_dispatcher");
+        assert!(c.detail.starts_with("on —"), "{:?}", c.detail);
     }
 
     #[test]

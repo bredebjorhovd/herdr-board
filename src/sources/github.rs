@@ -9,10 +9,18 @@ use serde_json::Value;
 
 pub const API: &str = "https://api.github.com";
 
-/// GitHub's maximum page size. Nothing here paginates: one page is enough for
-/// every repo the board is pointed at, and a caller that gets exactly this many
-/// rows back knows to say "or more" rather than pretending to a total.
+/// GitHub's maximum page size. `issues` walks pages until one comes back short;
+/// `open_issues` deliberately reads only the first, because it exists to preview
+/// roughly how much a repo would put on the board rather than to enumerate it.
 pub const PAGE: usize = 100;
+
+/// How many pages of issues to walk before giving up.
+///
+/// A ceiling rather than a limit: the loop stops on the first short page, so
+/// this only bites on a repo with thousands of issues — where returning a
+/// partial set would be worse than an error, because reaping deletes whatever
+/// is not in it.
+pub const MAX_PAGES: usize = 20;
 
 /// The REST surface we use. A seam, so tests never touch the network.
 pub trait Rest {
@@ -267,12 +275,41 @@ impl<T: Rest> Github<T> {
 
     /// Issues for a repo. GitHub's issues endpoint also returns pull requests;
     /// those carry a `pull_request` key and are filtered out here.
+    ///
+    /// **Paginated, and it has to be.** This endpoint returns issues *and* pull
+    /// requests, the PRs are discarded only after a page is cut, and it sorts by
+    /// `created` — so every pull request the board opens is newer than every
+    /// issue and pushes the oldest issues off the first page. On
+    /// bredebjorhovd/itsm-agent after 30 dispatches: 100 items on page one, 44
+    /// of them pull requests, 56 issues surviving, and 29 items on a second page
+    /// nobody fetched. Seven open issues were absent, and because a task with no
+    /// attempts is *deleted* when reaped, they vanished from the board with no
+    /// `gone` flag and no error — `dispatch` just answered `no task` (gh#31).
     pub fn issues(&self, repo: &str, labels: &[String]) -> Result<Vec<GithubIssue>> {
-        let mut path = format!("/repos/{repo}/issues?state=all&per_page={PAGE}");
-        if !labels.is_empty() {
-            path.push_str(&format!("&labels={}", labels.join(",")));
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let mut path =
+                format!("/repos/{repo}/issues?state=all&per_page={PAGE}&page={page}");
+            if !labels.is_empty() {
+                path.push_str(&format!("&labels={}", labels.join(",")));
+            }
+            // Length *before* the pull-request filter: a short page is what says
+            // the sequence is exhausted, and filtering first would make a page
+            // full of PRs look like the end of the issues.
+            let (issues, raw) = self.issue_page_counted(repo, &path)?;
+            out.extend(issues);
+            if raw < PAGE {
+                return Ok(out);
+            }
         }
-        self.issue_page(repo, &path)
+        // Ran out of pages before the API ran out of issues. Reaping on this
+        // would delete whatever is beyond it, so say so rather than returning a
+        // set that looks complete.
+        bail!(
+            "{repo} has more than {} issues and pull requests; refusing to \
+             report a partial set",
+            PAGE * MAX_PAGES
+        )
     }
 
     /// Open issues only, unfiltered — what adopting a repo unfiltered would put
@@ -286,15 +323,30 @@ impl<T: Rest> Github<T> {
     }
 
     fn issue_page(&self, repo: &str, path: &str) -> Result<Vec<GithubIssue>> {
+        Ok(self.issue_page_counted(repo, path)?.0)
+    }
+
+    /// One page, plus how many items the API actually returned.
+    ///
+    /// The raw count is the only thing that says whether there is another page.
+    /// The parsed count cannot: this endpoint mixes pull requests in with the
+    /// issues, so a full page can yield very few issues and still have more
+    /// behind it.
+    fn issue_page_counted(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<(Vec<GithubIssue>, usize)> {
         let v = self.rest.get(path)?;
         let arr = v
             .as_array()
             .ok_or_else(|| anyhow!("github issues: expected an array"))?;
-        Ok(arr
+        let issues = arr
             .iter()
             .filter(|n| n.get("pull_request").is_none())
             .filter_map(|n| parse_issue(repo, n))
-            .collect())
+            .collect();
+        Ok((issues, arr.len()))
     }
 
     /// Leave the same trail as Linear gets.
@@ -619,6 +671,62 @@ mod tests {
         assert_eq!(issues[0].number, 87);
         assert_eq!(issues[0].task_id(), "gh:o/r#87");
         assert_eq!(issues[0].identifier(), "gh#87");
+    }
+
+    #[test]
+    fn a_full_page_of_pull_requests_does_not_end_the_issue_walk() {
+        // gh#31, measured on bredebjorhovd/itsm-agent: page one held 100 items,
+        // 44 of them pull requests, leaving 56 issues — and 29 items sat on a
+        // page nobody fetched. This endpoint sorts by `created`, so every PR the
+        // board opens is newer than every issue and pushes the oldest issues off
+        // page one. Seven open issues were absent, and a reaped task with no
+        // attempts is *deleted*, so they left the board with no `gone` flag and
+        // no error.
+        //
+        // The walk must key on the raw item count, not the issue count: a page
+        // that is all pull requests yields zero issues and still has more behind
+        // it.
+        let mut page1: Vec<serde_json::Value> = (0..PAGE)
+            .map(|i| {
+                json!({ "number": 1000 + i, "node_id": "p", "title": "a pr",
+                        "html_url": "u", "state": "open", "updated_at": "t",
+                        "pull_request": { "url": "x" } })
+            })
+            .collect();
+        page1.truncate(PAGE);
+        let g = Github::new(FixtureRest::new(vec![
+            ("/repos/o/r/issues?state=all&per_page=100&page=1".into(), json!(page1)),
+            (
+                "/repos/o/r/issues?state=all&per_page=100&page=2".into(),
+                json!([{ "number": 3, "node_id": "n", "title": "the old issue",
+                         "html_url": "u", "state": "open", "updated_at": "t",
+                         "labels": [] }]),
+            ),
+        ]));
+        let issues = g.issues("o/r", &[]).unwrap();
+        assert_eq!(
+            issues.len(),
+            1,
+            "the issue on page two must be found even though page one yielded none"
+        );
+        assert_eq!(issues[0].number, 3);
+    }
+
+    #[test]
+    fn an_unwalkable_repo_errors_rather_than_reporting_a_partial_set() {
+        // Reaping deletes what is not in the returned set, so a set that might be
+        // incomplete must not be returned as if it were complete. The caller
+        // treats an error as "do not reap"; a short set would be treated as truth.
+        let full: Vec<serde_json::Value> = (0..PAGE)
+            .map(|i| {
+                json!({ "number": 1000 + i, "node_id": "p", "title": "a pr",
+                        "html_url": "u", "state": "open", "updated_at": "t",
+                        "pull_request": { "url": "x" } })
+            })
+            .collect();
+        let g = Github::new(FixtureRest::new(vec![("/repos/o/r/issues".into(), json!(full))]));
+        let err = g.issues("o/r", &[]).unwrap_err().to_string();
+        assert!(err.contains("refusing to report a partial set"), "{err}");
     }
 
     #[test]

@@ -77,26 +77,31 @@ impl Settled {
 
     /// The outcome line the dispatcher reads. Says more than the toast, which
     /// has a width limit and a person reading it; this has neither.
-    fn line(self, has_pr: bool) -> &'static str {
-        match (self, has_pr) {
+    ///
+    /// `pr_known` is what the board has *recorded*, not what GitHub holds — see
+    /// [`compose`] for why the difference matters and why nothing here claims a
+    /// pull request is absent.
+    fn line(self, pr_known: bool) -> &'static str {
+        match (self, pr_known) {
             (Settled::Finished, true) => "finished — pull request open",
-            (Settled::Finished, false) => "finished — committed, but opened no pull request",
+            (Settled::Finished, false) => "finished — committed",
             (Settled::PaneExited, _) => "failed — its pane exited before the work was finished",
             (Settled::NeverStarted, _) => "failed — its agent never started",
         }
     }
 
     /// What the dispatcher can do about it, which is the only reason to wake it.
-    fn what_now(self, has_pr: bool) -> &'static str {
-        match (self, has_pr) {
+    fn what_now(self, pr_known: bool) -> &'static str {
+        match (self, pr_known) {
             (Settled::Finished, true) => {
                 "Review it when you are ready. The pane that wrote it stays open until the \
                  task leaves review, so comments you write on the pull request reach the \
                  agent that wrote it."
             }
             (Settled::Finished, false) => {
-                "It committed without opening a pull request, so nothing is up for review \
-                 yet. The worktree above is where the work is."
+                "The branch above is where the work is. The board records pull requests on \
+                 its poll cycle and has none for this task yet, which is not the same as \
+                 there being none — check the branch before opening one."
             }
             _ => {
                 "Nothing was delivered and its pane is gone. Re-dispatch it if the work \
@@ -156,14 +161,33 @@ pub fn still_holds_the_dispatcher(pane: &PaneInfo, dispatcher: Option<&Attempt>)
 /// Enough to act on without a lookup: which task, how it ended, and where the
 /// result is. An orchestrator that has to run `herdr-board list` to find out
 /// what it was just told is barely better off than one that was never told.
+///
+/// ## Absent is not the same as none (gh#29)
+///
+/// `pr_url` says what the board has recorded, and the board records pull
+/// requests on the poll cycle while an attempt settles on *commits*, which are
+/// local and instant. Between an agent pushing a pull request and the board
+/// learning of it there is a window, and a settle lands inside it reliably —
+/// an agent opens its pull request moments after the last commit that triggered
+/// the settle. So a missing `pr_url` here means "not polled yet" at least as
+/// often as it means "never opened".
+///
+/// The notice therefore never asserts an absence it has not checked. It says
+/// what it knows — committed, on this branch, in this worktree — and stops. A
+/// dispatcher told a branch exists will find the pull request on it; one told
+/// there is none runs `gh pr create` and gets "a pull request already exists".
+///
+/// Re-reading GitHub for the one task would also fix this, at the price of an
+/// API call inside the settle path. The notice does not need to be complete, it
+/// needs to not be wrong.
 pub fn compose(task: &Task, attempt: &Attempt, settled: Settled, pr_url: Option<&str>) -> String {
-    let has_pr = pr_url.is_some();
+    let pr_known = pr_url.is_some();
     let mut s = format!(
         "herdr-board: work you released has settled.\n\n  \
          {} · {}\n  {}\n",
         task.identifier,
         task.title,
-        settled.line(has_pr)
+        settled.line(pr_known)
     );
     if let Some(url) = pr_url {
         s.push_str(&format!("  {url}\n"));
@@ -173,11 +197,11 @@ pub fn compose(task: &Task, attempt: &Attempt, settled: Settled, pr_url: Option<
     }
     // Only when there is no pull request to point at. With one, the URL is the
     // thing to act on and a path beside it is noise.
-    if !has_pr && let Some(worktree) = attempt.worktree.as_deref() {
+    if !pr_known && let Some(worktree) = attempt.worktree.as_deref() {
         s.push_str(&format!("  worktree {worktree}\n"));
     }
     s.push('\n');
-    s.push_str(settled.what_now(has_pr));
+    s.push_str(settled.what_now(pr_known));
     s.push_str(
         "\n\nYou are being told because you released this task. \
          `[defaults] notify_dispatcher = false` stops it.\n",
@@ -441,14 +465,40 @@ mod tests {
         assert!(!m.contains("/wt/age-25-1"), "{m}");
     }
 
-    /// The board settles on commits too, so "finished" does not imply a PR —
-    /// and a dispatcher told to go and review one that does not exist would go
-    /// looking for it.
+    /// The board settles on commits too, so "finished" does not imply a
+    /// recorded PR — and a dispatcher told to go and review one the board has
+    /// not got would go looking for it. It gets the branch and the worktree.
     #[test]
-    fn finishing_without_a_pull_request_says_so_and_points_at_the_worktree() {
+    fn finishing_without_a_known_pull_request_points_at_the_branch_and_worktree() {
         let m = compose(&task(), &attempt(None, Some("w1:p4")), Settled::Finished, None);
-        assert!(m.contains("opened no pull request"), "{m}");
+        assert!(m.contains("finished — committed"), "{m}");
+        assert!(m.contains("board/age-25"), "{m}");
         assert!(m.contains("/wt/age-25-1"), "{m}");
+    }
+
+    /// gh#29. An attempt settles on commits, which are local and instant; the
+    /// board learns of pull requests on the poll cycle. A settle lands inside
+    /// that window reliably, because an agent opens its pull request moments
+    /// after the last commit that triggered the settle — so a missing `pr_url`
+    /// is "not polled yet" as often as it is "never opened", and the notice
+    /// must not turn one into the other. The cost of getting this wrong was a
+    /// dispatcher running `gh pr create` against a PR that already existed.
+    #[test]
+    fn an_unpolled_pull_request_is_never_reported_as_an_absent_one() {
+        let m = compose(&task(), &attempt(None, Some("w1:p4")), Settled::Finished, None);
+        // No claim about what GitHub holds, in either the outcome line or the
+        // advice — both said it before, and both are read.
+        for claim in [
+            "opened no pull request",
+            "no pull request",
+            "without opening a pull request",
+            "nothing is up for review",
+        ] {
+            assert!(!m.contains(claim), "claims {claim:?} it never checked: {m}");
+        }
+        // And it sends the dispatcher to the branch, where a PR it has not
+        // recorded is still findable.
+        assert!(m.contains("check the branch"), "{m}");
     }
 
     #[test]
@@ -495,4 +545,3 @@ mod tests {
         );
     }
 }
-

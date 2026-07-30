@@ -119,8 +119,15 @@ worktree when you stop reads as an agent that did nothing, and the row sits in
 The two artifacts are not weighed the same. A pull request is your own statement
 that you are finished, so it settles the attempt on the first idle sample.
 Commits are not — you were told to make them mid-flight — so the board waits for
-two consecutive idle samples before settling on them, and any sample that says
-`working` starts that over. Open the PR when you want the row to move promptly.
+a full minute of the pane going on looking idle before settling on them, and any
+sample that says `working` starts that minute over. Open the PR when you want the
+row to move promptly.
+
+**A settle is not final.** If the board closes your attempt while you are still
+working, it notices: a closed attempt whose pane is still moving is re-opened,
+the row goes back to `working`, and the count of times that happened is kept on
+the attempt. You do not need to do anything about it, and it is not recorded as a
+retry — nothing was re-dispatched.
 
 `herdr-board doctor` explains a board that looks wrong: missing keys, unreachable
 repos, routes pointing at workspaces that do not exist. Prefer it to guessing.

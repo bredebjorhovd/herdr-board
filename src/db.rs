@@ -16,7 +16,7 @@ pub struct Db {
 const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktree, branch, \
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
-     settled_ticks, screen_print, screen_at";
+     settled_at, reopened, screen_print, screen_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -41,9 +41,10 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         dispatched_by_pane: r.get(13)?,
         base_sha: r.get(14)?,
         saw_working: r.get::<_, i64>(15)? != 0,
-        settled_ticks: r.get(16)?,
-        screen_print: r.get(17)?,
-        screen_at: r.get(18)?,
+        settled_at: r.get(16)?,
+        reopened: r.get(17)?,
+        screen_print: r.get(18)?,
+        screen_at: r.get(19)?,
     })
 }
 
@@ -115,7 +116,13 @@ impl Db {
               ended_at     TEXT,
               outcome      TEXT,
               missing_ticks INTEGER NOT NULL DEFAULT 0,
-              settled_ticks INTEGER NOT NULL DEFAULT 0,
+              -- When this attempt first looked finished on commits alone. A
+              -- duration, not a count of samples: reconciliation runs on
+              -- demand, so two samples can share a second (gh#34).
+              settled_at   TEXT,
+              -- How often the board closed this attempt and then found its
+              -- pane working again (gh#34).
+              reopened     INTEGER NOT NULL DEFAULT 0,
               -- Task id of the parent that released this one, when the board
               -- dispatched that parent too. NULL on its own does not mean
               -- "you": an orchestrator pane has no attempt and so no task id.
@@ -207,10 +214,18 @@ impl Db {
                 // Has this attempt ever been observed working? An agent that
                 // was never seen working cannot have finished.
                 ("saw_working", "INTEGER NOT NULL DEFAULT 0"),
-                // Consecutive samples that would have settled this attempt on
-                // commits alone. `idle` flaps mid-turn, so one is not enough —
-                // the mirror image of `missing_ticks`, see gh#18.
-                ("settled_ticks", "INTEGER NOT NULL DEFAULT 0"),
+                // When this attempt first looked finished on commits alone.
+                // `idle` flaps mid-turn, so one sample is not enough — and
+                // neither were the two consecutive samples gh#18 asked for,
+                // because reconciliation runs on demand and two of those can
+                // land in the same second (gh#34). Existing rows keep NULL,
+                // which reads as "the run starts now".
+                ("settled_at", "TEXT"),
+                // Times the board closed this attempt and then caught its pane
+                // still working (gh#34). Deliberately not a second attempt: no
+                // second dispatch happened, and counting one would inflate the
+                // retry rate the board reports.
+                ("reopened", "INTEGER NOT NULL DEFAULT 0"),
                 // The pane's screen last time we looked, and when that screen
                 // first appeared. Together they answer the question a manifest
                 // cannot: whether a spinner it matched is live (gh#32).
@@ -596,20 +611,93 @@ impl Db {
         Ok(())
     }
 
-    /// How many consecutive samples have looked finished on commits alone.
-    /// Cleared, not latched: an agent that goes back to work starts over.
-    pub fn set_settled_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {
+    /// Forget the screen recorded for this attempt.
+    ///
+    /// Called when an attempt is closed. The screen it was last seen showing was
+    /// recorded while its agent was still working, so it is no baseline for the
+    /// question the closed-attempt watch asks — *has this pane moved since we
+    /// called it finished* — and comparing against it would answer yes on the
+    /// very first look (gh#34).
+    pub fn clear_screen_sample(&self, attempt_id: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE attempts SET settled_ticks = ?2 WHERE id = ?1",
-            params![attempt_id, ticks],
+            "UPDATE attempts SET screen_print = NULL, screen_at = NULL WHERE id = ?1",
+            params![attempt_id],
         )?;
         Ok(())
+    }
+
+    /// Start or stop the clock on an attempt that looks finished.
+    ///
+    /// `Some` only ever on the first sample of a run — restamping it on every
+    /// sample is what would make it ageless, and an ageless stamp can never
+    /// reach [`crate::settled::SETTLE_SECS`]. Cleared, not latched: an agent that
+    /// goes back to work starts over.
+    pub fn set_settled_at(&self, attempt_id: i64, at: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET settled_at = ?2 WHERE id = ?1",
+            params![attempt_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Put a closed attempt back to work, because its pane never stopped.
+    ///
+    /// Re-opening the same row rather than inserting a new one is the decision
+    /// gh#34 had to make. An attempt is one agent, in one pane, on one branch,
+    /// and none of those changed: nobody dispatched anything, so a second row
+    /// would claim a retry that never happened and inflate the very number
+    /// `stats` reports as "needed more than one go". What must not be lost —
+    /// that the board once said this was finished — is a property of *this*
+    /// attempt, so it is counted here instead.
+    ///
+    /// `ended_at` goes with the outcome. Every other reader treats it as proof
+    /// the attempt is over (`gc` prunes by it, `stats` measures durations with
+    /// it), so a live row carrying one would lie to all of them.
+    ///
+    /// Returns `false` when the task already has a live attempt — somebody
+    /// re-dispatched it, that attempt is the current one, and the partial unique
+    /// index would refuse this anyway. Checked in the same statement rather than
+    /// read first, so a dispatch racing this loses cleanly.
+    pub fn reopen_attempt(&self, attempt_id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE attempts SET outcome = NULL, ended_at = NULL, settled_at = NULL,
+                    missing_ticks = 0, screen_print = NULL, screen_at = NULL,
+                    reopened = reopened + 1
+             WHERE id = ?1 AND outcome IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM attempts o
+                  WHERE o.task_id = attempts.task_id AND o.outcome IS NULL
+               )",
+            params![attempt_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Live attempts across all tasks, for reconciliation and concurrency caps.
     pub fn live_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE outcome IS NULL ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], read_attempt)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Closed attempts whose pane the board might still have to look at.
+    ///
+    /// Reconciliation only ever visited live attempts, which made every settle
+    /// final whether or not it was right (gh#34). These are the rows it has to
+    /// look at again, and the filter is what keeps that cheap:
+    ///
+    /// - `done` and `orphaned` only. Those are the board's own verdicts on
+    ///   evidence, and evidence can be wrong. `cancelled` is the operator ending
+    ///   an attempt on purpose and `failed` is a dispatch that never produced an
+    ///   agent — neither is ours to undo.
+    /// - A pane to look at. An attempt with none was never in one.
+    pub fn settled_attempts(&self) -> Result<Vec<Attempt>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE outcome IN ('done', 'orphaned') AND pane_id IS NOT NULL
+              ORDER BY id"
         ))?;
         let rows = stmt.query_map([], read_attempt)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -877,6 +965,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// gh#34 replaced a column rather than adding one, and the one it replaced
+    /// was `NOT NULL`. Every board in use has it, `insert_attempt` no longer
+    /// names it, and an insert that fell foul of that would take dispatch down.
+    #[test]
+    fn a_database_carrying_the_column_gh34_stopped_using_still_dispatches() {
+        let dir = std::env::temp_dir().join(format!("hb-gh34-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gh18.db");
+        let _ = std::fs::remove_file(&path);
+
+        // The gh#18 schema: `settled_ticks INTEGER NOT NULL`, no `settled_at`.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                   id TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
+                   identifier TEXT NOT NULL, title TEXT NOT NULL, body TEXT,
+                   url TEXT NOT NULL, labels TEXT NOT NULL DEFAULT '[]',
+                   state TEXT NOT NULL, source_state TEXT,
+                   updated_at TEXT NOT NULL, synced_at TEXT NOT NULL);
+                 CREATE TABLE attempts (
+                   id INTEGER PRIMARY KEY, task_id TEXT NOT NULL,
+                   pane_id TEXT, workspace TEXT NOT NULL, runtime TEXT NOT NULL,
+                   worktree TEXT, branch TEXT, started_at TEXT NOT NULL,
+                   ended_at TEXT, outcome TEXT,
+                   settled_ticks INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO tasks VALUES('linear:LIN-1','linear','u','LIN-1','t',NULL,
+                   'url','[]','ready',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO attempts VALUES(1,'linear:LIN-1','w1:p1','ws','claude-code',
+                   NULL,NULL,'2026-01-01T00:00:00Z','2026-01-01T01:00:00Z','done',1);",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let old = &db.load_tasks().unwrap()[0].attempts[0];
+        assert_eq!(old.settled_at, None, "there was never a time to migrate");
+        assert_eq!(old.reopened, 0);
+        // The insert the abandoned NOT NULL column would have broken.
+        let a = db.insert_attempt(&attempt("linear:LIN-1")).unwrap();
+        db.set_settled_at(a, Some("2026-07-30T22:03:06Z")).unwrap();
+        let attempts = db.attempts_for("linear:LIN-1").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[1].settled_at.as_deref(),
+            Some("2026-07-30T22:03:06Z")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn upsert_is_idempotent_and_refreshes_fields() {
         let db = db();
@@ -929,6 +1067,96 @@ mod tests {
         assert_eq!(db.live_count_in_workspace("fintech").unwrap(), 0);
         db.close_attempt(a1, Outcome::Done).unwrap();
         assert_eq!(db.live_count_in_workspace("offhand").unwrap(), 1);
+    }
+
+    // ---- re-opening a settle that was wrong (gh#34) ---------------------
+
+    #[test]
+    fn reopening_puts_the_same_attempt_back_to_work_rather_than_adding_one() {
+        // The decision gh#34 had to make. Nobody dispatched anything, so a
+        // second row would claim a retry that never happened.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.set_attempt_pane(a, "w1:p9").unwrap();
+        db.close_attempt(a, Outcome::Done).unwrap();
+
+        assert!(db.reopen_attempt(a).unwrap());
+        let attempts = db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(attempts.len(), 1, "no retry was invented");
+        assert_eq!(attempts[0].outcome, None, "and it is live again");
+        // `gc` prunes by `ended_at` and `stats` measures durations with it, so a
+        // live row must not carry one.
+        assert_eq!(attempts[0].ended_at, None);
+        // The fact the board once called it finished is what is kept instead.
+        assert_eq!(attempts[0].reopened, 1);
+        db.close_attempt(a, Outcome::Done).unwrap();
+        db.reopen_attempt(a).unwrap();
+        assert_eq!(db.attempts_for("linear:LIN-142").unwrap()[0].reopened, 2);
+    }
+
+    #[test]
+    fn a_task_that_was_re_dispatched_keeps_its_new_attempt() {
+        // The unique index would refuse a second live row anyway; refusing in the
+        // same statement is what makes a dispatch racing this lose cleanly.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let first = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.close_attempt(first, Outcome::Done).unwrap();
+        let retry = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+
+        assert!(!db.reopen_attempt(first).unwrap());
+        let attempts = db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(attempts[0].outcome, Some(Outcome::Done), "left closed");
+        assert_eq!(attempts[0].reopened, 0, "and not counted against");
+        assert_eq!(attempts[1].id, retry);
+    }
+
+    #[test]
+    fn a_live_attempt_is_not_something_to_reopen() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        assert!(!db.reopen_attempt(a).unwrap());
+    }
+
+    #[test]
+    fn only_the_boards_own_verdicts_are_watched_after_they_close() {
+        // `cancelled` is the operator ending an attempt on purpose and `failed`
+        // is a dispatch that never produced an agent. Neither is the board's to
+        // second-guess; `done` and `orphaned` are.
+        let db = db();
+        let mut watched = Vec::new();
+        for (n, outcome) in [
+            Outcome::Done,
+            Outcome::Orphaned,
+            Outcome::Cancelled,
+            Outcome::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("linear:LIN-{n}");
+            seed(&db, &id);
+            let a = db.insert_attempt(&attempt(&id)).unwrap();
+            db.set_attempt_pane(a, &format!("w1:p{n}")).unwrap();
+            db.close_attempt(a, outcome).unwrap();
+            if matches!(outcome, Outcome::Done | Outcome::Orphaned) {
+                watched.push(a);
+            }
+        }
+        // ...and one with no pane, which was never in one to look at.
+        seed(&db, "linear:LIN-9");
+        let paneless = db.insert_attempt(&attempt("linear:LIN-9")).unwrap();
+        db.close_attempt(paneless, Outcome::Done).unwrap();
+
+        let ids: Vec<i64> = db
+            .settled_attempts()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, watched);
     }
 
     #[test]

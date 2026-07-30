@@ -1033,6 +1033,41 @@ An override replaces the manifest wholesale, so it snapshots the active one and
 will shadow later upstream updates. `herdr-board integration uninstall claude`
 puts it back.
 
+### And the inverse: a settle the board got wrong
+
+The same distrust runs the other way. An attempt settles on one of two artifacts,
+and they are not weighed the same: a pull request is the agent's own statement
+that it is finished, so it closes the attempt on the first idle sample. Commits
+are not — dispatched agents are told to commit mid-flight — so a settle on commits
+alone has to wait for the pane to go on looking idle for **60 seconds**, and any
+sample reporting `working` starts that minute over.
+
+It waits a *duration*, not a number of samples, and that distinction is the whole
+of gh#34. The bar used to be two consecutive settled samples, which was a real
+wait when a tick meant a 30-second sweep. `pane.agent_status_changed` then made
+reconciliation event-driven — it fires several times a second during a status
+flap — and two samples stamped the same second cleared a bar that no longer
+measured anything. gh#543 was closed as finished twenty minutes before its agent
+stopped working.
+
+And a settle is no longer the last time the board looks. Reconciliation used to
+visit live attempts only, so a closed attempt's pane was never examined again: an
+agent that carried on was invisible, its pane was never disposed of (disposal
+wants a *finished* task, and this one was working), and the stall detection above
+could not help because it runs for live attempts only. Now a closed attempt whose
+pane herdr reports `working` is resampled on the same clock, and if the screen has
+**moved** since the settle, the attempt is re-opened.
+
+Re-opened — not re-dispatched. Nobody dispatched anything, so recording a second
+attempt would claim a retry that never happened and inflate the one number the
+board has for work done twice. The fact worth keeping is that the board was wrong
+about *this* attempt, so it is counted there: `herdr-board stats` reports it, and
+`list --json` carries it as `reopened`. Re-opening is refused when somebody
+already re-dispatched the task, when the issue is closed or gone, when the pane
+has moved on to another checkout, and when the screen has not moved — that last
+one is what stops a stale `✳ Tinkering…` flapping every finished row between
+`review` and `working` for the rest of the session.
+
 ## Teaching each runtime that the board exists
 
 Being dispatchable is not the same as knowing what to do. `herdr-board` is on

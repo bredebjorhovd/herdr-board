@@ -7,7 +7,7 @@ use crate::herdr::{Herdr, PaneInfo};
 use crate::log::Logger;
 use crate::model::*;
 use crate::screen::{self, Vitals};
-use crate::settled::Settled;
+use crate::settled::{self, Settled, Settling};
 use crate::sources::github::{Github, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, Linear};
 use anyhow::Result;
@@ -35,6 +35,16 @@ impl Rest for Box<dyn Rest> {
     fn put(&self, path: &str, body: &Value) -> Result<Value> {
         (**self).put(path, body)
     }
+}
+
+/// How long ago a stored RFC3339 timestamp was, in seconds.
+///
+/// `None` when it will not parse. Both callers treat that as "no usable
+/// reading": a stamp nothing can be measured from must not be the thing an
+/// attempt is closed or accused on.
+fn age_secs(at: &str) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    Some((chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
 }
 
 /// Health of one upstream source, rendered in the board header.
@@ -638,6 +648,11 @@ impl SyncEngine {
     ) -> Result<()> {
         self.notify_settled(herdr, task, settled.toast());
         self.db.close_attempt(attempt.id, settled.outcome())?;
+        // A closed attempt's pane is watched from here on (gh#34), and the screen
+        // recorded for it was taken while the agent was working. Forgetting it
+        // makes the next look a first look, so "the pane moved" means moved
+        // *since we called this finished* rather than since it last worked.
+        self.db.clear_screen_sample(attempt.id)?;
         self.enqueue_outcome(task, settled.outcome(), pr_url)?;
         self.wake_dispatcher(herdr, task, attempt, settled, pr_url);
         Ok(())
@@ -724,6 +739,108 @@ impl SyncEngine {
                 Some(pane) => self.reconcile_live_pane(&task, &attempt, pane, herdr)?,
             }
         }
+        // Last, because it may re-open an attempt: doing that first would
+        // reconcile the same attempt twice in one pass, reading its pane twice
+        // to reach the answer it already has.
+        self.rewatch_settled_attempts(&by_id, herdr)?;
+        Ok(())
+    }
+
+    /// Look again at attempts the board has already closed (gh#34).
+    ///
+    /// Reconciliation used to visit only live attempts, which made every settle
+    /// final whether or not it was right. gh#543 was closed on commits while its
+    /// agent had twenty more minutes of work in it, and from that moment nothing
+    /// examined its pane again — not the stall detection gh#32 added, which runs
+    /// for live attempts only; not disposal, which wants a *finished* task and
+    /// found one still working. The row sat in `review` while the work went on,
+    /// and the pane it was in was leaked for the session.
+    ///
+    /// It is the exact inverse of gh#32 — that was "the board says working, the
+    /// agent is dead" — so it takes the same care, for the same reason. herdr's
+    /// `working` is the signal that can lie: a stale `✳ Tinkering…` left in
+    /// scrollback reads `working` on a pane nobody is touching. Re-opening on the
+    /// status alone would flap every finished task between `review` and `working`
+    /// forever, so a closed attempt is re-opened only once its screen has
+    /// demonstrably *moved* since the board called it finished.
+    fn rewatch_settled_attempts(
+        &self,
+        by_id: &HashMap<&str, &PaneInfo>,
+        herdr: Option<&Herdr>,
+    ) -> Result<()> {
+        for attempt in self.db.settled_attempts()? {
+            let Some(pane_id) = attempt.pane_id.as_deref() else {
+                continue;
+            };
+            let Some(pane) = by_id.get(pane_id) else {
+                // The usual case by far: the pane is gone, so the settle stands.
+                continue;
+            };
+            // Only herdr's `working` is worth a pane read. That is what keeps
+            // this to a handful of reads per cycle instead of one for every task
+            // the board has ever finished — and it is also the only status that
+            // claims anything is happening, so there is nothing else to verify.
+            if pane.agent_status != Some(AgentStatus::Working) {
+                continue;
+            }
+            // The pane may be holding somebody else by now. The same check review
+            // delivery makes before typing into it.
+            if !crate::review::still_holds_the_author(pane, &attempt) {
+                continue;
+            }
+            let Some(task) = self.db.get_task(&attempt.task_id)? else {
+                continue;
+            };
+            // Nothing to re-open into. A closed or deleted issue, or `d mark
+            // done`, is somebody deciding this task is over; an agent still
+            // typing does not overrule them.
+            if task.upstream.is_final() || task.local_done {
+                continue;
+            }
+            // Already re-dispatched. That attempt is the live one, and the
+            // partial unique index says a task only ever has one.
+            if task.live_attempt().is_some() {
+                continue;
+            }
+            if self.vitals(herdr, &attempt, pane, AgentStatus::Working) != Vitals::Alive {
+                continue;
+            }
+            self.reopen(herdr, &task, &attempt)?;
+        }
+        Ok(())
+    }
+
+    /// Put a closed attempt back to work, because its pane never stopped.
+    ///
+    /// Why this row rather than a fresh one is argued at [`Db::reopen_attempt`].
+    /// The short of it: nobody dispatched anything, so there is no second attempt
+    /// to record — only a first one the board was wrong about.
+    fn reopen(&self, herdr: Option<&Herdr>, task: &Task, attempt: &Attempt) -> Result<()> {
+        if !self.db.reopen_attempt(attempt.id)? {
+            // Lost a race with a dispatch between the check above and here. The
+            // live attempt is the current one; nothing to do and nothing wrong.
+            return Ok(());
+        }
+        // Both, so that this cycle's derivation already puts the row back in
+        // WORKING — `rewatch` runs after the live pass, which would otherwise
+        // leave it claiming `review` for one more cycle on the status it had when
+        // it was closed.
+        self.db
+            .set_attempt_status(attempt.id, AgentStatus::Working)?;
+        self.db.set_saw_working(attempt.id)?;
+        self.log.warn(format!(
+            "{} was closed as {} but pane {} is still working — attempt re-opened \
+             ({} time(s) now)",
+            task.identifier,
+            attempt
+                .outcome
+                .map(Outcome::as_str)
+                .unwrap_or("finished"),
+            attempt.pane_id.as_deref().unwrap_or("?"),
+            attempt.reopened + 1
+        ));
+        // Worth a toast: the operator was told this finished, and it had not.
+        self.notify_settled(herdr, task, "is still working — reopened");
         Ok(())
     }
 
@@ -796,7 +913,7 @@ impl SyncEngine {
         if !settled {
             // Back at work: whatever the last samples said, they were not the
             // end of the attempt.
-            return self.clear_settled_ticks(attempt);
+            return self.clear_settled_clock(attempt);
         }
         // A PR is the agent's own declaration that it is finished, and it
         // cannot exist unless something ran. Nothing to second-guess: settle on
@@ -837,27 +954,35 @@ impl SyncEngine {
             if matches!(vitals, Vitals::Frozen { .. }) {
                 return self.report_stalled(herdr, task, attempt, None);
             }
-            return self.clear_settled_ticks(attempt);
+            return self.clear_settled_clock(attempt);
         }
         // gh#18: and one settled sample is not "finished". `idle` is a screen
         // classification that flaps mid-turn — the bottom of the pane loses the
         // working line behind long bash output or a large diff — and
         // `pane.agent_status_changed` invokes this path at the moment of the
-        // flap rather than waiting for the next 30s sweep. So the weak artifact
-        // gets the debounce the vanished pane already has above: two
-        // consecutive samples, and any sample that says `working` starts over.
-        let ticks = attempt.settled_ticks + 1;
-        if ticks < 2 {
-            self.log.info(format!(
-                "{} agent {} with commits (tick {}/2)",
-                task.identifier,
-                status.as_str(),
-                ticks
-            ));
-            self.db.set_settled_ticks(attempt.id, ticks)?;
-            return Ok(());
+        // flap rather than waiting for the next 30s sweep.
+        //
+        // gh#34: which is why the two consecutive samples gh#18 asked for were
+        // no wait at all. Two events a fraction of a second apart satisfy a
+        // counter, and one flap was enough to close gh#543 twenty minutes early.
+        // So the bar is a duration on the same clock gh#32 uses in the other
+        // direction: the attempt has to go on looking finished, and any sample
+        // that says `working` starts it over.
+        match settled::settling(attempt.settled_at.as_deref().and_then(age_secs)) {
+            Settling::Started => {
+                self.log.info(format!(
+                    "{} agent {} with commits — settling if it stays that way for {}s",
+                    task.identifier,
+                    status.as_str(),
+                    settled::SETTLE_SECS
+                ));
+                self.db.set_settled_at(attempt.id, Some(&crate::db::now()))
+            }
+            // Silent on purpose: reconciliation runs on demand, so a flapping
+            // status would write this line several times a second.
+            Settling::Waiting { .. } => Ok(()),
+            Settling::LongEnough => self.settle_now(herdr, task, attempt, status, "commits"),
         }
-        self.settle_now(herdr, task, attempt, status, "commits")
     }
 
     /// Ask a pane herdr calls `working` whether anything is actually moving.
@@ -905,12 +1030,10 @@ impl SyncEngine {
         // would otherwise be compared forever against a timestamp it never had,
         // so it is treated as a first look and restamped below.
         let previous = match (attempt.screen_print.as_deref(), attempt.screen_at.as_deref()) {
-            (Some(fingerprint), Some(at)) => chrono::DateTime::parse_from_rfc3339(at)
-                .ok()
-                .map(|t| screen::Sample {
-                    fingerprint,
-                    age_secs: (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds(),
-                }),
+            (Some(fingerprint), Some(at)) => age_secs(at).map(|age_secs| screen::Sample {
+                fingerprint,
+                age_secs,
+            }),
             _ => None,
         };
         let vitals = screen::vitals(previous, &screen);
@@ -965,14 +1088,14 @@ impl SyncEngine {
         }
         self.db
             .set_attempt_status(attempt.id, AgentStatus::Blocked)?;
-        // Whatever the last samples were counting towards, it was not this.
-        self.clear_settled_ticks(attempt)
+        // Whatever the last samples were leading up to, it was not this.
+        self.clear_settled_clock(attempt)
     }
 
-    /// Forget a run of settled-looking samples that did not end the attempt.
-    fn clear_settled_ticks(&self, attempt: &Attempt) -> Result<()> {
-        if attempt.settled_ticks != 0 {
-            self.db.set_settled_ticks(attempt.id, 0)?;
+    /// Forget a run of finished-looking samples that did not end the attempt.
+    fn clear_settled_clock(&self, attempt: &Attempt) -> Result<()> {
+        if attempt.settled_at.is_some() {
+            self.db.set_settled_at(attempt.id, None)?;
         }
         Ok(())
     }
@@ -1856,8 +1979,16 @@ mod tests {
         e.db.attempts_for("linear:LIN-142").unwrap().remove(0)
     }
 
+    /// Backdate an attempt's settle clock, standing in for the seconds between
+    /// two reconciles. `set_settled_at` stamps *now*, which is right in
+    /// production and useless in a test that cannot wait a minute.
+    fn looked_settled_secs_ago(e: &SyncEngine, attempt: i64, secs: i64) {
+        let at = crate::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        e.db.set_settled_at(attempt, Some(&at)).unwrap();
+    }
+
     #[test]
-    fn commits_alone_need_two_settled_samples_before_the_attempt_closes() {
+    fn commits_alone_need_a_minute_of_looking_finished_before_the_attempt_closes() {
         // gh#18. `idle` is a screen classification that flaps while an agent
         // works, so one sample of it is not "finished" — and the weak artifact
         // is already there, because the agent was told to commit mid-flight.
@@ -1872,10 +2003,70 @@ mod tests {
             a.outcome.is_none(),
             "one idle sample must not close an attempt that is still being worked"
         );
-        assert_eq!(a.settled_ticks, 1);
+        assert!(a.settled_at.is_some(), "it starts the clock instead");
 
+        looked_settled_secs_ago(&e, a.id, settled::SETTLE_SECS);
         e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// gh#34, the bug itself. `pane.agent_status_changed` fires several times a
+    /// second during a flap, so a bar counted in *samples* is cleared by two
+    /// events a fraction of a second apart — which is how gh#543 was closed as
+    /// done while its agent worked on for another twenty minutes.
+    #[test]
+    fn two_settled_samples_in_the_same_second_are_not_a_wait() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let work = dispatch_with_commits(&e, "linear:LIN-142", "w1:p9");
+        e.reconcile(&[pane("w1:p9", AgentStatus::Working)]).unwrap();
+
+        // As many back-to-back samples as a flap can produce, all inside the
+        // same second because nothing here waits.
+        for _ in 0..8 {
+            e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        }
+        let a = live(&e);
+        assert!(
+            a.outcome.is_none(),
+            "eight samples in one second is still no time at all"
+        );
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "and nothing was written back upstream"
+        );
+
+        // Only the clock releases it, and one second short of the window is
+        // still short.
+        looked_settled_secs_ago(&e, a.id, settled::SETTLE_SECS - 1);
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        assert!(live(&e).outcome.is_none(), "{}s is not a minute", settled::SETTLE_SECS - 1);
+
+        looked_settled_secs_ago(&e, a.id, settled::SETTLE_SECS);
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The clock has to measure from when it *first* looked finished. Restamping
+    /// it on every sample is the same bug in a different shape: a stamp that is
+    /// always fresh can never age into a settle.
+    #[test]
+    fn resampling_does_not_restart_the_settle_clock() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let work = dispatch_with_commits(&e, "linear:LIN-142", "w1:p9");
+        e.reconcile(&[pane("w1:p9", AgentStatus::Working)]).unwrap();
+
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        let started = live(&e).settled_at;
+        looked_settled_secs_ago(&e, live(&e).id, 30);
+        let aged = live(&e).settled_at;
+        e.reconcile(&[pane("w1:p9", AgentStatus::Idle)]).unwrap();
+        assert_eq!(live(&e).settled_at, aged, "the stamp must go on ageing");
+        assert_ne!(started, aged, "(and the fixture really did backdate it)");
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
@@ -1899,7 +2090,7 @@ mod tests {
         }
         let a = live(&e);
         assert!(a.outcome.is_none(), "an agent still working must still be working");
-        assert_eq!(a.settled_ticks, 0, "going back to work starts the count over");
+        assert_eq!(a.settled_at, None, "going back to work starts the clock over");
         assert_eq!(
             e.db.pending_writeback_count().unwrap(),
             0,

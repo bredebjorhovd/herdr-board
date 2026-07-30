@@ -34,6 +34,11 @@ pub struct Stats {
     pub completion_rate: Option<f64>,
     /// Tasks that needed more than one attempt.
     pub retried_tasks: usize,
+    /// Times the board closed an attempt and then caught its pane still working
+    /// (gh#34). Not retries — nobody dispatched anything — so they are counted
+    /// apart from `retried_tasks`. This is the board reporting on its own
+    /// judgement rather than on the herd's.
+    pub early_settles: usize,
     /// Released by an agent rather than by the operator.
     pub agent_dispatched: usize,
     pub by_workspace: BTreeMap<String, usize>,
@@ -116,6 +121,7 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         longest_minutes: durations.last().copied(),
         completion_rate: (ended > 0).then(|| done as f64 / ended as f64),
         retried_tasks,
+        early_settles: attempts.iter().map(|(_, a)| a.reopened as usize).sum(),
         agent_dispatched,
         by_workspace,
         by_runtime,
@@ -160,6 +166,12 @@ pub fn print(s: &Stats) {
         println!(
             "  {} task(s) needed more than one go",
             s.retried_tasks
+        );
+    }
+    if s.early_settles > 0 {
+        println!(
+            "  {} attempt(s) called finished while their agent was still working",
+            s.early_settles
         );
     }
     if s.agent_dispatched > 0 {
@@ -245,7 +257,8 @@ mod tests {
                 .map(|_| crate::db::rfc3339(start + chrono::Duration::minutes(ran_for))),
             outcome,
             missing_ticks: 0,
-            settled_ticks: 0,
+            settled_at: None,
+            reopened: 0,
             agent_status: None,
             dispatched_by: by.map(str::to_string),
             dispatched_by_pane: pane.map(str::to_string),

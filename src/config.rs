@@ -180,7 +180,13 @@ pub fn github_token(paths: &Paths) -> Option<String> {
     Credentials::load(paths).github_token
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Everything `routing.toml` says.
+///
+/// `PartialEq` here — and on every type below it — is what lets a long-lived
+/// process notice that the file it read at startup has been edited. It has to
+/// be the whole config: any subset is a proxy, and the edits that keep a proxy
+/// unchanged are exactly the ones nobody thinks to restart for (gh#37).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -202,7 +208,7 @@ pub struct RoutingConfig {
 /// `[github] repos` entries, because those are the config that already exists.
 /// Ignoring has nowhere else to live — "I am only reading this repo" is not a
 /// fact any other key can carry.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct AdoptConfig {
     /// `owner/repo` entries the board will never offer again. Delete a line to
     /// be offered it once more.
@@ -216,7 +222,7 @@ impl AdoptConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SyncConfig {
     /// Poll interval, e.g. `"30s"`.
     #[serde(default = "default_interval")]
@@ -265,7 +271,7 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_per_workspace: usize,
@@ -347,7 +353,7 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GithubConfig {
     /// `owner/repo` entries to poll for issues and PRs.
     #[serde(default)]
@@ -427,7 +433,7 @@ impl Default for GithubConfig {
 /// labels = ["release-a"]
 /// writeback = false
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
     /// `owner/repo`. Must also appear in `[github] repos` — see
     /// [`RoutingConfig::validate`].
@@ -504,7 +510,7 @@ impl GithubConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct LinearConfig {
     /// Name of the workflow state a task moves to when the board derives
     /// `review` — typically `"In Review"`.
@@ -525,7 +531,7 @@ pub struct LinearConfig {
     pub review_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
     #[serde(default)]
@@ -555,7 +561,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct RouteMatch {
     pub linear_team: Option<String>,
     pub linear_project: Option<String>,

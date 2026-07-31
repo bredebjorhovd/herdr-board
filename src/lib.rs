@@ -12,6 +12,7 @@ pub mod herdr;
 pub mod integration;
 pub mod log;
 pub mod model;
+pub mod nudge;
 pub mod review;
 pub mod screen;
 pub mod settled;

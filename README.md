@@ -1020,6 +1020,45 @@ which is honest, because it really is still holding a slot. A pane somebody has
 scrolled back in is skipped entirely: its visible screen does not move either,
 and that is the operator's doing, not the agent's.
 
+### And then doing something about it
+
+Reporting was not what the three parked agents needed. Each came back on a single
+prompt typed by hand, after 30, 62 and 65 minutes of holding a slot — so the board
+can type it (gh#40):
+
+```toml
+[defaults]
+nudge_stalled = true
+```
+
+A **nudge, not a re-dispatch**. The session is intact and one turn died; starting
+over would throw away everything the agent has worked out in order to recover from
+a transient server error. It goes through the same delivery review comments use,
+into the pane the agent is already sitting in, checked first for still holding
+that agent.
+
+**Only a 5xx**, and only three of them — immediately, then after two minutes, then
+after five. The cap is not about load; at three panes Anthropic does not notice.
+It is that an agent which has ignored three nudges is not suffering from a 5xx any
+more, and nudging it forever would hide that behind a board that looks busy. After
+the cap the attempt stays `blocked`, and the notification says `stalled after 3
+nudges — API Error: 529 …`, which is the honest end state. Every nudge is logged:
+"the board typed into a pane" should never have to be inferred from an agent's
+behaviour.
+
+Resetting the counter is the subtle part. A nudge lands as text and gets echoed,
+so the screen moves once for a nudge that achieved nothing — reset on that and the
+cap is never reached. What separates the two is how long the movement lasts, so a
+pane is credited with having come back only if it is still moving when its next
+nudge would have been due.
+
+**Off by default**, like `notify_dispatcher`: a board that types into panes
+unprompted is a different thing from one that watches them. It is also how you
+keep it out of a fight with another watcher — the itsm driver has a retry loop of
+its own, and two things nudging one agent is worse than neither, so over panes
+either of them can reach, turn on exactly one. `herdr-board doctor` states which
+way the flag is set.
+
 Two things it is not:
 
 - **Not hooks.** herdr accepts `pane report-agent` from anyone, but Claude

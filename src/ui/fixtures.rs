@@ -103,6 +103,8 @@ fn attempt_by(
         // Nothing renders these; they are reconciliation's own bookkeeping.
         screen_print: None,
         screen_at: None,
+        nudges: 0,
+        nudged_at: None,
     }
 }
 

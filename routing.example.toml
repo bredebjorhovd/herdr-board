@@ -72,6 +72,14 @@ branch_template = "board/{identifier_lower}"
 # orchestrator cannot be woken, so somebody has to notice — this is how you do,
 # without watching the board.
 # notify = true
+# When an agent's turn dies on an Anthropic 5xx and its pane stops moving, prompt
+# it to carry on rather than leaving it parked on a concurrency slot. Three tries
+# with a wait between them, into the pane it is already in — never a re-dispatch,
+# since the session is intact and only one turn died — and then it stays blocked
+# and says so. Off, because a board that types into panes unprompted is a
+# different thing from one that watches them, and because anything else retrying
+# these agents wants only one of you doing it.
+# nudge_stalled = true
 # Which tracker `herdr-board new` writes to: "linear" or "github". This is not
 # inferable — a label routes work to a repo and says nothing about where that
 # project's tickets live. herdr-board's own backlog is in Linear while its code

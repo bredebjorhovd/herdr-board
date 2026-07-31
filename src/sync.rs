@@ -927,11 +927,17 @@ impl SyncEngine {
         // dispatched agents to commit even without a PR — and settling one that
         // died mid-task as `finished` would tell the operator the opposite of
         // what happened. A human retrying is what unsticks a 529, so say so.
+        //
+        // gh#40: and then, if asked to, be that human. Reported first and nudged
+        // second, in that order deliberately — the report is what the board knows
+        // right now, and it is true whether or not the nudge lands.
         if let Vitals::Frozen {
             api_error: Some(err),
         } = &vitals
         {
-            return self.report_stalled(herdr, task, attempt, Some(err));
+            self.report_stalled(herdr, task, attempt, Some(err))?;
+            self.nudge_stalled(herdr, task, attempt, pane, err);
+            return Ok(());
         }
         // Commits on the attempt branch are evidence too — an agent that
         // commits locally and stops would otherwise sit `working` forever —
@@ -1049,8 +1055,107 @@ impl SyncEngine {
                 self.log
                     .warn(format!("recording {}'s screen: {e}", pane.pane_id));
             }
+            // gh#40: a pane that has gone on moving since the last nudge is one
+            // the nudge fixed, and it gets its full allowance back. Not on the
+            // first frame of movement — a nudge is text, and text gets echoed, so
+            // the screen moves once for a nudge that achieved nothing.
+            if crate::nudge::recovered(
+                attempt.nudges,
+                attempt.nudged_at.as_deref().and_then(age_secs),
+            ) {
+                self.log.info(format!(
+                    "{} pane {} is moving again after {} nudge(s)",
+                    attempt.task_id, pane.pane_id, attempt.nudges
+                ));
+                if let Err(e) = self.db.clear_nudges(attempt.id) {
+                    self.log
+                        .warn(format!("clearing {}'s nudges: {e}", pane.pane_id));
+                }
+            }
         }
         vitals
+    }
+
+    /// Ask an agent whose turn died on an Anthropic 5xx to carry on (gh#40).
+    ///
+    /// gh#32 stopped at reporting the stall, and reporting was not what the three
+    /// parked agents needed: each came back on a single prompt typed by hand,
+    /// after 30, 62 and 65 minutes of holding a concurrency slot. This types it.
+    ///
+    /// A nudge, never a re-dispatch. The session is intact and one turn died;
+    /// starting over would throw away everything the agent has worked out to
+    /// recover from a transient server error. So it goes through
+    /// [`crate::wake::wake`], which knows how to get text into a pane that is not
+    /// reacting — and into the pane the agent is already in, checked first for
+    /// still holding that agent, the same check review delivery makes.
+    ///
+    /// Off unless `[defaults] nudge_stalled` says otherwise, which is also what
+    /// keeps this from fighting another watcher over the same panes.
+    fn nudge_stalled(
+        &self,
+        herdr: Option<&Herdr>,
+        task: &Task,
+        attempt: &Attempt,
+        pane: &PaneInfo,
+        api_error: &str,
+    ) {
+        let plan = crate::nudge::plan(
+            self.cfg.defaults.nudge_stalled,
+            attempt.nudges,
+            attempt.nudged_at.as_deref().and_then(age_secs),
+        );
+        let nth = match plan {
+            crate::nudge::Plan::Nudge { nth } => nth,
+            // Silent, all of them. `Off` is the default and would say this about
+            // every stalled pane on every cycle; `Hold` and `Capped` repeat every
+            // cycle for as long as the pane sits there, which can be hours.
+            _ => return,
+        };
+        let Some(h) = herdr else {
+            return;
+        };
+        // The pane may be holding somebody else by now — a handoff, or an agent
+        // that exited and left a shell. Typing a prompt into bash is the failure
+        // this check exists for.
+        if !crate::review::still_holds_the_author(pane, attempt) {
+            self.log.info(format!(
+                "{} pane {} no longer holds the agent that stalled — not nudging it",
+                task.identifier, pane.pane_id
+            ));
+            return;
+        }
+        // Counted before the delivery, not after: `wake` can take tens of seconds
+        // to confirm, and a crash in between must leave the attempt having spent
+        // a try rather than free to spend it again.
+        if let Err(e) = self.db.set_nudged(attempt.id) {
+            self.log
+                .warn(format!("recording {}'s nudge: {e}", pane.pane_id));
+            return;
+        }
+        let delivery = crate::wake::wake(
+            h,
+            &self.log,
+            &pane.pane_id,
+            &crate::nudge::message(api_error),
+        );
+        // Every nudge, at a level that shows up without going looking. "The board
+        // typed into a pane" is not a thing anybody should have to infer from an
+        // agent's behaviour.
+        self.log.warn(format!(
+            "{} pane {} stalled on {api_error} — nudged it to carry on \
+             ({nth}/{}, {delivery:?})",
+            task.identifier,
+            pane.pane_id,
+            crate::nudge::MAX_NUDGES,
+        ));
+        if nth >= crate::nudge::MAX_NUDGES {
+            self.log.warn(format!(
+                "{} pane {} has had its {} nudges — if it stays frozen it stays blocked",
+                task.identifier,
+                pane.pane_id,
+                crate::nudge::MAX_NUDGES,
+            ));
+        }
     }
 
     /// Report an attempt whose pane has stopped moving, with the reason when the
@@ -1069,16 +1174,31 @@ impl SyncEngine {
         attempt: &Attempt,
         api_error: Option<&str>,
     ) -> Result<()> {
+        // gh#40: when the board has already tried to unstick this pane and got
+        // nowhere, say so — a pane that ignored every nudge is a different
+        // problem from one nobody has spoken to, and it is the one that needs a
+        // person. In front of the error rather than after it, because a toast is
+        // cut at 78 characters and an API error alone fills them.
+        let tried = if attempt.nudges >= crate::nudge::MAX_NUDGES {
+            format!(" after {} nudges", attempt.nudges)
+        } else {
+            String::new()
+        };
         let why = match api_error {
-            Some(err) => format!("stalled — {err}"),
+            Some(err) => format!("stalled{tried} — {err}"),
             None => format!(
-                "stalled — its screen has not changed in {}s",
+                "stalled{tried} — its screen has not changed in {}s",
                 screen::STALL_SECS
             ),
         };
-        // Once, on the way in. A pane can sit frozen for hours and the operator
-        // should not be told about it on every cycle.
-        if attempt.agent_status != Some(AgentStatus::Blocked) {
+        // Once on the way in, and once if nudging gave up. A pane can sit frozen
+        // for hours, and a nudge moves its screen — so without this the flip back
+        // to `working` and then to `blocked` again would raise a fresh
+        // notification on every round of a stall already being worked on.
+        if crate::nudge::worth_saying(
+            attempt.agent_status == Some(AgentStatus::Blocked),
+            attempt.nudges,
+        ) {
             self.log.warn(format!(
                 "{} pane {} reports working but nothing is running — {why}",
                 task.identifier,

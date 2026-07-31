@@ -479,6 +479,12 @@ branch_template = "board/{{identifier_lower}}"
 # an orchestrator woken by every child it released cannot hold a train of
 # thought. Turn it on if you dispatch from orchestrators rather than by hand.
 # notify_dispatcher = true
+# When an agent's turn dies on an Anthropic 5xx and its pane stops moving, prompt
+# it to carry on instead of leaving it parked on a concurrency slot. A few tries,
+# a wait between them, and then it stays blocked. Off, because a board that types
+# into panes unprompted is a different thing from one that watches them — and
+# because anything else retrying these agents wants only one of you doing it.
+# nudge_stalled = true
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves
@@ -1248,6 +1254,12 @@ pub fn doctor(paths: &Paths) -> Result<Vec<Check>> {
                 detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
             });
 
+            checks.push(Check {
+                name: "stall nudge".into(),
+                ok: true,
+                detail: nudge_stalled_detail(cfg.defaults.nudge_stalled),
+            });
+
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.
@@ -1423,6 +1435,30 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
         "off — only you are notified when released work settles; the agent \
          that released it waits to be asked (`[defaults] notify_dispatcher \
          = true` to enable)"
+            .into()
+    }
+}
+
+/// Whether the board types into a pane whose agent died on a server error.
+///
+/// Here for both readings. On, it is the one setting under which the board acts
+/// on a pane rather than watching it, and an operator should be able to see that
+/// stated somewhere other than the source — including when deciding whether
+/// something else already retries these agents, because two watchers nudging one
+/// pane is worse than neither. Off, it is the invisible failure the settle notice
+/// is: a stalled agent simply sits there, and nothing says the board could have
+/// asked it to carry on.
+fn nudge_stalled_detail(nudge_stalled: bool) -> String {
+    if nudge_stalled {
+        format!(
+            "on — an agent frozen on an Anthropic 5xx is prompted to carry on in its \
+             own pane, up to {} times, and left blocked after that",
+            crate::nudge::MAX_NUDGES
+        )
+    } else {
+        "off — an agent frozen on an Anthropic 5xx is reported blocked and waits for \
+         you to prompt it (`[defaults] nudge_stalled = true` to enable; leave it off \
+         if something else already retries these agents)"
             .into()
     }
 }
@@ -1905,6 +1941,48 @@ mod tests {
             .iter()
             .find(|c| c.name == "settle notice")
             .expect("doctor is silent about notify_dispatcher");
+        assert!(c.detail.starts_with("on —"), "{:?}", c.detail);
+    }
+
+    /// gh#40. Both readings matter: on, the board types into panes and that
+    /// should be visible somewhere other than the source — not least when
+    /// deciding whether something else already retries these agents. Off, it is
+    /// the same invisible failure the settle notice is, so the key has to be
+    /// named.
+    #[test]
+    fn doctor_says_whether_a_stalled_agent_gets_nudged() {
+        let on = nudge_stalled_detail(true);
+        assert!(on.starts_with("on —"), "{on}");
+        assert!(on.contains("carry on"), "{on}");
+        assert!(
+            on.contains(&crate::nudge::MAX_NUDGES.to_string()),
+            "on has to say how many times: {on}"
+        );
+
+        let off = nudge_stalled_detail(false);
+        assert!(off.starts_with("off —"), "{off}");
+        assert!(
+            off.contains("nudge_stalled"),
+            "off has to name the key to turn it on: {off}"
+        );
+        // The one warning that cannot live only in the README: two watchers
+        // nudging one agent is worse than neither.
+        assert!(off.contains("something else already retries"), "{off}");
+    }
+
+    #[test]
+    fn doctor_emits_the_stall_nudge_check() {
+        let p = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\nnudge_stalled = true\n\n[github]\nrepos = []\n",
+        )
+        .unwrap();
+        let checks = doctor(&p).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "stall nudge")
+            .expect("doctor is silent about nudge_stalled");
         assert!(c.detail.starts_with("on —"), "{:?}", c.detail);
     }
 

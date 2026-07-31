@@ -38,6 +38,19 @@ const DEAD_ON_A_529: &str = "\
   ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
 ";
 
+/// The other shape gh#32 found: frozen, but with nothing on screen naming a
+/// cause. `screen::api_error` is deliberately narrow, and this is what it
+/// declines to guess at.
+const DEAD_WITHOUT_A_REASON: &str = "\
+⏺ 111
+✻ Crunched for 3m 19s
+  ⎿  Tip: Ask Claude to create subagents for specific tasks.
+──────────────────────────────────────────
+❯
+──────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+";
+
 /// The same pane a second later, if it were alive. Captured 14s apart from a
 /// genuinely working agent: the elapsed timer is the difference, and it is the
 /// whole reason this check is safe to run against agents that are fine.
@@ -127,6 +140,25 @@ prompt = "Work on {identifier}: {title}"
 notify = true
 "#;
 
+/// The same board with `nudge_stalled` on (gh#40). A separate string rather than
+/// a mutation, so what the operator writes in `routing.toml` is what the test
+/// parses.
+const ROUTING_NUDGING: &str = r#"
+[sync]
+interval = "30s"
+
+[[route]]
+match = { linear_team = "OFF" }
+workspace = "offhand"
+repo = "/tmp/offhand"
+runtime = "claude-code"
+prompt = "Work on {identifier}: {title}"
+
+[defaults]
+notify = true
+nudge_stalled = true
+"#;
+
 struct Board {
     dir: PathBuf,
     engine: SyncEngine,
@@ -140,6 +172,15 @@ impl Drop for Board {
 
 impl Board {
     fn new(name: &str) -> Board {
+        Board::with(name, ROUTING)
+    }
+
+    /// A board that has been asked to nudge stalled agents (gh#40).
+    fn nudging(name: &str) -> Board {
+        Board::with(name, ROUTING_NUDGING)
+    }
+
+    fn with(name: &str, routing: &str) -> Board {
         let dir = std::env::temp_dir().join(format!(
             "herdr-board-gh32-{}-{name}",
             std::process::id()
@@ -151,7 +192,7 @@ impl Board {
         };
         let engine = SyncEngine {
             db: Db::open(&paths.db()).unwrap(),
-            cfg: toml::from_str(ROUTING).unwrap(),
+            cfg: toml::from_str(routing).unwrap(),
             credentials: Default::default(),
             paths,
             log: Arc::new(herdr_board::log::Logger::new("", false)),
@@ -213,6 +254,32 @@ impl Board {
                 rusqlite::params![attempt, herdr_board::screen::fingerprint(screen), at],
             )
             .unwrap();
+    }
+
+    /// Put an attempt part-way through a nudge sequence, with its last nudge
+    /// backdated. Standing in for the minutes between tries, which a test cannot
+    /// wait out (gh#40).
+    fn nudged_secs_ago(&self, attempt: i64, nudges: i64, secs: i64) {
+        let at = herdr_board::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        self.engine
+            .db
+            .conn
+            .execute(
+                "UPDATE attempts SET nudges = ?2, nudged_at = ?3 WHERE id = ?1",
+                rusqlite::params![attempt, nudges, at],
+            )
+            .unwrap();
+    }
+
+    fn nudges(&self, attempt: i64) -> i64 {
+        self.engine
+            .db
+            .live_attempts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == attempt)
+            .expect("the attempt is still live")
+            .nudges
     }
 
     fn state(&self, identifier: &str) -> BoardState {
@@ -424,4 +491,165 @@ fn a_frozen_pane_that_left_a_pull_request_settles_instead() {
         "the operator hears that it finished, not that it stalled: {toasts:?}"
     );
     assert!(!toasts.iter().any(|t| t.contains("stalled")), "{toasts:?}");
+}
+
+// ---- gh#40: nudging the pane instead of leaving it parked -----------------
+
+/// Every `agent prompt` the stub was handed for this pane.
+fn prompts_into(pane: &str) -> Vec<String> {
+    argv_mentioning(&format!("agent prompt {pane}"))
+}
+
+/// The point of gh#40. gh#32 saw the stall and stopped there; three agents then
+/// sat parked for 30, 62 and 65 minutes, and a prompt typed by hand was all any
+/// of them needed. So type it.
+#[test]
+fn a_stalled_agent_is_prompted_to_carry_on() {
+    let b = Board::nudging("nudge");
+    let attempt = b.dispatched("OFF-110", "w1:p110").unwrap();
+    show("w1:p110", DEAD_ON_A_529);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+
+    b.tick(&[working_pane("w1:p110")]);
+
+    let sent = prompts_into("w1:p110");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    // It tells the agent what happened, because from inside the session the last
+    // thing that happened is a turn that produced nothing.
+    assert!(sent[0].contains("529 Overloaded"), "{sent:?}");
+    assert!(sent[0].contains("herdr-board"), "{sent:?}");
+    // Into the pane it is already in. A re-dispatch would throw away half an
+    // hour of context to recover from a transient server error — and would show
+    // up here as a second attempt.
+    let attempts = b.engine.db.attempts_for("linear:OFF-110").unwrap();
+    assert_eq!(attempts.len(), 1, "nudged, not re-dispatched");
+    assert_eq!(attempts[0].pane_id.as_deref(), Some("w1:p110"));
+    assert_eq!(b.nudges(attempt), 1);
+    // And it is still reported for what it is until it proves otherwise.
+    assert_eq!(b.live_status(attempt), Some(AgentStatus::Blocked));
+}
+
+/// Off by default. A board that types into panes unprompted is a different thing
+/// from one that watches them, and that is opted into.
+#[test]
+fn nothing_is_typed_into_a_pane_nobody_asked_for() {
+    let b = Board::new("quiet");
+    let attempt = b.dispatched("OFF-111", "w1:p111").unwrap();
+    show("w1:p111", DEAD_ON_A_529);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+
+    b.tick(&[working_pane("w1:p111")]);
+
+    assert!(prompts_into("w1:p111").is_empty());
+    assert_eq!(b.nudges(attempt), 0);
+    // The reporting gh#32 added is unchanged by the flag being off.
+    assert_eq!(b.live_status(attempt), Some(AgentStatus::Blocked));
+}
+
+/// A stall with no error named is not a 5xx, and nothing is typed into it.
+/// `screen::api_error` is the narrow part, and this is the wiring honouring it.
+#[test]
+fn a_stall_with_no_server_error_on_it_is_not_nudged() {
+    let b = Board::nudging("noerror");
+    let attempt = b.dispatched("OFF-112", "w1:p112").unwrap();
+    show("w1:p112", DEAD_WITHOUT_A_REASON);
+    b.sample_taken_secs_ago(attempt, DEAD_WITHOUT_A_REASON, 40);
+
+    b.tick(&[working_pane("w1:p112")]);
+
+    assert_eq!(b.live_status(attempt), Some(AgentStatus::Blocked));
+    assert!(prompts_into("w1:p112").is_empty());
+}
+
+/// Back off between tries. A pane nudged moments ago has not had time to answer,
+/// and hammering it would tell us nothing a wait does not.
+#[test]
+fn a_pane_nudged_a_moment_ago_is_left_alone() {
+    let b = Board::nudging("backoff");
+    let attempt = b.dispatched("OFF-113", "w1:p113").unwrap();
+    show("w1:p113", DEAD_ON_A_529);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+    b.nudged_secs_ago(attempt, 1, 30);
+
+    b.tick(&[working_pane("w1:p113")]);
+    assert!(prompts_into("w1:p113").is_empty());
+    assert_eq!(b.nudges(attempt), 1, "and the try is not spent either");
+
+    // Once the wait is up, it gets its second.
+    b.nudged_secs_ago(attempt, 1, 200);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+    b.tick(&[working_pane("w1:p113")]);
+    assert_eq!(prompts_into("w1:p113").len(), 1);
+    assert_eq!(b.nudges(attempt), 2);
+}
+
+/// The cap. An agent that has ignored three nudges is not suffering from a 5xx
+/// any more, and going on nudging it would hide that behind a board that looks
+/// busy. It stays blocked, and says why.
+#[test]
+fn a_pane_that_ignored_every_nudge_is_left_blocked_and_said_so() {
+    let b = Board::nudging("capped");
+    let attempt = b.dispatched("OFF-114", "w1:p114").unwrap();
+    show("w1:p114", DEAD_ON_A_529);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+    b.nudged_secs_ago(attempt, herdr_board::nudge::MAX_NUDGES, 3_600);
+
+    b.tick(&[working_pane("w1:p114")]);
+
+    assert!(
+        prompts_into("w1:p114").is_empty(),
+        "three was the allowance"
+    );
+    assert_eq!(b.live_status(attempt), Some(AgentStatus::Blocked));
+    assert_eq!(b.state("OFF-114"), BoardState::Blocked);
+    // The toast is cut at 78 characters, so both facts have to fit inside them:
+    // that the board tried, and what it was up against.
+    let toasts = argv_mentioning("OFF-114 stalled");
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert!(toasts[0].contains("after 3 nudges"), "{toasts:?}");
+    assert!(toasts[0].contains("529"), "{toasts:?}");
+}
+
+/// A nudge that worked costs nothing later. The counter resets — but only once
+/// the pane has been moving long enough for the movement to be the agent rather
+/// than the echo of the nudge itself.
+#[test]
+fn a_pane_that_came_back_gets_its_nudges_back() {
+    let b = Board::nudging("recovered");
+    let attempt = b.dispatched("OFF-115", "w1:p115").unwrap();
+    show("w1:p115", ALIVE);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+
+    // The screen moved, but only seconds after we typed into it. That is what a
+    // nudge looks like being echoed, and clearing here is what would make the
+    // cap unreachable.
+    b.nudged_secs_ago(attempt, 1, 5);
+    b.tick(&[working_pane("w1:p115")]);
+    assert_eq!(b.live_status(attempt), Some(AgentStatus::Working));
+    assert_eq!(b.nudges(attempt), 1, "an echo is not a recovery");
+
+    // Still moving when its next nudge would have been due. An echo is one
+    // frame; this is an agent.
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+    b.nudged_secs_ago(attempt, 1, 200);
+    b.tick(&[working_pane("w1:p115")]);
+    assert_eq!(b.nudges(attempt), 0);
+}
+
+/// The pane may be holding somebody else by now — a handoff, or an agent that
+/// exited and left a shell behind. Typing a prompt at bash is the failure this
+/// check exists for, and it is the same one review delivery makes.
+#[test]
+fn a_pane_that_no_longer_holds_the_agent_is_not_typed_into() {
+    let b = Board::nudging("gone");
+    let attempt = b.dispatched("OFF-116", "w1:p116").unwrap();
+    show("w1:p116", DEAD_ON_A_529);
+    b.sample_taken_secs_ago(attempt, DEAD_ON_A_529, 40);
+
+    let mut pane = working_pane("w1:p116");
+    pane.agent = None;
+    b.tick(&[pane]);
+
+    assert!(prompts_into("w1:p116").is_empty());
+    assert_eq!(b.nudges(attempt), 0);
 }

@@ -1656,6 +1656,18 @@ pub fn render_stats(buf: &mut Buffer, area: Rect, app: &mut App) {
             ),
         ));
     }
+    // The board's judgement about the herd, rather than the herd's own record:
+    // how often it called work finished and had to take that back (gh#34).
+    if s.early_settles > 0 {
+        rows.push((
+            "reopened".into(),
+            format!(
+                "{} attempt{} were still working when closed",
+                s.early_settles,
+                if s.early_settles == 1 { "" } else { "s" }
+            ),
+        ));
+    }
     // The number that says whether the herd is releasing its own work.
     rows.push((
         "released".into(),
@@ -2812,6 +2824,7 @@ mod tests {
             longest_minutes: Some(43),
             completion_rate: Some(10.0 / 11.0),
             retried_tasks: 1,
+            early_settles: 1,
             agent_dispatched: 2,
             by_workspace: [("herdr-board".to_string(), 6)].into_iter().collect(),
             by_runtime: [("claude-code".to_string(), 9)].into_iter().collect(),

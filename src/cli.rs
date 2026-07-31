@@ -556,6 +556,15 @@ pub struct TaskRow {
     /// long-lived poller can tell a fresh cancellation from one it already saw.
     pub last_outcome_at: Option<String>,
     pub attempts: usize,
+    /// How many times the board closed this row's attempt and then caught its
+    /// pane still working (gh#34).
+    ///
+    /// The honest half of a settle a poller may already have acted on. A parent
+    /// that saw `review` with `last_outcome: done`, went to read the pull
+    /// request, and now sees `working` again is not looking at a retry — the
+    /// attempt count is unchanged, because nobody dispatched anything. This is
+    /// the field that says which of the two happened.
+    pub reopened: i64,
 }
 
 /// One task, in the shape callers are promised.
@@ -595,6 +604,7 @@ fn task_row(task: &crate::model::Task, route: Option<&crate::config::Route>) -> 
         last_outcome: closed.and_then(|a| a.outcome).map(|o| o.as_str().to_string()),
         last_outcome_at: closed.and_then(|a| a.ended_at.clone()),
         attempts: task.attempts.len(),
+        reopened: live.or(last).map(|a| a.reopened).unwrap_or(0),
     }
 }
 

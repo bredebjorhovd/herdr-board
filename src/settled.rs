@@ -36,6 +36,14 @@
 //! never started. A `blocked` agent is not one of them. Blocked means the work
 //! is waiting on a *human* — a permission prompt, a question — and there is
 //! nothing the dispatcher can do about it, so it stays a toast.
+//!
+//! ## When a settle is early (gh#34)
+//!
+//! Two of the three ends are events: a pane that is gone is gone. The third is
+//! an inference from a flapping signal — herdr reports `idle`, the branch has
+//! commits on it, so the agent must have finished — and that inference needs a
+//! wait in front of it. [`settling`] is that wait, and it is counted in seconds
+//! rather than in samples for the reason gh#34 exists.
 
 use crate::herdr::{Herdr, PaneInfo};
 use crate::model::{Attempt, Outcome, Task};
@@ -108,6 +116,69 @@ impl Settled {
                  still matters; there is no agent left to prompt."
             }
         }
+    }
+}
+
+// ---- how long "finished" has to hold (gh#34) ------------------------------
+
+/// How long an attempt has to go on looking finished before it is closed on
+/// commits alone.
+///
+/// gh#18 asked for "two consecutive settled samples" and got two *samples*,
+/// which stopped being a wait at all the moment `pane.agent_status_changed`
+/// began invoking reconciliation on demand. It fires several times a second
+/// during a status flap, so both samples can land inside the same second:
+///
+/// ```text
+/// 22:03:06  gh#543 agent idle with commits (tick 1/2)
+/// 22:03:06  gh#543 agent idle with commits — attempt done
+/// ```
+///
+/// That attempt had twenty more minutes of work in it. So the bar is a duration
+/// on a clock, the shape [`crate::screen::STALL_SECS`] already uses in the other
+/// direction — sixty seconds, which is two daemon cycles, the bar gh#18 meant to
+/// set back when a tick *was* thirty seconds apart.
+///
+/// The cost of being wrong the slow way is small, which is what makes a generous
+/// window affordable: the attempt's pane stays open either way, a pull request
+/// skips this wait entirely, and nothing downstream of a settle minds a minute.
+pub const SETTLE_SECS: i64 = 60;
+
+/// The two floors under [`SETTLE_SECS`], checked at build time because a bar
+/// nobody can lower by accident is worth more than a test somebody can delete:
+/// it has to outlast a 30s sync interval, or one daemon cycle clears it without
+/// anything having been observed twice — and it has to be wider than the stall
+/// window whose shape it borrows.
+const _: () = assert!(SETTLE_SECS >= 30);
+const _: () = assert!(SETTLE_SECS >= 2 * crate::screen::STALL_SECS);
+
+/// What a run of finished-looking samples has established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settling {
+    /// Nothing yet: this is the first sample of the run, so start the clock.
+    Started,
+    /// Inside the window. `for_secs` is how long it has looked finished.
+    Waiting { for_secs: i64 },
+    /// It has gone on looking finished for [`SETTLE_SECS`]. Close it.
+    LongEnough,
+}
+
+/// Has an attempt that looks finished looked that way for long enough?
+///
+/// `since_secs` is how long ago it *first* did — not when it was last sampled.
+/// The difference is the whole point: an attempt resampled twice a second must
+/// still age, or the wait is however long two events take, which is nothing.
+///
+/// Pure, so the rule is testable without a clock, a database or a pane: the
+/// caller owns the clock and the storage, this owns the decision.
+pub fn settling(since_secs: Option<i64>) -> Settling {
+    match since_secs {
+        None => Settling::Started,
+        // A stamp in the future lands here too — a clock that stepped backwards
+        // can produce one, and waiting is the safe answer to a time that makes
+        // no sense.
+        Some(secs) if secs < SETTLE_SECS => Settling::Waiting { for_secs: secs },
+        Some(_) => Settling::LongEnough,
     }
 }
 
@@ -352,7 +423,8 @@ mod tests {
             ended_at: None,
             outcome: None,
             missing_ticks: 0,
-            settled_ticks: 0,
+            settled_at: None,
+            reopened: 0,
             agent_status: None,
             dispatched_by: dispatched_by.map(str::to_string),
             dispatched_by_pane: pane.map(str::to_string),
@@ -375,6 +447,43 @@ mod tests {
             cwd: cwd.map(str::to_string),
             scroll_offset: 0,
         }
+    }
+
+    // ---- the wait in front of a settle (gh#34) ---------------------------
+
+    #[test]
+    fn the_first_finished_looking_sample_only_starts_the_clock() {
+        assert_eq!(settling(None), Settling::Started);
+    }
+
+    /// The whole of gh#34. `pane.agent_status_changed` fires several times a
+    /// second during a flap, so a bar counted in samples is met by two events
+    /// stamped the same second — as gh#543 was, twenty minutes before its agent
+    /// stopped. Only elapsed time can tell those two apart.
+    #[test]
+    fn samples_a_moment_apart_establish_nothing() {
+        assert_eq!(settling(Some(0)), Settling::Waiting { for_secs: 0 });
+        assert_eq!(settling(Some(1)), Settling::Waiting { for_secs: 1 });
+        assert_eq!(
+            settling(Some(SETTLE_SECS - 1)),
+            Settling::Waiting {
+                for_secs: SETTLE_SECS - 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_window_of_looking_finished_is_what_closes_it() {
+        assert_eq!(settling(Some(SETTLE_SECS)), Settling::LongEnough);
+        assert_eq!(settling(Some(SETTLE_SECS + 600)), Settling::LongEnough);
+    }
+
+    /// A stamp in the future is what a clock that stepped backwards leaves
+    /// behind. Waiting is the safe reading; settling on it would close an attempt
+    /// on arithmetic nobody can defend.
+    #[test]
+    fn a_stamp_from_the_future_settles_nothing() {
+        assert_eq!(settling(Some(-90)), Settling::Waiting { for_secs: -90 });
     }
 
     // ---- routing ---------------------------------------------------------

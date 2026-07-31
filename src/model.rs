@@ -456,12 +456,17 @@ pub struct Attempt {
     /// stops a freshly-started `idle` agent from being reaped before its
     /// prompt has even been delivered.
     pub saw_working: bool,
-    /// Consecutive samples that looked finished on *commits alone*. Settling
-    /// waits for 2, because `idle` is a screen classification that flaps while
-    /// an agent works, not a stable fact — one badly-timed sample would close
-    /// an attempt mid-turn (gh#18). The mirror image of `missing_ticks`; a PR
-    /// bypasses it entirely.
-    pub settled_ticks: i64,
+    /// When this attempt *first* looked finished on commits alone, and still
+    /// does. Settling waits [`crate::settled::SETTLE_SECS`] from here, because
+    /// `idle` is a screen classification that flaps while an agent works, not a
+    /// stable fact — and counting samples instead of seconds was no wait at all
+    /// once reconciliation began running on demand (gh#18, gh#34). Cleared the
+    /// moment a sample says `working`; a pull request bypasses it entirely.
+    pub settled_at: Option<String>,
+    /// How many times the board closed this attempt and then found its pane
+    /// working again (gh#34). Not a retry: nobody dispatched anything, so it is
+    /// counted here on the one attempt rather than by inventing a second one.
+    pub reopened: i64,
     /// Digest of this pane's screen the last time it changed, and when that was
     /// — see [`crate::screen::fingerprint`]. Together they answer the one
     /// question a detection manifest cannot: whether the spinner it matched is

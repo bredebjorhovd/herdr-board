@@ -306,6 +306,21 @@ pub struct Defaults {
     /// never fires for operator-released work, which has no dispatcher.
     #[serde(default)]
     pub notify_dispatcher: bool,
+    /// Prompt an agent whose turn died on an Anthropic 5xx to carry on (gh#40).
+    ///
+    /// gh#32 already sees the stall — a `working` pane whose screen has not moved
+    /// with an `API Error: 5xx` on it — and reports it `blocked`. This is the
+    /// board acting on it: [`crate::wake::wake`] into the same pane, a few times,
+    /// with a wait between. Never a re-dispatch; the agent's context is intact
+    /// and only one turn died.
+    ///
+    /// **Off by default**, for the reason [`notify_dispatcher`](Self::notify_dispatcher)
+    /// is: a board that types into panes unprompted is a different thing from one
+    /// that watches them. It is also how you keep it out of a fight with another
+    /// watcher — anything else retrying the same agents wants exactly one of the
+    /// two turned on, because two things nudging one pane is worse than neither.
+    #[serde(default)]
+    pub nudge_stalled: bool,
     /// Which tracker `herdr-board new` writes to: `linear` or `github`.
     ///
     /// Not inferable from a label — a label routes work to a repo and says
@@ -340,6 +355,7 @@ impl Default for Defaults {
             branch_template: default_branch_template(),
             notify: true,
             notify_dispatcher: false,
+            nudge_stalled: false,
             new_source: default_new_source(),
             split_direction: None,
             max_panes_per_tab: default_max_panes_per_tab(),

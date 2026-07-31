@@ -16,7 +16,7 @@ pub struct Db {
 const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktree, branch, \
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
-     settled_at, reopened, screen_print, screen_at";
+     settled_at, reopened, screen_print, screen_at, nudges, nudged_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -45,6 +45,8 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         reopened: r.get(17)?,
         screen_print: r.get(18)?,
         screen_at: r.get(19)?,
+        nudges: r.get(20)?,
+        nudged_at: r.get(21)?,
     })
 }
 
@@ -140,7 +142,11 @@ impl Db {
               -- seen. A `working` status whose screen has not changed since is
               -- not a running turn — see gh#32 and `crate::screen::vitals`.
               screen_print TEXT,
-              screen_at    TEXT
+              screen_at    TEXT,
+              -- Nudges sent into this pane for the stall it is currently in, and
+              -- when the last one went (gh#40). Cleared once the pane comes back.
+              nudges       INTEGER NOT NULL DEFAULT 0,
+              nudged_at    TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -231,6 +237,12 @@ impl Db {
                 // cannot: whether a spinner it matched is live (gh#32).
                 ("screen_print", "TEXT"),
                 ("screen_at", "TEXT"),
+                // Times the board has prompted this pane to carry on after its
+                // turn died on an Anthropic 5xx, and when it last did (gh#40).
+                // Existing rows keep 0, which is "nothing tried yet" — right for
+                // a stall that predates the feature as much as for a fresh one.
+                ("nudges", "INTEGER NOT NULL DEFAULT 0"),
+                ("nudged_at", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -626,6 +638,35 @@ impl Db {
         Ok(())
     }
 
+    /// Count a nudge sent into this attempt's pane, and stamp when (gh#40).
+    ///
+    /// Counted whatever the delivery reported, because the cap is what bounds
+    /// this: a `herdr agent prompt` that keeps failing is a thing to try a few
+    /// times and then stop, exactly like one that keeps being ignored, and a
+    /// refusal that did not count would leave the board retrying it every cycle
+    /// forever. Which it was is in the log line beside it.
+    pub fn set_nudged(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET nudges = nudges + 1, nudged_at = ?2 WHERE id = ?1",
+            params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Give an attempt its full allowance of nudges back, because its pane came
+    /// back to life.
+    ///
+    /// Not called on the first sign of movement: a nudge lands as text and gets
+    /// echoed, so the screen moves once for a nudge that achieved nothing. See
+    /// [`crate::nudge::recovered`] for what is waited for instead.
+    pub fn clear_nudges(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET nudges = 0, nudged_at = NULL WHERE id = ?1",
+            params![attempt_id],
+        )?;
+        Ok(())
+    }
+
     /// Start or stop the clock on an attempt that looks finished.
     ///
     /// `Some` only ever on the first sample of a run — restamping it on every
@@ -662,6 +703,7 @@ impl Db {
         let n = self.conn.execute(
             "UPDATE attempts SET outcome = NULL, ended_at = NULL, settled_at = NULL,
                     missing_ticks = 0, screen_print = NULL, screen_at = NULL,
+                    nudges = 0, nudged_at = NULL,
                     reopened = reopened + 1
              WHERE id = ?1 AND outcome IS NOT NULL
                AND NOT EXISTS (

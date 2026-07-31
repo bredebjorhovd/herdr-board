@@ -878,6 +878,8 @@ mod tests {
             saw_working: true,
             screen_print: None,
             screen_at: None,
+            nudges: 0,
+            nudged_at: None,
         }
     }
 

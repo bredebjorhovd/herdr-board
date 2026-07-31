@@ -473,6 +473,13 @@ pub struct Attempt {
     /// live, or a line left in scrollback by a turn that died (gh#32).
     pub screen_print: Option<String>,
     pub screen_at: Option<String>,
+    /// How many times the board has typed a "carry on" into this pane for the
+    /// stall it is currently in, and when the last one went (gh#40). Capped at
+    /// [`crate::nudge::MAX_NUDGES`], and cleared once the pane has been moving
+    /// long enough for the movement to be the agent rather than the echo of the
+    /// nudge itself — see [`crate::nudge::recovered`].
+    pub nudges: i64,
+    pub nudged_at: Option<String>,
 }
 
 impl Attempt {

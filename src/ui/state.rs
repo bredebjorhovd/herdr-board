@@ -153,6 +153,14 @@ pub enum Filter {
     All,
     /// One route, cycled with `f`.
     Route(String),
+    /// The rows nothing routes, cycled with `f` after the named routes.
+    ///
+    /// Not a missing filter but a real one: a route that ANDs a repo with a
+    /// label leaves most of that repo's backlog marked `no route`, on the
+    /// board and deliberately undispatchable. Without a position of their own
+    /// they are the rows you most need to see as a group and the only ones you
+    /// cannot filter to — or away from.
+    NoRoute,
     /// A substring of identifier, title or route, typed at `/`.
     Text(String),
 }
@@ -166,12 +174,20 @@ impl Filter {
         match self {
             Filter::All => true,
             Filter::Route(r) => v.route_name.as_deref() == Some(r.as_str()),
+            // The same field the named routes partition on, so every row is in
+            // exactly one position of the cycle.
+            Filter::NoRoute => v.route_name.is_none(),
             Filter::Text(q) => {
                 let q = q.trim();
                 q.is_empty()
                     || contains(&v.task.identifier, q)
                     || contains(&v.task.title, q)
                     || v.route_name.as_deref().is_some_and(|r| contains(r, q))
+                    // The route column renders `no route` on such a row, and
+                    // matching what is rendered is the least surprising rule —
+                    // it also makes `/no route` reach the group without having
+                    // to know `f` exists at all.
+                    || (v.route_name.is_none() && contains(NO_ROUTE, q))
             }
         }
     }
@@ -183,9 +199,16 @@ impl Filter {
     /// whenever a route is picked would hide it exactly when you are looking
     /// project by project. A typed query is different — it is a search, and a
     /// repo is findable by name like anything else.
+    ///
+    /// `no route` is no exception, and the section's own header is what keeps
+    /// the two apart: an unadopted repo has no board config and nothing polls
+    /// it, while a `no route` row *is* polled and is deliberately
+    /// undispatchable. One is a gap to close and the other a choice being
+    /// honoured, so the filter counts neither as the other — but it does not
+    /// pretend, on this one position, that the gap stopped existing.
     pub fn matches_repo(&self, u: &crate::adopt::Unadopted) -> bool {
         match self {
-            Filter::All | Filter::Route(_) => true,
+            Filter::All | Filter::Route(_) | Filter::NoRoute => true,
             Filter::Text(q) => {
                 let q = q.trim();
                 q.is_empty() || contains(&u.label, q) || contains(&u.slug, q)
@@ -199,6 +222,9 @@ impl Filter {
         match self {
             Filter::All => None,
             Filter::Route(r) => Some(format!("filter: {r}")),
+            // Said the way any other position is said, and in the words the
+            // rows themselves use.
+            Filter::NoRoute => Some(format!("filter: {NO_ROUTE}")),
             Filter::Text(q) => Some(format!("/{q}")),
         }
     }
@@ -216,12 +242,22 @@ impl Filter {
             Filter::Route(r) => Some(format!(
                 "Nothing on the board routes to {r}.  f moves on, F clears the filter."
             )),
+            // Reachable when the last unrouted row leaves under the filter —
+            // `f` never offers this position on a board where everything routes.
+            Filter::NoRoute => Some(
+                "Everything on the board has a route.  f moves on, F clears the filter."
+                    .to_string(),
+            ),
             Filter::Text(q) => Some(format!(
                 "No identifier, title or route matches `{q}`.  F clears the filter."
             )),
         }
     }
 }
+
+/// What the route column renders for a row nothing routes — and so what the
+/// header says, and what a typed query has to match.
+pub const NO_ROUTE: &str = "no route";
 
 fn contains(hay: &str, needle: &str) -> bool {
     hay.to_lowercase().contains(&needle.to_lowercase())
@@ -727,9 +763,7 @@ impl App {
     /// a route whose only rows are yesterday's `done` would filter to nothing.
     pub fn routes_present(&self) -> Vec<String> {
         let mut out: Vec<String> = self
-            .views
-            .iter()
-            .filter(|v| v.state() != BoardState::Done || finished_today(v))
+            .on_board()
             .filter_map(|v| v.route_name.clone())
             .collect();
         out.sort_unstable();
@@ -737,31 +771,62 @@ impl App {
         out
     }
 
-    /// `f` — the next route, then back to all.
+    /// The rows `f` is a tour of: everything except history older than today.
+    ///
+    /// Whether a position is offered and what it then shows have to be decided
+    /// from the same rows, or `f` offers stops that filter to nothing.
+    fn on_board(&self) -> impl Iterator<Item = &TaskView> {
+        self.views
+            .iter()
+            .filter(|v| v.state() != BoardState::Done || finished_today(v))
+    }
+
+    /// The positions `f` steps through, in order. `all` is the wrap, not a
+    /// position.
+    ///
+    /// `no route` comes last, after the named routes: it is the odd one out,
+    /// and putting it at the end leaves the routes in a stable order as they
+    /// come and go rather than shifting every one of them by a place.
+    ///
+    /// A position with no rows is never offered — an empty one is a keypress
+    /// that appears to do nothing, which reads as a bug. That is why a route
+    /// whose only row closed yesterday is left out, and it is the same reason
+    /// `no route` is skipped on a board where everything routes.
+    pub fn filter_cycle(&self) -> Vec<Filter> {
+        let mut out: Vec<Filter> = self.routes_present().into_iter().map(Filter::Route).collect();
+        if self.on_board().any(|v| v.route_name.is_none()) {
+            out.push(Filter::NoRoute);
+        }
+        out
+    }
+
+    /// `f` — the next position, then back to all.
     ///
     /// No input mode, no cursor, nothing to escape: one key, and one more press
-    /// always gets you further out. Wrapping past the last route lands on
+    /// always gets you further out. Wrapping past the last position lands on
     /// everything, which is the way back for anyone who never finds `F`.
     pub fn cycle_route(&mut self) {
-        let routes = self.routes_present();
-        if routes.is_empty() {
+        let cycle = self.filter_cycle();
+        if cycle.is_empty() {
+            // Every row is in some position now, so an empty cycle means an
+            // empty board — there is nothing to say about routes.
             self.clear_filter();
-            self.flash("no row on the board has a route");
+            self.flash("nothing on the board to filter");
             return;
         }
         let next = match &self.filter {
-            Filter::Route(cur) => match routes.iter().position(|r| r == cur) {
-                Some(i) => i + 1,
-                // The route left the board while it was filtering; start again
-                // rather than dropping the operator somewhere arbitrary.
-                None => 0,
-            },
+            cur @ (Filter::Route(_) | Filter::NoRoute) => {
+                match cycle.iter().position(|c| c == cur) {
+                    Some(i) => i + 1,
+                    // The position left the board while it was filtering; start
+                    // again rather than dropping the operator somewhere
+                    // arbitrary.
+                    None => 0,
+                }
+            }
             _ => 0,
         };
-        self.filter = match routes.get(next) {
-            Some(r) => Filter::Route(r.clone()),
-            None => Filter::All,
-        };
+        self.filter = cycle.get(next).cloned().unwrap_or(Filter::All);
         self.typing = false;
         self.clamp_selection();
     }
@@ -1225,6 +1290,17 @@ mod tests {
         }
     }
 
+    /// Polled, on the board, and routed by nothing.
+    fn unrouted_view(id: &str, state: BoardState) -> TaskView {
+        TaskView {
+            has_route: false,
+            route_name: None,
+            workspace: None,
+            runtime: None,
+            ..view(id, state)
+        }
+    }
+
     /// Three routes, so cycling has somewhere to go.
     fn many_routes() -> App {
         App::new(
@@ -1237,6 +1313,23 @@ mod tests {
             sync(),
             "/cfg".into(),
         )
+    }
+
+    /// The task ids the filter shows, without the section headers between them.
+    fn shown_ids(a: &App) -> Vec<String> {
+        a.sections()
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .map(|v| v.id().to_string())
+            .collect()
+    }
+
+    /// The same three routes, plus the group nothing routes.
+    fn many_routes_and_unrouted() -> App {
+        let mut a = many_routes();
+        a.views.push(unrouted_view("u1", BoardState::Ready));
+        a.views.push(unrouted_view("u2", BoardState::Ready));
+        a
     }
 
     #[test]
@@ -1254,6 +1347,128 @@ mod tests {
         assert_eq!(a.filter, Filter::Route("tally".into()));
         a.cycle_route();
         assert_eq!(a.filter, Filter::All, "the tour has to end back at the board");
+    }
+
+    // ---- gh#39: no route is a position, not a gap in the cycle ----------
+
+    #[test]
+    fn f_reaches_the_rows_nothing_routes_last_and_then_goes_back_to_all() {
+        // The rows you most need to see as a group used to be the only ones
+        // with no cycle position. It comes after the named routes: the odd one
+        // out, placed where it does not shift the routes as they come and go.
+        let mut a = many_routes_and_unrouted();
+        assert_eq!(
+            a.filter_cycle(),
+            vec![
+                Filter::Route("itsm-agent".into()),
+                Filter::Route("offhand".into()),
+                Filter::Route("tally".into()),
+                Filter::NoRoute,
+            ]
+        );
+
+        for _ in 0..3 {
+            a.cycle_route();
+        }
+        assert_eq!(a.filter, Filter::Route("tally".into()));
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::NoRoute);
+        assert_eq!(
+            shown_ids(&a),
+            vec!["u1", "u2"],
+            "the position shows the group and nothing else"
+        );
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::All, "the tour still ends back at the board");
+    }
+
+    #[test]
+    fn no_route_is_skipped_when_every_row_has_one() {
+        // An empty position is a keypress that appears to do nothing, which
+        // reads as a bug — the same reason a route with no rows is skipped.
+        let a = many_routes();
+        assert!(!a.filter_cycle().contains(&Filter::NoRoute));
+    }
+
+    #[test]
+    fn an_unrouted_row_that_closed_yesterday_does_not_offer_the_position() {
+        // `done` is bounded to today, so the position would filter to nothing —
+        // exactly what disqualifies a named route.
+        let mut old = unrouted_view("old", BoardState::Done);
+        old.task.updated_at = "2020-01-01T00:00:00Z".into();
+        let a = App::new(
+            vec![old, routed("a", BoardState::Ready, "offhand")],
+            sync(),
+            "/cfg".into(),
+        );
+        assert_eq!(a.filter_cycle(), vec![Filter::Route("offhand".into())]);
+    }
+
+    #[test]
+    fn a_board_where_nothing_routes_still_filters_to_the_group() {
+        // With no named route at all `f` used to flash and give up, on the one
+        // board where the group is the entire backlog.
+        let mut a = App::new(
+            vec![
+                unrouted_view("u1", BoardState::Ready),
+                unrouted_view("u2", BoardState::Blocked),
+            ],
+            sync(),
+            "/cfg".into(),
+        );
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::NoRoute);
+        assert_eq!(a.shown_tasks(), 2);
+    }
+
+    #[test]
+    fn f_on_an_empty_board_says_so_and_leaves_the_filter_alone() {
+        // Every row is in some position now, so an empty cycle means an empty
+        // board — not a board without routes.
+        let mut a = App::new(Vec::new(), sync(), "/cfg".into());
+        a.cycle_route();
+        assert_eq!(a.filter, Filter::All);
+    }
+
+    #[test]
+    fn the_header_names_the_no_route_position_like_any_other() {
+        // A filtered board that does not say what it is filtered to looks
+        // broken, and this position is no more special than a route.
+        assert_eq!(Filter::NoRoute.label().as_deref(), Some("filter: no route"));
+        assert!(Filter::NoRoute.active());
+        assert!(Filter::NoRoute.empty_note().is_some());
+    }
+
+    #[test]
+    fn the_no_route_position_is_not_the_unadopted_section() {
+        // An unadopted repo has no board config and nothing polls it; a
+        // `no route` row is polled, on the board, and deliberately
+        // undispatchable. The section keeps its own header and its own rows —
+        // filtering to one group never counts the other as part of it.
+        let mut a = many_routes_and_unrouted();
+        a.unadopted = vec![unadopted("o/thing")];
+        a.filter = Filter::NoRoute;
+        assert_eq!(a.shown_tasks(), 2, "an unadopted repo was counted as a row");
+        let rows = a.rows();
+        assert!(
+            rows.contains(&Row::UnadoptedSection),
+            "the gap stopped being visible on exactly the position it reads like"
+        );
+        assert!(rows.contains(&Row::Unadopted("o/thing".into())));
+    }
+
+    #[test]
+    fn a_typed_query_matches_no_route_as_the_column_renders_it() {
+        // The route column renders that string, so `/no route` reaches the
+        // group without having to know `f` exists — and reaches the same rows.
+        let mut a = many_routes_and_unrouted();
+        a.filter = Filter::Text("no route".into());
+        assert_eq!(shown_ids(&a), vec!["u1", "u2"]);
+
+        a.filter = Filter::NoRoute;
+        let by_cycle = shown_ids(&a);
+        a.filter = Filter::Text("NO ROUTE".into());
+        assert_eq!(shown_ids(&a), by_cycle, "the two disagree on the group");
     }
 
     #[test]

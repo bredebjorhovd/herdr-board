@@ -294,7 +294,7 @@ waiting: telling you to go poke a finished agent would be worse than silence.
 | `space` | adoption screen | pick a label to poll that repo for |
 | `enter` | adoption screen | adopt, with whatever is picked |
 | `X` | unadopted repo | ignore — stop offering it |
-| `f` | list | show one route, then the next, then all of them |
+| `f` | list | one route, then the next, then no route, then all |
 | `/` | list | find — matches identifier, title and route as you type |
 | `F` | list | clear whichever filter is on |
 | `s` | anywhere | sync now |
@@ -346,23 +346,45 @@ stay distinguishable.
 
 ### Showing less than everything
 
-A board is a queue you scan at a glance. At 109 rows that are not done — 83 of
+A board is a queue you scan at a glance. At 129 rows that are not done — most of
 them from one repo whose roadmap lives as open issues — it stopped being one.
 
 Two controls, because they answer different questions:
 
-* **`f`** cycles the routes that actually have a row on the board, then back to
-  all of them. *Show me one project.* No input mode, no cursor, nothing to
-  escape: one more press always gets you further out.
+* **`f`** cycles the routes that actually have a row on the board, then the rows
+  nothing routes, then back to all of them. *Show me one project.* No input
+  mode, no cursor, nothing to escape: one more press always gets you further
+  out.
 * **`/`** opens a text field that matches identifier, title and route as you
   type. *Where was that ticket.* Finds a word across every repo at once. `enter`
   keeps the query and hands the keys back to the board; `esc` clears it.
 * **`F`** clears whichever is on.
 
 The header says which, in the corner where the sync status sits — `filter:
-itsm-agent`, or `/altinn`. A filtered board that does not say so is a board that
-looks broken, so the filter holds that corner and the status gives way to it as
-the pane narrows.
+itsm-agent`, `filter: no route`, or `/altinn`. A filtered board that does not
+say so is a board that looks broken, so the filter holds that corner and the
+status gives way to it as the pane narrows.
+
+**`no route` is a position in the cycle, not a gap in it.** A route that ANDs a
+repo with a label leaves most of that repo's backlog polled, on the board and
+deliberately undispatchable — the rows you most need to see as a group used to
+be the only ones with no cycle position, so they could be neither filtered to
+nor filtered away. Two choices made on purpose:
+
+* **It comes last**, after the named routes. It is the odd one out, and putting
+  it at the end leaves the routes in a stable order as they come and go.
+* **It is offered only when some row lacks a route**, the same way a route with
+  no rows on the board is skipped. An empty position is a keypress that appears
+  to do nothing, which reads as a bug.
+
+`/no route` matches the same rows, because that is the string the route column
+renders — so the group is reachable without knowing `f` exists.
+
+**It is not UNADOPTED, and the difference matters.** An unadopted repo has no
+board config at all and nothing polls it; a `no route` row *is* polled and is
+undispatchable by choice. One is a gap to close, the other a choice being
+honoured, so they stay two buckets: the section keeps its own header under the
+`no route` filter, and its repos are never counted as rows of it.
 
 **A filter is a view, and it changes nothing else.** Not what syncs, not what is
 dispatchable, not what counts against `max_concurrent_per_workspace`. A hidden
@@ -1306,19 +1328,19 @@ resolved here rather than guessed at repeatedly.
 ## Development
 
 ```bash
-cargo test                 # 493 tests (472 unit, 21 integration)
+cargo test                 # 568 tests (532 unit, 36 integration)
 cargo clippy --all-targets -- -D warnings
 cargo run -- demo --list   # every board state, no network or database
 cargo run -- demo linear-down
 ```
 
 The demo covers: populated, empty, source-down, syncd-dead, stale-binding,
-unadopted and crowded, including the `no route` row, the idle working row, both
+unadopted and crowded, including the `no route` rows, the idle working row, both
 confirmations and the outcome lines that follow them, the UNADOPTED section in
 all three shapes of missing config, and all four screens. `crowded` is the board
-filtering exists for — 109 rows that are not done over five routes, 83 of them
-from one repo — because reviewing `f` and `/` against ten rows reviews them
-where they are not needed. `n` cycles scenarios, and
+filtering exists for — 129 rows that are not done over five routes and no route
+at all, 103 of them from one repo — because reviewing `f` and `/` against ten
+rows reviews them where they are not needed. `n` cycles scenarios, and
 the mouse works exactly as it does on the real board — a demo that ignores
 clicks cannot be used to review the mouse.
 

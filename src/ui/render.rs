@@ -321,11 +321,12 @@ pub fn metadata(v: &TaskView, selected: bool, width: u16) -> String {
                 .unwrap_or_default();
             if !v.has_route {
                 // A property of the issue, not an affordance for the cursor —
-                // so it shows on every such row, selected or not.
+                // so it shows on every such row, selected or not. The same
+                // words `f` and `/` filter by, from the one constant.
                 if repo.is_empty() {
-                    "no route".into()
+                    NO_ROUTE.into()
                 } else {
-                    format!("{repo} · no route")
+                    format!("{repo} · {NO_ROUTE}")
                 }
             } else if selected {
                 // Repeating this on every ready row is four copies of one
@@ -1209,7 +1210,7 @@ pub const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "filter",
         &[
-            ("f", "show one route, then the next, then all of them"),
+            ("f", "one route, then the next, then no route, then all"),
             ("/", "find — matches identifier, title and route as you type"),
             ("F", "clear the filter"),
         ],
@@ -3012,7 +3013,7 @@ mod tests {
 
     #[test]
     fn filtering_to_one_route_leaves_only_that_routes_rows_and_sections() {
-        // The board this exists for: 109 rows over five routes, down to one
+        // The board this exists for: 129 rows over five routes, down to one
         // project you can read at a glance.
         let mut app = fixtures::app(fixtures::CROWDED);
         app.filter = Filter::Route("tally".into());
@@ -3043,7 +3044,42 @@ mod tests {
         assert!(all.contains("tripletex-mcp"), "{all}");
     }
 
+    // ---- gh#39: no route is a position, not a gap in the cycle ----------
 
+    #[test]
+    fn the_header_names_the_no_route_position_in_the_rows_own_words() {
+        // It is a cycle position like any other, and the header has to read
+        // like one — in the string the route column already renders.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        app.filter = Filter::NoRoute;
+        let head = line(&draw(&mut app, 100, 30), 0);
+        assert!(head.contains("filter: no route"), "{head:?}");
+
+        // Every task row it left on screen is one nothing routes — and the
+        // sections whose rows all route are gone with them.
+        let all = body(&mut app, 100, 40);
+        assert!(all.contains(NO_ROUTE), "the rows it filtered to:\n{all}");
+        assert!(!all.contains("WORKING"), "a routed row survived:\n{all}");
+        for v in app.sections().iter().flat_map(|(_, rows)| rows) {
+            assert!(!v.has_route, "{} routes to {:?}", v.id(), v.route_name);
+        }
+    }
+
+    #[test]
+    fn f_steps_from_the_last_route_onto_no_route_and_then_off_the_filter() {
+        // The last position, after the named routes — and one more press is
+        // still the way out for anyone who never finds `F`.
+        let mut app = fixtures::app(fixtures::CROWDED);
+        let cycle = app.filter_cycle();
+        assert_eq!(cycle.last(), Some(&Filter::NoRoute), "{cycle:?}");
+        for _ in 0..cycle.len() {
+            app.cycle_route();
+        }
+        assert_eq!(app.filter, Filter::NoRoute);
+        assert!(line(&draw(&mut app, 100, 30), 0).contains("filter: no route"));
+        app.cycle_route();
+        assert_eq!(app.filter, Filter::All);
+    }
 
 
     #[test]

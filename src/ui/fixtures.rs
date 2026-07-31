@@ -263,6 +263,26 @@ fn routed(task: Task, route: &str, elapsed: Option<i64>) -> TaskView {
     }
 }
 
+/// Polled, on the board, and deliberately undispatchable.
+///
+/// The route names the repo *and* a label, so the issues without that label
+/// are still polled and still shown — with no route, which is the answer and
+/// not an oversight.
+fn unrouted(task: Task) -> TaskView {
+    let repo = crate::model::gh_repo_name(&task.id).map(str::to_string);
+    TaskView {
+        has_route: false,
+        route_name: None,
+        runtime: None,
+        workspace: None,
+        // Nothing resolves a branch or a prompt for a row nothing routes.
+        branch: None,
+        resolved_prompt: None,
+        repo,
+        ..view(task, None)
+    }
+}
+
 /// Enough distinct titles to fill a repo's whole open backlog without any two
 /// rows reading alike — 83 identical lines would be a fixture nobody believes.
 const CROWD_VERBS: &[&str] = &[
@@ -281,6 +301,8 @@ const CROWD_SUBJECTS: &[&str] = &[
     "the ledger export writer",
     "the duplicate-invoice guard",
     "the SAF-T column mapping",
+    "the bank statement importer",
+    "the depreciation schedule",
 ];
 
 /// Distinct for every `i` below `verbs × subjects`, which is what the callers
@@ -293,11 +315,13 @@ fn crowd_title(i: usize) -> String {
     )
 }
 
-/// 109 rows that are not done, across five routes.
+/// 129 rows that are not done, across five routes and no route at all.
 ///
-/// The shape AGE-27 is about: one repo contributing 83 of them because
+/// The shape AGE-27 is about: one repo contributing most of them because
 /// `[github] labels = []` polls every open issue, and four other routes whose
-/// handful of rows are the ones you actually came to look at.
+/// handful of rows are the ones you actually came to look at. That repo's
+/// route then claims only the labelled ones, so 20 of its rows sit on the
+/// board with no route — the group gh#39 gives `f` a position for.
 fn crowded_views() -> Vec<TaskView> {
     // The ordinary board, all on one route, still on it underneath the flood.
     let mut out = populated_views();
@@ -321,6 +345,19 @@ fn crowded_views() -> Vec<TaskView> {
         }
         let elapsed = t.attempts.first().map(|_| 60 + i as i64 * 37);
         out.push(routed(t, "itsm-agent", elapsed));
+    }
+
+    // The same repo's other backlog: polled, on the board, and routed by
+    // nothing, because the route ANDs the repo with a label these issues do
+    // not carry. Not an oversight and not a handful — the group `f` had no
+    // position for.
+    for i in 0..20 {
+        out.push(unrouted(gh_task(
+            "Florin-AS/itsm-agent",
+            800 + i as u32,
+            &crowd_title(103 + i),
+            BoardState::Ready,
+        )));
     }
 
     // Three repos with the backlog a curated tracker actually has. Their title
@@ -522,14 +559,22 @@ mod tests {
     #[test]
     fn the_crowded_scenario_is_the_board_that_stopped_being_scannable() {
         // The shape AGE-27 is about, and the size the filter has to work at:
-        // 109 rows that are not done, across five routes, 83 of them from the
+        // 129 rows that are not done, across five routes, 103 of them from the
         // one repo that polls every open issue it has.
         let a = app(CROWDED);
         let live = a.views.iter().filter(|v| v.state() != BoardState::Done).count();
-        assert_eq!(live, 109, "the fixture is no longer the size of the problem");
+        assert_eq!(live, 129, "the fixture is no longer the size of the problem");
         assert_eq!(
             a.routes_present(),
             vec!["altinn-forms", "brreg-client", "itsm-agent", "offhand", "tally"]
+        );
+        // ...and one more position after them, because a fifth of that repo's
+        // backlog is polled and routed by nothing (gh#39).
+        assert_eq!(a.filter_cycle().last(), Some(&Filter::NoRoute));
+        assert_eq!(
+            a.views.iter().filter(|v| !v.has_route).count(),
+            21,
+            "the deliberately undispatchable group is not a group any more"
         );
         let itsm = a
             .views

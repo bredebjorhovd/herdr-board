@@ -1,9 +1,9 @@
 # herdr-board
 
-A personal task board that runs inside [herdr](https://herdr.dev). Linear issues
-(read-write) and GitHub issues/PRs (read-only) come in; one keypress sends a task
-into a herdr pane with a coding agent; pane state reconciles back to the board
-and to Linear.
+A task board that runs inside [herdr](https://herdr.dev). GitHub issues and PRs
+are the main source now, with Linear (read-write) still on the board. Coding
+agents do the running: they queue up, dispatch one another, follow the work, and
+PR reviews are delivered back to the agent that wrote them.
 
 Single operator, local-first, no cloud components. Target: herdr ≥ 0.7.5.
 

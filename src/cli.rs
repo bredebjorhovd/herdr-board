@@ -274,16 +274,21 @@ fn rebuild_if_configuration_changed(
 ) -> Option<SyncEngine> {
     let linear_changed = credentials.linear_api_key != engine.credentials.linear_api_key;
     let github_changed = credentials.github_token != engine.credentials.github_token;
-    let repos_changed = cfg.github.repos != engine.cfg.github.repos;
-    let routes_changed = cfg.routes.len() != engine.cfg.routes.len();
+    // The whole file, not a proxy for it. Comparing the repo list and the route
+    // count missed every edit that kept both the same size — narrowing an
+    // existing route's `match`, moving a label filter between `[[github.repo]]`
+    // and a route, any `[defaults]` key at all — and the daemon then went on
+    // applying the config it started with while `sync --once` in a shell read
+    // the file and disagreed with it, with nothing on screen to say why (gh#37).
+    let routing_changed = cfg != engine.cfg;
 
-    if !(linear_changed || github_changed || repos_changed || routes_changed) {
+    if !(linear_changed || github_changed || routing_changed) {
         return None;
     }
     log.info(format!(
         "configuration changed (linear credential:{linear_changed} \
          github credential:{github_changed} \
-         repos:{repos_changed} routes:{routes_changed}) — rebuilding"
+         routing.toml:{routing_changed}) — rebuilding"
     ));
     let rebuilt = Db::open(&paths.db()).and_then(|db| {
         build_engine_with_credentials(db, cfg, paths.clone(), log.clone(), credentials)
@@ -2039,5 +2044,89 @@ mod tests {
         .expect("a removed key should rebuild the engine");
         assert_eq!(removed.credentials.linear_api_key, None);
         assert!(removed.linear.is_none());
+    }
+
+    /// gh#37. Both of these edits leave the repo list and the route count
+    /// exactly as they were, and both change which issues the board keeps —
+    /// which is how a running daemon came to delete rows that `sync --once`
+    /// in a shell, reading the file fresh, kept every time.
+    #[test]
+    fn an_edit_that_moves_no_repo_and_no_route_still_rebuilds() {
+        let paths = tmp();
+        let log = Arc::new(Logger::new("", false));
+        let write = |text: &str| {
+            std::fs::write(paths.routing(), text).unwrap();
+            RoutingConfig::load(&paths.routing())
+                .expect("fixture must be a config the loader takes")
+        };
+        let engine_for = |cfg: RoutingConfig| {
+            build_engine_with_credentials(
+                Db::open(&paths.db()).unwrap(),
+                cfg,
+                paths.clone(),
+                log.clone(),
+                Credentials::default(),
+            )
+            .unwrap()
+        };
+
+        let before = write(
+            "[github]\nrepos = [\"bredebjorhovd/papegoye\"]\n\n\
+             [[github.repo]]\nname = \"bredebjorhovd/papegoye\"\nlabels = [\"agent\"]\n\n\
+             [[route]]\nworkspace = \"papegoye\"\nrepo = \"~/dev/papegoye\"\nruntime = \"claude\"\n\
+             [route.match]\ngh_repo = \"bredebjorhovd/papegoye\"\n",
+        );
+        let engine = engine_for(before);
+
+        // The edit that bit: the label filter moves off the repo and into the
+        // route's `match`. One repo before and after, one route before and
+        // after, and a different set of issues polled.
+        let narrowed = write(
+            "[github]\nrepos = [\"bredebjorhovd/papegoye\"]\n\n\
+             [[github.repo]]\nname = \"bredebjorhovd/papegoye\"\nlabels = []\n\n\
+             [[route]]\nworkspace = \"papegoye\"\nrepo = \"~/dev/papegoye\"\nruntime = \"claude\"\n\
+             [route.match]\ngh_repo = \"bredebjorhovd/papegoye\"\nlabel = \"agent\"\n",
+        );
+        let rebuilt = rebuild_if_configuration_changed(
+            &paths,
+            &engine,
+            &log,
+            Credentials::default(),
+            narrowed,
+        )
+        .expect("an edited route match and repo filter should rebuild the engine");
+        let polled = rebuilt.cfg.github.labels_for("bredebjorhovd/papegoye");
+        assert!(
+            polled.is_empty(),
+            "the daemon kept polling for the old label filter: {polled:?}"
+        );
+        assert_eq!(rebuilt.cfg.routes[0].match_.label.as_deref(), Some("agent"));
+
+        // A `[defaults]` key is no different: nothing about it touches repos or
+        // routes, and it decides what dispatch does.
+        let toggled = write(
+            "[defaults]\nnotify = false\n\n\
+             [github]\nrepos = [\"bredebjorhovd/papegoye\"]\n\n\
+             [[github.repo]]\nname = \"bredebjorhovd/papegoye\"\nlabels = []\n\n\
+             [[route]]\nworkspace = \"papegoye\"\nrepo = \"~/dev/papegoye\"\nruntime = \"claude\"\n\
+             [route.match]\ngh_repo = \"bredebjorhovd/papegoye\"\nlabel = \"agent\"\n",
+        );
+        let again = rebuild_if_configuration_changed(
+            &paths,
+            &rebuilt,
+            &log,
+            Credentials::default(),
+            toggled,
+        )
+        .expect("an edited [defaults] key should rebuild the engine");
+        assert!(!again.cfg.defaults.notify);
+
+        // And an unchanged file still rebuilds nothing.
+        let same = RoutingConfig::load(&paths.routing()).unwrap();
+        assert!(
+            rebuild_if_configuration_changed(&paths, &again, &log, Credentials::default(), same)
+                .is_none(),
+            "rebuilding on every cycle would throw away the engine's caches"
+        );
     }
 }

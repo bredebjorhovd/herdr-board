@@ -1288,11 +1288,11 @@ impl SyncEngine {
             if task.state != BoardState::Done {
                 continue;
             }
-            let live_panes: std::collections::HashSet<String> = herdr
+            let live_panes: HashMap<String, PaneInfo> = herdr
                 .pane_list()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|p| p.pane_id)
+                .map(|p| (p.pane_id.clone(), p))
                 .collect();
             for attempt in &task.attempts {
                 // Only closed attempts: a live one is still running, and
@@ -1301,7 +1301,21 @@ impl SyncEngine {
                 else {
                     continue;
                 };
-                if !live_panes.contains(pane) {
+                let Some(info) = live_panes.get(pane) else {
+                    continue;
+                };
+                // A live pane at that id is not the same thing as *this
+                // attempt's* pane. herdr returns a closed workspace's ids to its
+                // pool, so a finished attempt's id can later name a pane that
+                // was dispatched minutes ago — and closing it kills work that
+                // just started. Seen on gh#50: three dispatches died within
+                // seconds, each into a pane whose id a task finished a week
+                // earlier still held.
+                if !crate::review::still_holds_the_attempt(info, attempt) {
+                    self.log.info(format!(
+                        "{} is done, but pane {pane} is no longer its checkout — leaving it alone",
+                        task.identifier
+                    ));
                     continue;
                 }
                 match herdr.pane_close(pane) {

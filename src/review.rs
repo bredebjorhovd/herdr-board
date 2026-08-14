@@ -268,26 +268,63 @@ pub fn authoring_attempt<'a>(task: &'a Task, pr: &PullRequest) -> Option<&'a Att
         .find(|a| a.pane_id.is_some() && a.branch.as_deref() == Some(pr.head_ref.as_str()))
 }
 
-/// Does this pane still hold the agent that wrote the pull request?
+/// What to do when herdr will not say where a pane is.
 ///
-/// herdr pane ids are not reused, so the pane still existing is most of the
-/// answer. The rest: something has to be running in it — a pane whose agent
-/// exited is a shell prompt, and pasting a review into one types the review at
-/// bash — and where it is running has to still be the attempt's own checkout.
-pub fn still_holds_the_author(pane: &PaneInfo, attempt: &Attempt) -> bool {
-    if pane.agent.is_none() {
-        return false;
-    }
+/// The answer is not the same for every caller, and pretending it is cost a
+/// night of dead dispatches — see [`still_holds_the_attempt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenUnknown {
+    /// Proceed. The action is cheap to get wrong.
+    Allow,
+    /// Refuse. The action is destructive.
+    Refuse,
+}
+
+/// Is this pane still the one this attempt ran in?
+///
+/// **Pane ids are reused.** herdr returns a closed workspace's ids to its pool,
+/// so an id recorded against a finished attempt can later name a pane belonging
+/// to somebody else — proven in this board's own history, where six ids served
+/// two attempts each and three of those crossed tasks (gh#50). The pane existing
+/// is therefore not evidence of anything; where it is running is.
+fn holds(pane: &PaneInfo, attempt: &Attempt, unknown: WhenUnknown) -> bool {
     match (pane.cwd.as_deref(), attempt.worktree.as_deref()) {
         // `starts_with`, not equality: an agent that has cd'd into a
         // subdirectory of its own worktree is still in its own worktree.
         (Some(cwd), Some(worktree)) => {
             std::path::Path::new(cwd).starts_with(std::path::Path::new(worktree))
         }
-        // herdr did not say where the pane is. The pane id and a live agent are
-        // then all there is, and they are enough to not deliver blind.
-        _ => true,
+        _ => unknown == WhenUnknown::Allow,
     }
+}
+
+/// Does this pane still hold the agent that wrote the pull request?
+///
+/// Identity, plus something running in it: a pane whose agent exited is a shell
+/// prompt, and pasting a review into one types the review at bash.
+///
+/// An unanswerable question allows the delivery. Getting this wrong sends a
+/// review comment somewhere useless, which is a wasted message and nothing more.
+pub fn still_holds_the_author(pane: &PaneInfo, attempt: &Attempt) -> bool {
+    if pane.agent.is_none() {
+        return false;
+    }
+    holds(pane, attempt, WhenUnknown::Allow)
+}
+
+/// The same question, asked before closing the pane.
+///
+/// Two deliberate differences from [`still_holds_the_author`].
+///
+/// An unanswerable question **refuses**. Delivering a message to the wrong pane
+/// wastes a message; closing the wrong pane kills work that is running in it, so
+/// silence has to mean no.
+///
+/// A live agent is not required. Disposal exists to clear away an idle agent in
+/// a checkout nobody will look at again, and an attempt whose agent has already
+/// exited leaves a bare shell that should still be collected.
+pub fn still_holds_the_attempt(pane: &PaneInfo, attempt: &Attempt) -> bool {
+    holds(pane, attempt, WhenUnknown::Refuse)
 }
 
 /// The message an agent is woken with.
@@ -491,6 +528,87 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt_in(worktree: Option<&str>) -> Attempt {
+        Attempt {
+            id: 1,
+            task_id: "gh:o/r#1".into(),
+            pane_id: Some("w8V:p1".into()),
+            workspace: "ws".into(),
+            runtime: "claude-code".into(),
+            worktree: worktree.map(str::to_string),
+            branch: Some("board/gh-1".into()),
+            started_at: crate::db::now(),
+            ended_at: Some(crate::db::now()),
+            outcome: Some(crate::model::Outcome::Done),
+            missing_ticks: 0,
+            agent_status: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            saw_working: true,
+            settled_at: None,
+            reopened: 0,
+            screen_print: None,
+            screen_at: None,
+            nudges: 0,
+            nudged_at: None,
+        }
+    }
+
+    fn pane_at(cwd: Option<&str>, agent: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id: "w8V:p1".into(),
+            workspace_id: "w8V".into(),
+            tab_id: None,
+            agent: agent.map(str::to_string),
+            agent_status: None,
+            focused: false,
+            label: None,
+            cwd: cwd.map(str::to_string),
+            scroll_offset: 0,
+        }
+    }
+
+    #[test]
+    fn a_recycled_pane_id_is_not_the_attempts_pane() {
+        // gh#50: w8V:p1 belonged to gh#126, which finished on 2026-08-07. herdr
+        // returned the id to its pool, handed it to a gh#394 dispatch a week
+        // later, and disposal closed that dispatch seconds after it was
+        // prompted — three times in one evening, because the id matched.
+        let finished = attempt_in(Some("/wt/board-gh-126"));
+        let somebody_else = pane_at(Some("/wt/board-gh-394"), Some("claude"));
+        assert!(
+            !still_holds_the_attempt(&somebody_else, &finished),
+            "an id that has been handed to another attempt must not be closed"
+        );
+        assert!(
+            !still_holds_the_author(&somebody_else, &finished),
+            "and a review must not be delivered into it either"
+        );
+    }
+
+    #[test]
+    fn its_own_pane_is_still_disposable() {
+        let a = attempt_in(Some("/wt/board-gh-126"));
+        // Subdirectory, because an agent that cd'd deeper is still in its own
+        // checkout.
+        assert!(still_holds_the_attempt(&pane_at(Some("/wt/board-gh-126/src"), Some("claude")), &a));
+        // No agent left in it: a bare shell in the attempt's own checkout is
+        // exactly what disposal exists to clear away.
+        assert!(still_holds_the_attempt(&pane_at(Some("/wt/board-gh-126"), None), &a));
+    }
+
+    #[test]
+    fn an_unanswerable_question_refuses_the_close_and_allows_the_message() {
+        // The asymmetry is the point. Delivering a review to the wrong pane
+        // wastes a message; closing the wrong pane kills work.
+        let a = attempt_in(Some("/wt/board-gh-126"));
+        let nowhere = pane_at(None, Some("claude"));
+        assert!(!still_holds_the_attempt(&nowhere, &a), "no cwd must not close");
+        assert!(still_holds_the_author(&nowhere, &a), "no cwd may still deliver");
+    }
+
     use crate::model::Outcome;
 
     fn feedback(kind: FeedbackKind, id: i64, body: &str, created_at: &str) -> Feedback {

@@ -699,6 +699,7 @@ branch_template = "board/{identifier_lower}"
 
     fn engine_with(db: Db) -> SyncEngine {
         SyncEngine {
+            declined: Default::default(),
             db,
             cfg: cfg(),
             credentials: Default::default(),

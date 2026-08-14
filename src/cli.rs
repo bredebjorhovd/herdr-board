@@ -46,6 +46,7 @@ fn build_engine_with_credentials(
             .map(|r| Github::new(Box::new(r) as Box<dyn Rest>))
     };
     Ok(SyncEngine {
+        declined: Default::default(),
         db,
         cfg,
         credentials,

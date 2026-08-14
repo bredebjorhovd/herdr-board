@@ -1094,6 +1094,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hb-review-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         SyncEngine {
+            declined: Default::default(),
             db: Db::open_in_memory().unwrap(),
             cfg: crate::config::RoutingConfig::default(),
             credentials: Default::default(),

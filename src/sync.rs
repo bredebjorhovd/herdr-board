@@ -66,6 +66,13 @@ enum Sent {
 }
 
 pub struct SyncEngine {
+    /// Collisions already reported by [`SyncEngine::dispose_finished_panes`],
+    /// keyed by attempt and the pane id that turned out not to be its own.
+    ///
+    /// In memory rather than on the row: this is a logging decision, not board
+    /// state, and once per daemon run is the granularity that matters — a
+    /// restart re-announcing a live collision is useful rather than noise.
+    pub declined: std::sync::Mutex<std::collections::HashSet<(i64, String)>>,
     pub db: Db,
     pub cfg: RoutingConfig,
     pub credentials: Credentials,
@@ -1312,10 +1319,18 @@ impl SyncEngine {
                 // seconds, each into a pane whose id a task finished a week
                 // earlier still held.
                 if !crate::review::still_holds_the_attempt(info, attempt) {
-                    self.log.info(format!(
-                        "{} is done, but pane {pane} is no longer its checkout — leaving it alone",
-                        task.identifier
-                    ));
+                    // Said once. The condition is stable — a recycled id does
+                    // not un-recycle — so the check re-runs every sweep and
+                    // would otherwise repeat this line once a minute for as
+                    // long as the new agent lives, burying everything worth
+                    // reading. Keyed by pane too: if the id is later handed to
+                    // a *second* stranger, that is a new fact.
+                    if self.first_refusal(attempt.id, pane) {
+                        self.log.info(format!(
+                            "{} is done, but pane {pane} is no longer its checkout — leaving it alone",
+                            task.identifier
+                        ));
+                    }
                     continue;
                 }
                 match herdr.pane_close(pane) {
@@ -1331,6 +1346,16 @@ impl SyncEngine {
             }
         }
         Ok(closed)
+    }
+
+    /// Is this the first time this attempt has been found holding somebody
+    /// else's pane? Records it as seen either way.
+    fn first_refusal(&self, attempt_id: i64, pane: &str) -> bool {
+        match self.declined.lock() {
+            Ok(mut seen) => seen.insert((attempt_id, pane.to_string())),
+            // A poisoned lock is not a reason to go quiet about a collision.
+            Err(_) => true,
+        }
     }
 
     /// Recompute and persist every task's derived state, using the agent status
@@ -1915,6 +1940,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         SyncEngine {
+            declined: Default::default(),
             db: Db::open_in_memory().unwrap(),
             cfg: RoutingConfig {
                 defaults: Defaults::default(),
@@ -3633,6 +3659,21 @@ mod tests {
             "measuring from the repo HEAD is what made it look finished — pinned              so the regression is recognisable if it returns"
         );
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_refusal_is_reported_once_per_pane_not_once_per_sweep() {
+        // The guard added for gh#50 is correct and was too talkative: a recycled
+        // id does not un-recycle, so the check re-runs every sweep and repeated
+        // the same line about once a minute for as long as the new agent lived.
+        let e = engine(None);
+        assert!(e.first_refusal(7, "w8W:p1"), "the first time is worth saying");
+        assert!(!e.first_refusal(7, "w8W:p1"), "the next sweep is not");
+        assert!(!e.first_refusal(7, "w8W:p1"));
+        // A different stranger holding the same attempt's id is a new fact.
+        assert!(e.first_refusal(7, "w8X:p1"));
+        // As is the same pane turning up against a different attempt.
+        assert!(e.first_refusal(8, "w8W:p1"));
     }
 
     #[test]

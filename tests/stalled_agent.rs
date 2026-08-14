@@ -191,6 +191,7 @@ impl Board {
             state_dir: dir.clone(),
         };
         let engine = SyncEngine {
+            declined: Default::default(),
             db: Db::open(&paths.db()).unwrap(),
             cfg: toml::from_str(routing).unwrap(),
             credentials: Default::default(),

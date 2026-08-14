@@ -110,6 +110,7 @@ impl Harness {
         };
         let cfg: RoutingConfig = toml::from_str(ROUTING).unwrap();
         SyncEngine {
+            declined: Default::default(),
             db: Db::open(&paths.db()).unwrap(),
             cfg,
             credentials: Default::default(),

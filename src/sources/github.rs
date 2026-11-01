@@ -14,13 +14,14 @@ pub const API: &str = "https://api.github.com";
 /// roughly how much a repo would put on the board rather than to enumerate it.
 pub const PAGE: usize = 100;
 
-/// How many pages of open issues to walk before giving up.
+/// How many pages of open issues, or of open pull requests, to walk before
+/// giving up.
 ///
 /// A ceiling rather than a limit: the loop stops on the first short page, so
-/// this only bites on a repo with thousands of *open* issues and pull requests
+/// this only bites on a repo with thousands of *open* issues or pull requests
 /// — where returning a partial set would be worse than an error, because
 /// reaping deletes whatever is not in it. History does not count against it:
-/// closed items are never walked (gh#51).
+/// closed items are never walked (gh#51, gh#53).
 pub const MAX_PAGES: usize = 20;
 
 /// The issue is not there any more: deleted (410) or not found (404).
@@ -519,14 +520,73 @@ impl<T: Rest> Github<T> {
         Ok(out)
     }
 
+    /// Open pull requests for a repo, every page of them.
+    ///
+    /// This used to read one page of `state=all` — the hundred newest pull
+    /// requests, open or closed. On Florin-AS/Tally that cut at #1887 and left
+    /// 15 of 20 open pull requests out of every poll, and since a PR row is only
+    /// `seen` if a poll returns it, the rows that were there got reaped (gh#53,
+    /// the same shape as gh#31 on the issues endpoint). The open set is what
+    /// decides the board; a known PR that drops out of it is asked about by
+    /// number ([`Github::pull`]), and recent merges for attempt linking come
+    /// from [`Github::recently_closed_pulls`].
     pub fn pulls(&self, repo: &str) -> Result<Vec<PullRequest>> {
-        let v = self
-            .rest
-            .get(&format!("/repos/{repo}/pulls?state=all&per_page=100"))?;
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let v = self.rest.get(&format!(
+                "/repos/{repo}/pulls?state=open&per_page={PAGE}&page={page}"
+            ))?;
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow!("github pulls: expected an array"))?;
+            // Raw length, not parsed: a page is short because the API ran out,
+            // not because an item failed to parse.
+            out.extend(arr.iter().filter_map(|n| parse_pull(repo, n)));
+            if arr.len() < PAGE {
+                return Ok(out);
+            }
+        }
+        bail!(
+            "{repo} has more than {} open pull requests; refusing to report a \
+             partial set",
+            PAGE * MAX_PAGES
+        )
+    }
+
+    /// The hundred most recently updated closed pull requests — one page, not a
+    /// walk.
+    ///
+    /// Not for what is on the board (that is [`Github::pulls`]), but for attempt
+    /// linking: a PR the board never saw open, because it was opened and merged
+    /// between two polls or while the daemon was down, has no number on the
+    /// task to look up, and its branch is the only way to find it. A partial
+    /// set is fine here — nothing is reaped for being absent from it.
+    pub fn recently_closed_pulls(&self, repo: &str) -> Result<Vec<PullRequest>> {
+        let v = self.rest.get(&format!(
+            "/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page={PAGE}"
+        ))?;
         let arr = v
             .as_array()
             .ok_or_else(|| anyhow!("github pulls: expected an array"))?;
         Ok(arr.iter().filter_map(|n| parse_pull(repo, n)).collect())
+    }
+
+    /// One pull request by number, whatever its state. `None` when GitHub says
+    /// it is not there — an answer, unlike an outage, which is an error.
+    ///
+    /// How a PR the board holds as open learns it was merged or closed, now that
+    /// [`Github::pulls`] returns only open ones: the same per-number question
+    /// [`Github::issue`] answers for issues.
+    pub fn pull(&self, repo: &str, number: i64) -> Result<Option<PullRequest>> {
+        let v = match self.rest.get(&format!("/repos/{repo}/pulls/{number}")) {
+            Ok(v) => v,
+            Err(e) if e.downcast_ref::<NotFound>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !v.is_object() {
+            bail!("github pull request {repo}!{number}: expected an object");
+        }
+        Ok(parse_pull(repo, &v))
     }
 }
 
@@ -884,6 +944,56 @@ mod tests {
             g.pulls("o/r").unwrap()[0].to_upsert().upstream,
             UpstreamState::Terminal
         );
+    }
+
+    #[test]
+    fn open_pull_requests_are_walked_page_by_page() {
+        let full: Vec<Value> = (0..PAGE as i64)
+            .map(|i| json!({ "number": 3000 + i, "title": "t", "html_url": "u",
+                             "state": "open", "updated_at": "t", "head": { "ref": "x" } }))
+            .collect();
+        let g = Github::new(FixtureRest::new(vec![
+            ("/repos/o/r/pulls?state=open&per_page=100&page=1".into(), json!(full)),
+            (
+                "/repos/o/r/pulls?state=open&per_page=100&page=2".into(),
+                json!([{ "number": 1700, "title": "old", "html_url": "u",
+                         "state": "open", "updated_at": "t", "head": { "ref": "y" } }]),
+            ),
+        ]));
+        let pulls = g.pulls("o/r").unwrap();
+        assert_eq!(pulls.len(), PAGE + 1);
+        assert!(pulls.iter().any(|p| p.number == 1700), "below the first page");
+        assert!(g.rest.asked.borrow().iter().all(|p| p.contains("state=open")));
+    }
+
+    #[test]
+    fn too_many_open_pull_requests_is_an_error_not_a_partial_set() {
+        let full: Vec<Value> = (0..PAGE as i64)
+            .map(|i| json!({ "number": i, "title": "t", "html_url": "u",
+                             "state": "open", "updated_at": "t", "head": { "ref": "x" } }))
+            .collect();
+        let g = Github::new(FixtureRest::new(vec![("/repos/o/r/pulls".into(), json!(full))]));
+        let err = g.pulls("o/r").unwrap_err().to_string();
+        assert!(err.contains("refusing to report a partial set"), "{err}");
+        assert_eq!(g.rest.asked.borrow().len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn a_pull_request_by_number_carries_its_merge() {
+        let g = Github::new(FixtureRest::new(vec![
+            (
+                "/repos/o/r/pulls/31".into(),
+                json!({ "number": 31, "title": "t", "html_url": "u", "state": "closed",
+                        "merged": true, "merged_at": "t", "updated_at": "t",
+                        "head": { "ref": "x" } }),
+            ),
+            ("/repos/o/r/pulls/32".into(), json!({ "__status": 404 })),
+            ("/repos/o/r/pulls/33".into(), json!({ "__status": 502 })),
+        ]));
+        let pr = g.pull("o/r", 31).unwrap().unwrap();
+        assert!(pr.merged && !pr.open);
+        assert!(g.pull("o/r", 32).unwrap().is_none());
+        assert!(g.pull("o/r", 33).is_err(), "an outage must not read as deleted");
     }
 
     #[test]

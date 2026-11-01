@@ -14,13 +14,29 @@ pub const API: &str = "https://api.github.com";
 /// roughly how much a repo would put on the board rather than to enumerate it.
 pub const PAGE: usize = 100;
 
-/// How many pages of issues to walk before giving up.
+/// How many pages of open issues to walk before giving up.
 ///
 /// A ceiling rather than a limit: the loop stops on the first short page, so
-/// this only bites on a repo with thousands of issues — where returning a
-/// partial set would be worse than an error, because reaping deletes whatever
-/// is not in it.
+/// this only bites on a repo with thousands of *open* issues and pull requests
+/// — where returning a partial set would be worse than an error, because
+/// reaping deletes whatever is not in it. History does not count against it:
+/// closed items are never walked (gh#51).
 pub const MAX_PAGES: usize = 20;
+
+/// The issue is not there any more: deleted (410) or not found (404).
+///
+/// Typed rather than a string match, because it is the one HTTP failure that
+/// is an *answer* — "reap it" — rather than an outage that must stop reaping.
+#[derive(Debug)]
+pub struct NotFound(pub u16);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "github HTTP {}: not found", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
 
 /// The REST surface we use. A seam, so tests never touch the network.
 pub trait Rest {
@@ -69,6 +85,9 @@ impl HttpRest {
         let status = resp.status();
         if status.as_u16() == 403 || status.as_u16() == 429 {
             bail!("github rate limited ({status})");
+        }
+        if status.as_u16() == 404 || status.as_u16() == 410 {
+            return Err(NotFound(status.as_u16()).into());
         }
         if status.as_u16() == 401 {
             bail!("github rejected the token (401) — check GITHUB_TOKEN scopes");
@@ -273,23 +292,33 @@ impl<T: Rest> Github<T> {
         Github { rest }
     }
 
-    /// Issues for a repo. GitHub's issues endpoint also returns pull requests;
-    /// those carry a `pull_request` key and are filtered out here.
+    /// Open issues for a repo, every page of them. GitHub's issues endpoint also
+    /// returns pull requests; those carry a `pull_request` key and are filtered
+    /// out here.
     ///
-    /// **Paginated, and it has to be.** This endpoint returns issues *and* pull
-    /// requests, the PRs are discarded only after a page is cut, and it sorts by
-    /// `created` — so every pull request the board opens is newer than every
-    /// issue and pushes the oldest issues off the first page. On
-    /// bredebjorhovd/itsm-agent after 30 dispatches: 100 items on page one, 44
-    /// of them pull requests, 56 issues surviving, and 29 items on a second page
-    /// nobody fetched. Seven open issues were absent, and because a task with no
-    /// attempts is *deleted* when reaped, they vanished from the board with no
-    /// `gone` flag and no error — `dispatch` just answered `no task` (gh#31).
+    /// **Open only.** This used to ask for `state=all`, so that a task whose
+    /// issue was closed would see it closed rather than vanish. But that walks
+    /// the repo's whole history every cycle, PRs included, and the walk has a
+    /// ceiling: Florin-AS/Tally passed 2000 issues and pull requests in total
+    /// with far fewer open, and every poll bailed — new issues never reached
+    /// the board (gh#51). The open set is what decides what is on the board;
+    /// closing is caught by [`Github::issue`] on the few known tasks that drop
+    /// out of it.
+    ///
+    /// **Paginated, and it has to be.** The PRs are discarded only after a page
+    /// is cut, and the endpoint sorts by `created` — so every pull request the
+    /// board opens is newer than every issue and pushes the oldest issues off
+    /// the first page. On bredebjorhovd/itsm-agent after 30 dispatches: 100
+    /// items on page one, 44 of them pull requests, 56 issues surviving, and 29
+    /// items on a second page nobody fetched. Seven open issues were absent, and
+    /// because a task with no attempts is *deleted* when reaped, they vanished
+    /// from the board with no `gone` flag and no error — `dispatch` just
+    /// answered `no task` (gh#31).
     pub fn issues(&self, repo: &str, labels: &[String]) -> Result<Vec<GithubIssue>> {
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
             let mut path =
-                format!("/repos/{repo}/issues?state=all&per_page={PAGE}&page={page}");
+                format!("/repos/{repo}/issues?state=open&per_page={PAGE}&page={page}");
             if !labels.is_empty() {
                 path.push_str(&format!("&labels={}", labels.join(",")));
             }
@@ -302,22 +331,47 @@ impl<T: Rest> Github<T> {
                 return Ok(out);
             }
         }
-        // Ran out of pages before the API ran out of issues. Reaping on this
-        // would delete whatever is beyond it, so say so rather than returning a
-        // set that looks complete.
+        // Ran out of pages before the API ran out of open issues. Reaping on
+        // this would delete whatever is beyond it, so say so rather than
+        // returning a set that looks complete.
         bail!(
-            "{repo} has more than {} issues and pull requests; refusing to \
+            "{repo} has more than {} open issues and pull requests; refusing to \
              report a partial set",
             PAGE * MAX_PAGES
         )
     }
 
-    /// Open issues only, unfiltered — what adopting a repo unfiltered would put
-    /// on the board, before it is put there.
+    /// One issue by number, whatever its state. `None` when GitHub says it is
+    /// not there (deleted, or never was) — an answer, unlike an outage, which
+    /// is an error.
     ///
-    /// Deliberately not [`Github::issues`]: that asks for `state=all`, so on a
-    /// repo with years of closed issues the page would be mostly history and
-    /// the count would say nothing about what is about to arrive.
+    /// How a known task learns its issue was closed, now that [`Github::issues`]
+    /// returns only open ones: anything the board holds as open that the open
+    /// set no longer contains is asked about here, one call each. That is a
+    /// handful per cycle at most — every issue closed since the last poll that
+    /// the board was showing — where walking closed history was thousands.
+    pub fn issue(&self, repo: &str, number: i64) -> Result<Option<GithubIssue>> {
+        let v = match self.rest.get(&format!("/repos/{repo}/issues/{number}")) {
+            Ok(v) => v,
+            Err(e) if e.downcast_ref::<NotFound>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !v.is_object() {
+            bail!("github issue {repo}#{number}: expected an object");
+        }
+        // The number may now be a pull request (it cannot become one, but the
+        // endpoint answers for both); a pull request is not this issue.
+        if v.get("pull_request").is_some() {
+            return Ok(None);
+        }
+        Ok(parse_issue(repo, &v))
+    }
+
+    /// Open issues only, unfiltered, first page only — what adopting a repo
+    /// unfiltered would put on the board, before it is put there.
+    ///
+    /// Deliberately not [`Github::issues`]: this is a preview of roughly how
+    /// much would arrive, and one page says that without walking the repo.
     pub fn open_issues(&self, repo: &str) -> Result<Vec<GithubIssue>> {
         self.issue_page(repo, &format!("/repos/{repo}/issues?state=open&per_page={PAGE}"))
     }
@@ -627,11 +681,18 @@ impl FixtureRest {
 impl Rest for FixtureRest {
     fn get(&self, path: &str) -> Result<Value> {
         self.asked.borrow_mut().push(path.to_string());
-        self.routes
+        let v = self
+            .routes
             .iter()
             .find(|(p, _)| path.starts_with(p.as_str()))
             .map(|(_, v)| v.clone())
-            .ok_or_else(|| anyhow!("no fixture for {path}"))
+            .ok_or_else(|| anyhow!("no fixture for {path}"))?;
+        // `{"__status": 404}` stands for an HTTP failure rather than a body.
+        match v.get("__status").and_then(Value::as_u64) {
+            Some(code @ (404 | 410)) => Err(NotFound(code as u16).into()),
+            Some(code) => Err(anyhow!("github HTTP {code} for {path}")),
+            None => Ok(v),
+        }
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
@@ -695,9 +756,9 @@ mod tests {
             .collect();
         page1.truncate(PAGE);
         let g = Github::new(FixtureRest::new(vec![
-            ("/repos/o/r/issues?state=all&per_page=100&page=1".into(), json!(page1)),
+            ("/repos/o/r/issues?state=open&per_page=100&page=1".into(), json!(page1)),
             (
-                "/repos/o/r/issues?state=all&per_page=100&page=2".into(),
+                "/repos/o/r/issues?state=open&per_page=100&page=2".into(),
                 json!([{ "number": 3, "node_id": "n", "title": "the old issue",
                          "html_url": "u", "state": "open", "updated_at": "t",
                          "labels": [] }]),
@@ -732,13 +793,59 @@ mod tests {
     #[test]
     fn closed_issues_map_to_terminal_upstream() {
         let g = Github::new(FixtureRest::new(vec![(
-            "/repos/o/r/issues".into(),
-            json!([{ "number": 87, "node_id": "n1", "title": "Bug", "html_url": "u",
-                     "state": "closed", "updated_at": "t", "labels": [] }]),
+            "/repos/o/r/issues/87".into(),
+            json!({ "number": 87, "node_id": "n1", "title": "Bug", "html_url": "u",
+                    "state": "closed", "updated_at": "t", "labels": [] }),
         )]));
-        let up = g.issues("o/r", &[]).unwrap()[0].to_upsert();
+        let up = g.issue("o/r", 87).unwrap().unwrap().to_upsert();
         assert_eq!(up.upstream, UpstreamState::Terminal);
         assert_eq!(up.source_state.as_deref(), Some("closed"));
+    }
+
+    fn full_page_of_prs(state: &str) -> serde_json::Value {
+        json!((0..PAGE)
+            .map(|i| json!({ "number": 5000 + i, "node_id": "p", "title": "a pr",
+                             "html_url": "u", "state": state, "updated_at": "t",
+                             "pull_request": { "url": "x" } }))
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn closed_history_beyond_the_ceiling_does_not_stop_the_open_walk() {
+        // gh#51: Florin-AS/Tally passed 2000 issues and pull requests in total —
+        // 494 issues, 1506 PRs — and `state=all` bailed every poll, so new
+        // issues never reached the board. History is unbounded; only the open
+        // set decides what is on the board, and only it is walked.
+        let g = Github::new(FixtureRest::new(vec![
+            // Any walk of closed or all items would hit the ceiling.
+            ("/repos/o/r/issues?state=all".into(), full_page_of_prs("closed")),
+            ("/repos/o/r/issues?state=closed".into(), full_page_of_prs("closed")),
+            ("/repos/o/r/issues?state=open&per_page=100&page=1".into(), full_page_of_prs("open")),
+            (
+                "/repos/o/r/issues?state=open&per_page=100&page=2".into(),
+                json!([{ "number": 2009, "node_id": "n", "title": "new", "html_url": "u",
+                         "state": "open", "updated_at": "t", "labels": [] }]),
+            ),
+        ]));
+        let issues = g.issues("o/r", &[]).unwrap();
+        assert_eq!(issues.iter().map(|i| i.number).collect::<Vec<_>>(), vec![2009]);
+        assert!(
+            g.rest.asked.borrow().iter().all(|p| p.contains("state=open")),
+            "{:?}",
+            g.rest.asked.borrow()
+        );
+    }
+
+    #[test]
+    fn a_missing_issue_is_an_answer_not_an_outage() {
+        let g = Github::new(FixtureRest::new(vec![
+            ("/repos/o/r/issues/1".into(), json!({ "__status": 410 })),
+            ("/repos/o/r/issues/2".into(), json!({ "__status": 404 })),
+            ("/repos/o/r/issues/3".into(), json!({ "__status": 502 })),
+        ]));
+        assert!(g.issue("o/r", 1).unwrap().is_none());
+        assert!(g.issue("o/r", 2).unwrap().is_none());
+        assert!(g.issue("o/r", 3).is_err(), "an outage must not read as deleted");
     }
 
     #[test]

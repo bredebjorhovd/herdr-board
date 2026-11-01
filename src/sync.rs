@@ -350,8 +350,14 @@ impl SyncEngine {
             // right answer for a curated tracker and a backlog dump for a repo
             // that keeps its roadmap as open issues.
             match gh.issues(repo, self.cfg.github.labels_for(repo)) {
-                Ok(issues) => {
-                    for i in issues {
+                Ok(open) => {
+                    let open_ids: std::collections::HashSet<String> =
+                        open.iter().map(|i| i.task_id()).collect();
+                    let (closed, error) = self.closed_since_last_poll(gh, repo, &open_ids, &mut seen);
+                    if let Some(e) = error {
+                        failed = Some(e);
+                    }
+                    for i in open.into_iter().chain(closed) {
                         seen.insert(i.task_id());
                         // Two writers on one issue now — the board and the agent
                         // in the pane — so the §4.1 loop guard carries across.
@@ -440,6 +446,61 @@ impl SyncEngine {
             }
         }
         all_pulls
+    }
+
+    /// The board's issues in `repo` that the open set no longer holds, and what
+    /// became of each.
+    ///
+    /// The open set is all [`Github::issues`] returns (gh#51), so a known issue
+    /// missing from it is closed, deleted, or filtered out by a label change —
+    /// and only asking says which. Already-closed rows are not asked about:
+    /// they were closed last time, and are marked seen so reaping keeps them,
+    /// exactly as walking `state=all` used to. Gone rows are not candidates at
+    /// all ([`Db::reapable_task_ids`]).
+    ///
+    /// Returns the issues to upsert — the closed ones — with each added to
+    /// `seen`. A deleted issue, or one open but no longer labelled for the
+    /// board, is left out of `seen` and reaped as before. A lookup that fails
+    /// is returned as the error, which stops reaping for the cycle: not knowing
+    /// is not the same as gone.
+    fn closed_since_last_poll(
+        &self,
+        gh: &Github<Box<dyn Rest>>,
+        repo: &str,
+        open_ids: &std::collections::HashSet<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> (Vec<crate::sources::github::GithubIssue>, Option<String>) {
+        seen.extend(open_ids.iter().cloned());
+        let mut closed = Vec::new();
+        let mut error = None;
+        let prefix = format!("gh:{repo}#");
+        for id in self.db.reapable_task_ids(Source::Github).unwrap_or_default() {
+            let Some(number) = id.strip_prefix(&prefix).and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if open_ids.contains(&id) {
+                continue;
+            }
+            let Ok(Some(task)) = self.db.get_task(&id) else {
+                continue;
+            };
+            if task.upstream == UpstreamState::Terminal {
+                seen.insert(id);
+                continue;
+            }
+            match gh.issue(repo, number) {
+                Ok(Some(i)) if i.closed => {
+                    seen.insert(id);
+                    closed.push(i);
+                }
+                // Open but not in the (label-filtered) open set, or not there at
+                // all: out of `seen`, so reaping decides.
+                Ok(_) => {}
+                Err(e) => error = Some(format!("looking up {id}: {e}")),
+            }
+        }
+        (closed, error)
     }
 
     /// Every branch the board has dispatched onto, with the repository it was
@@ -2876,6 +2937,10 @@ mod tests {
     /// A GitHub row whose id names the repo it belongs to — which is what
     /// per-repo settings are looked up by, so a test about them needs to choose.
     fn seed_gh_in(e: &SyncEngine, id: &str) {
+        seed_gh_with(e, id, UpstreamState::Unstarted);
+    }
+
+    fn seed_gh_with(e: &SyncEngine, id: &str, upstream: UpstreamState) {
         let number = id.rsplit('#').next().unwrap_or("0").to_string();
         e.db.upsert_task(&UpsertTask {
             id: id.into(),
@@ -2886,13 +2951,102 @@ mod tests {
             body: None,
             url: "u".into(),
             labels: vec![],
-            source_state: Some("open".into()),
+            source_state: Some(
+                if upstream == UpstreamState::Terminal { "closed" } else { "open" }.into(),
+            ),
             linear_team: None,
             linear_project: None,
-            upstream: UpstreamState::Unstarted,
+            upstream,
             updated_at: crate::db::now(),
         })
         .unwrap();
+    }
+
+    fn engine_polling_o_r(routes: Vec<(String, Value)>) -> SyncEngine {
+        let mut e = engine_with(
+            None,
+            Some(Github::new(Box::new(crate::sources::github::FixtureRest::new(routes))
+                as Box<dyn Rest>)),
+        );
+        e.cfg.github.repos = vec!["o/r".into()];
+        e
+    }
+
+    /// gh#51: only open issues are walked now, so a known issue closed between
+    /// two polls has to be asked about by number — and must arrive closed,
+    /// not be reaped as if deleted.
+    #[test]
+    fn an_issue_closed_between_polls_arrives_closed_rather_than_reaped() {
+        let e = engine_polling_o_r(vec![
+            (
+                "/repos/o/r/issues?state=open".into(),
+                json!([{ "number": 2009, "node_id": "n", "title": "new", "html_url": "u",
+                         "state": "open", "updated_at": "t", "labels": [] }]),
+            ),
+            (
+                "/repos/o/r/issues/7".into(),
+                json!({ "number": 7, "node_id": "n7", "title": "Bug", "html_url": "u",
+                        "state": "closed", "updated_at": "t2", "labels": [] }),
+            ),
+            ("/repos/o/r/issues/8".into(), json!({ "__status": 410 })),
+            ("/repos/o/r/pulls".into(), json!([])),
+        ]);
+        seed_gh_in(&e, "gh:o/r#7");
+        seed_gh_in(&e, "gh:o/r#8");
+        // Closed last time: no fixture, so asking about it would fail the poll.
+        seed_gh_with(&e, "gh:o/r#9", UpstreamState::Terminal);
+
+        e.poll_github();
+
+        assert_eq!(e.db.meta_get(meta::GITHUB_STATUS).unwrap().as_deref(), Some("ok"));
+        assert!(e.db.get_task("gh:o/r#2009").unwrap().is_some(), "new open issue lands");
+        let closed = e.db.get_task("gh:o/r#7").unwrap().unwrap();
+        assert_eq!(closed.upstream, UpstreamState::Terminal);
+        assert_eq!(closed.source_state.as_deref(), Some("closed"));
+        assert!(e.db.get_task("gh:o/r#8").unwrap().is_none(), "deleted upstream: reaped");
+        // Status `ok` above also says #9 was not asked about: it has no fixture.
+        assert!(e.db.get_task("gh:o/r#9").unwrap().is_some(), "already closed: kept");
+    }
+
+    #[test]
+    fn a_failed_lookup_stops_reaping_for_the_cycle() {
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!([])),
+            ("/repos/o/r/issues/7".into(), json!({ "__status": 502 })),
+            ("/repos/o/r/issues/8".into(), json!({ "__status": 410 })),
+            ("/repos/o/r/pulls".into(), json!([])),
+        ]);
+        seed_gh_in(&e, "gh:o/r#7");
+        seed_gh_in(&e, "gh:o/r#8");
+
+        e.poll_github();
+
+        assert!(
+            e.db.meta_get(meta::GITHUB_STATUS).unwrap().unwrap().starts_with("error:"),
+            "an outage is reported"
+        );
+        assert!(e.db.get_task("gh:o/r#7").unwrap().is_some(), "not knowing is not gone");
+        assert!(e.db.get_task("gh:o/r#8").unwrap().is_some(), "and nothing is reaped");
+    }
+
+    #[test]
+    fn too_many_open_issues_still_refuses_a_partial_set() {
+        let full: Vec<Value> = (0..crate::sources::github::PAGE)
+            .map(|i| json!({ "number": 1000 + i, "node_id": "n", "title": "t",
+                             "html_url": "u", "state": "open", "updated_at": "t",
+                             "labels": [] }))
+            .collect();
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!(full)),
+            ("/repos/o/r/pulls".into(), json!([])),
+        ]);
+        seed_gh_in(&e, "gh:o/r#7");
+
+        e.poll_github();
+
+        let status = e.db.meta_get(meta::GITHUB_STATUS).unwrap().unwrap();
+        assert!(status.contains("refusing to report a partial set"), "{status}");
+        assert!(e.db.get_task("gh:o/r#7").unwrap().is_some(), "no reaping on a partial set");
     }
 
     /// An engine with GitHub writeback enabled — it is off by default now, so a

@@ -374,10 +374,11 @@ impl SyncEngine {
                 }
                 Err(e) => failed = Some(e.to_string()),
             }
-            match gh.pulls(repo) {
-                Ok(p) => all_pulls.extend(p),
-                Err(e) => failed = Some(e.to_string()),
+            let (pulls, error) = self.pulls_for(gh, repo);
+            if let Some(e) = error {
+                failed = Some(e);
             }
+            all_pulls.extend(pulls);
         }
 
         // A PR whose branch belongs to an attempt is that task's PR, not a row
@@ -402,8 +403,31 @@ impl SyncEngine {
         let check_mergeable = self.due_for_full_sweep();
 
         if self.cfg.github.pull_requests {
+            // PR rows the board already holds. A closed PR is upserted only onto
+            // one of these: the recently-closed page is there for linking, and
+            // turning it into rows would grow the board by a hundred finished
+            // PRs nobody asked to see.
+            let known_rows: std::collections::HashSet<String> = self
+                .db
+                .reapable_task_ids(Source::Github)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|id| id.contains('!'))
+                .collect();
+            for id in &known_rows {
+                // Closed last time and kept without a call, exactly as issues
+                // are (gh#51): finished, and nothing more will happen to it.
+                if let Ok(Some(task)) = self.db.get_task(id)
+                    && task.upstream == UpstreamState::Terminal
+                {
+                    seen.insert(id.clone());
+                }
+            }
             for pr in &all_pulls {
                 if attempt_branches.claims(pr) {
+                    continue;
+                }
+                if !pr.open && !known_rows.contains(&pr.task_id()) {
                     continue;
                 }
                 if let Err(e) = self.db.upsert_task(&pr.to_upsert()) {
@@ -501,6 +525,86 @@ impl SyncEngine {
             }
         }
         (closed, error)
+    }
+
+    /// Pull requests for `repo`: every open one, plus the closed ones the board
+    /// has a reason to know about.
+    ///
+    /// The open set is walked in full (gh#53); it is what decides which PR rows
+    /// exist. Closed PRs come two ways. One page of the most recently closed,
+    /// for attempt linking — a PR merged before any poll saw it open has no
+    /// number on the task, only a branch. And a lookup by number for each PR
+    /// the board holds as open that neither set contains: a PR row that is not
+    /// terminal, or an attempt's linked PR. That is how a PR merged between two
+    /// polls reaches `merged` instead of being reaped.
+    ///
+    /// Order is open first, so [`SyncEngine::link_pull_requests`], which takes
+    /// the first branch match, prefers a live PR over an older closed one.
+    ///
+    /// A failed open walk is returned as the error with nothing else: the PR
+    /// rows' `seen` would be incomplete. A failed lookup or recent page is
+    /// returned as the error too, alongside what did arrive — not knowing is
+    /// not the same as gone, so reaping stops for the cycle.
+    fn pulls_for(
+        &self,
+        gh: &Github<Box<dyn Rest>>,
+        repo: &str,
+    ) -> (Vec<PullRequest>, Option<String>) {
+        let mut out = match gh.pulls(repo) {
+            Ok(p) => p,
+            Err(e) => return (Vec::new(), Some(e.to_string())),
+        };
+        let mut error = None;
+        match gh.recently_closed_pulls(repo) {
+            Ok(closed) => {
+                // Merged between the two calls: the closed answer is the newer.
+                let numbers: std::collections::HashSet<i64> =
+                    closed.iter().map(|p| p.number).collect();
+                out.retain(|p| !numbers.contains(&p.number));
+                out.extend(closed);
+            }
+            Err(e) => error = Some(e.to_string()),
+        }
+        let mut have: std::collections::HashSet<i64> = out.iter().map(|p| p.number).collect();
+        for number in self.open_pr_numbers(repo) {
+            if !have.insert(number) {
+                continue;
+            }
+            match gh.pull(repo, number) {
+                Ok(Some(pr)) => out.push(pr),
+                // Not there: a PR row is left out of `seen` and reaping decides.
+                Ok(None) => {}
+                Err(e) => error = Some(format!("looking up {repo}!{number}: {e}")),
+            }
+        }
+        (out, error)
+    }
+
+    /// Numbers of the pull requests in `repo` the board believes are open:
+    /// PR rows not yet terminal, and the linked PR of any unfinished task with
+    /// an attempt branch for [`SyncEngine::link_pull_requests`] to match.
+    fn open_pr_numbers(&self, repo: &str) -> Vec<i64> {
+        let mut out = Vec::new();
+        let row_prefix = format!("gh:{repo}!");
+        for task in self.db.load_tasks().unwrap_or_default() {
+            if task.upstream == UpstreamState::Gone {
+                continue;
+            }
+            if let Some(n) = task.id.strip_prefix(&row_prefix).and_then(|n| n.parse().ok()) {
+                if task.upstream != UpstreamState::Terminal {
+                    out.push(n);
+                }
+                continue;
+            }
+            let linked = task.pr_open
+                && !task.state.is_terminal()
+                && task.attempts.iter().any(|a| a.branch.is_some())
+                && task.pr_url.as_deref().and_then(pr_url_repo) == Some(repo);
+            if linked && let Some(n) = task.pr_number {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Every branch the board has dispatched onto, with the repository it was
@@ -1940,6 +2044,14 @@ impl AttemptBranches {
     }
 }
 
+/// `https://github.com/owner/repo/pull/508` → `owner/repo`. The repo a linked
+/// PR lives in, which for a Linear task nothing else records.
+fn pr_url_repo(url: &str) -> Option<&str> {
+    let rest = url.split_once("github.com/")?.1;
+    let (repo, tail) = rest.split_once("/pull/")?;
+    (repo.split('/').count() == 2 && !tail.is_empty()).then_some(repo)
+}
+
 /// `gh:owner/repo#87` → (`owner/repo`, 87). Also accepts the pull-request form
 /// `gh:owner/repo!508` — GitHub's issues endpoints serve pull requests too, so
 /// comments and closing work the same for both.
@@ -2495,12 +2607,13 @@ mod tests {
                     ("/repos/Florin-AS/tripletex-mcp/pulls".into(), json!([])),
                     ("/repos/bredebjorhovd/OIOS/issues".into(), json!([])),
                     (
-                        "/repos/bredebjorhovd/OIOS/pulls".into(),
+                        "/repos/bredebjorhovd/OIOS/pulls?state=open".into(),
                         json!([{ "number": 10, "title": "Row-capture sweeps",
                                  "html_url": "https://github.com/bredebjorhovd/OIOS/pull/10",
-                                 "state": "closed", "merged_at": "t", "updated_at": "t",
+                                 "state": "open", "updated_at": "t",
                                  "head": { "ref": "board/gh-2" } }]),
                     ),
+                    ("/repos/bredebjorhovd/OIOS/pulls".into(), json!([])),
                 ],
             )) as Box<dyn Rest>)),
         );
@@ -3047,6 +3160,191 @@ mod tests {
         let status = e.db.meta_get(meta::GITHUB_STATUS).unwrap().unwrap();
         assert!(status.contains("refusing to report a partial set"), "{status}");
         assert!(e.db.get_task("gh:o/r#7").unwrap().is_some(), "no reaping on a partial set");
+    }
+
+    fn pr_json(number: i64, state: &str, merged: bool, head: &str) -> Value {
+        json!({ "number": number, "title": "a pr",
+                "html_url": format!("https://github.com/o/r/pull/{number}"),
+                "state": state, "updated_at": "t", "draft": false,
+                "merged_at": if merged { json!("t") } else { Value::Null },
+                "head": { "ref": head } })
+    }
+
+    /// A PR row as an earlier poll left it.
+    fn seed_pr_row(e: &SyncEngine, number: i64, open: bool) {
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number,
+            title: "a pr".into(),
+            body: None,
+            url: format!("https://github.com/o/r/pull/{number}"),
+            head_ref: format!("feature/{number}"),
+            open,
+            merged: !open,
+            draft: false,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(number), open).unwrap();
+    }
+
+    /// gh#53: `pulls` read one page of `state=all`, the hundred newest. On
+    /// Florin-AS/Tally that cut at #1887 and 15 of 20 open PRs were absent —
+    /// and a PR row a poll does not return is reaped.
+    #[test]
+    fn open_prs_older_than_the_newest_hundred_stay_on_the_board() {
+        let closed: Vec<Value> = (0..crate::sources::github::PAGE as i64)
+            .map(|i| pr_json(2000 + i, "closed", true, "x"))
+            .collect();
+        // No route for `state=all`: asking for it fails the poll.
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!([])),
+            (
+                "/repos/o/r/pulls?state=open&per_page=100&page=1".into(),
+                json!([10, 400, 900, 1500, 2150]
+                    .iter()
+                    .map(|n| pr_json(*n, "open", false, "feature"))
+                    .collect::<Vec<_>>()),
+            ),
+            ("/repos/o/r/pulls?state=closed".into(), json!(closed)),
+        ]);
+        seed_pr_row(&e, 10, true);
+
+        e.poll_github();
+
+        assert_eq!(e.db.meta_get(meta::GITHUB_STATUS).unwrap().as_deref(), Some("ok"));
+        for n in [10, 400, 900, 1500, 2150] {
+            let t = e.db.get_task(&format!("gh:o/r!{n}")).unwrap();
+            assert!(t.is_some_and(|t| t.pr_open), "open PR !{n} is on the board");
+        }
+        assert!(
+            e.db.get_task("gh:o/r!2050").unwrap().is_none(),
+            "the recently-closed page is for linking, not new rows"
+        );
+    }
+
+    #[test]
+    fn a_pr_merged_between_polls_reaches_merged_rather_than_reaped() {
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!([])),
+            ("/repos/o/r/pulls?state=open".into(), json!([])),
+            // Merged long enough ago to be off the recent page: asked by number.
+            ("/repos/o/r/pulls?state=closed".into(), json!([])),
+            ("/repos/o/r/pulls/31".into(), pr_json(31, "closed", true, "feature/31")),
+            ("/repos/o/r/pulls/32".into(), json!({ "__status": 404 })),
+        ]);
+        seed_pr_row(&e, 31, true);
+        seed_pr_row(&e, 32, true);
+        // Merged last time: no fixture, so asking about it would fail the poll.
+        seed_pr_row(&e, 5, false);
+
+        e.poll_github();
+
+        assert_eq!(e.db.meta_get(meta::GITHUB_STATUS).unwrap().as_deref(), Some("ok"));
+        let t = e.db.get_task("gh:o/r!31").unwrap().unwrap();
+        assert_eq!(t.upstream, UpstreamState::Terminal);
+        assert!(t.pr_merged && !t.pr_open, "merged, not just gone");
+        assert!(e.db.get_task("gh:o/r!32").unwrap().is_none(), "deleted upstream: reaped");
+        assert!(e.db.get_task("gh:o/r!5").unwrap().is_some(), "already merged: kept");
+    }
+
+    #[test]
+    fn a_failed_pr_lookup_stops_reaping_for_the_cycle() {
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!([])),
+            ("/repos/o/r/pulls?state=open".into(), json!([])),
+            ("/repos/o/r/pulls?state=closed".into(), json!([])),
+            ("/repos/o/r/pulls/31".into(), json!({ "__status": 502 })),
+            ("/repos/o/r/pulls/32".into(), json!({ "__status": 404 })),
+        ]);
+        seed_pr_row(&e, 31, true);
+        seed_pr_row(&e, 32, true);
+
+        e.poll_github();
+
+        let status = e.db.meta_get(meta::GITHUB_STATUS).unwrap().unwrap();
+        assert!(status.contains("looking up o/r!31"), "{status}");
+        assert!(e.db.get_task("gh:o/r!31").unwrap().is_some(), "not knowing is not gone");
+        assert!(e.db.get_task("gh:o/r!32").unwrap().is_some(), "and nothing is reaped");
+    }
+
+    #[test]
+    fn too_many_open_prs_still_refuses_a_partial_set() {
+        let full: Vec<Value> = (0..crate::sources::github::PAGE as i64)
+            .map(|i| pr_json(1000 + i, "open", false, "feature"))
+            .collect();
+        let e = engine_polling_o_r(vec![
+            ("/repos/o/r/issues?state=open".into(), json!([])),
+            ("/repos/o/r/pulls?state=open".into(), json!(full)),
+        ]);
+        seed_pr_row(&e, 31, true);
+
+        e.poll_github();
+
+        let status = e.db.meta_get(meta::GITHUB_STATUS).unwrap().unwrap();
+        assert!(status.contains("open pull requests; refusing to report a partial set"), "{status}");
+        assert!(e.db.get_task("gh:o/r!31").unwrap().is_some(), "no reaping on a partial set");
+    }
+
+    /// An attempt's PR the board saw open, merged since and gone from the open
+    /// set: the number on the task is asked about, and the merge finishes it.
+    #[test]
+    fn an_attempts_pr_merged_between_polls_still_finishes_the_task() {
+        let e = engine_polling_o_r(vec![
+            (
+                "/repos/o/r/issues?state=open".into(),
+                json!([{ "number": 7, "node_id": "n7", "title": "Bug", "html_url": "u",
+                         "state": "open", "updated_at": "t", "labels": [] }]),
+            ),
+            ("/repos/o/r/pulls?state=open".into(), json!([])),
+            ("/repos/o/r/pulls?state=closed".into(), json!([])),
+            ("/repos/o/r/pulls/40".into(), pr_json(40, "closed", true, "board/o/r/gh-7")),
+        ]);
+        seed_gh_in(&e, "gh:o/r#7");
+        dispatch_on(&e, "gh:o/r#7", "board/o/r/gh-7");
+        e.db.set_pr("gh:o/r#7", Some("https://github.com/o/r/pull/40"), Some(40), true)
+            .unwrap();
+
+        e.poll_github();
+
+        assert_eq!(e.db.meta_get(meta::GITHUB_STATUS).unwrap().as_deref(), Some("ok"));
+        let t = e.db.get_task("gh:o/r#7").unwrap().unwrap();
+        assert!(t.pr_merged && !t.pr_open && t.local_done, "the merge finished it");
+        assert!(e.db.get_task("gh:o/r!40").unwrap().is_none(), "and it is no row of its own");
+    }
+
+    /// Opened and merged between two polls (or while the daemon was down): no
+    /// number on the task to ask about, so the recently-closed page is what
+    /// finds it by branch — as the newest hundred of `state=all` used to.
+    #[test]
+    fn an_attempts_pr_never_seen_open_still_links_by_branch() {
+        let e = engine_polling_o_r(vec![
+            (
+                "/repos/o/r/issues?state=open".into(),
+                json!([{ "number": 7, "node_id": "n7", "title": "Bug", "html_url": "u",
+                         "state": "open", "updated_at": "t", "labels": [] }]),
+            ),
+            ("/repos/o/r/pulls?state=open".into(), json!([])),
+            (
+                "/repos/o/r/pulls?state=closed".into(),
+                json!([pr_json(41, "closed", true, "board/o/r/gh-7")]),
+            ),
+        ]);
+        seed_gh_in(&e, "gh:o/r#7");
+        dispatch_on(&e, "gh:o/r#7", "board/o/r/gh-7");
+
+        e.poll_github();
+
+        let t = e.db.get_task("gh:o/r#7").unwrap().unwrap();
+        assert_eq!(t.pr_number, Some(41));
+        assert!(t.pr_merged && t.local_done);
+    }
+
+    #[test]
+    fn a_pr_url_names_its_repo() {
+        assert_eq!(pr_url_repo("https://github.com/o/r/pull/508"), Some("o/r"));
+        assert_eq!(pr_url_repo("https://github.com/o/r/issues/508"), None);
+        assert_eq!(pr_url_repo("https://linear.app/x/pull/1"), None);
     }
 
     /// An engine with GitHub writeback enabled — it is off by default now, so a
